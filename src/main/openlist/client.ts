@@ -55,6 +55,15 @@ export class OpenListError extends Error {
 
 export class OpenListClient {
   private token = ''
+  /** 正在执行登录，防止 401 触发的自动重登递归 */
+  private authenticating = false
+  /**
+   * 正在进行的重新登录。
+   *
+   * 并发请求可能同时收到 401，用同一个 Promise 去重，
+   * 避免几十个并发请求各自打一次登录接口。
+   */
+  private reauthInFlight: Promise<void> | null = null
   private readonly baseUrl: string
   private readonly username: string
   private readonly password: string
@@ -70,10 +79,34 @@ export class OpenListClient {
   // ── 认证 ─────────────────────────────────────────────
   /** 登录换取 JWT。token 有效期约 48h，过期需重新登录。 */
   async login(): Promise<void> {
-    const res = await this.request<{ token: string }>('POST', '/api/auth/login', {
-      body: { username: this.username, password: this.password }
-    })
-    this.token = res.token
+    this.authenticating = true
+    const previousToken = this.token
+    this.token = ''
+    try {
+      const res = await this.request<{ token: string }>('POST', '/api/auth/login', {
+        body: { username: this.username, password: this.password },
+        allowAuthRetry: false
+      })
+      this.token = res.token
+    } catch (err) {
+      // 登录失败时恢复旧 token，让后续重试仍有机会用未过期的凭据
+      this.token = previousToken
+      throw err
+    } finally {
+      this.authenticating = false
+    }
+  }
+
+  /**
+   * 凭据过期后重新登录，并发调用共享同一次登录。
+   */
+  private reauth(): Promise<void> {
+    if (!this.reauthInFlight) {
+      this.reauthInFlight = this.login().finally(() => {
+        this.reauthInFlight = null
+      })
+    }
+    return this.reauthInFlight
   }
 
   // ── 上传 ─────────────────────────────────────────────
@@ -231,6 +264,15 @@ export class OpenListClient {
    * 拿不到时会抛错，由调用方记录，差异保持未处置状态。
    */
   async downloadTo(remotePath: string, localPath: string): Promise<void> {
+    await this.downloadAttempt(remotePath, localPath, true)
+  }
+
+  /** 下载实现体；allowRetry 控制 401 后是否允许重新登录再试一次。 */
+  private async downloadAttempt(
+    remotePath: string,
+    localPath: string,
+    allowRetry: boolean
+  ): Promise<void> {
     const url = `${this.baseUrl}/d${encodeURI(remotePath)}`
     const headers: Record<string, string> = {
       ...(this.token ? { Authorization: this.token } : {})
@@ -240,6 +282,12 @@ export class OpenListClient {
     const timer = setTimeout(() => controller.abort(), this.timeoutMs)
     try {
       const res = await fetch(url, { headers, signal: controller.signal })
+
+      if (res.status === 401 && allowRetry && !this.authenticating) {
+        await this.reauth()
+        return this.downloadAttempt(remotePath, localPath, false)
+      }
+
       if (!res.ok || !res.body) {
         throw new OpenListError(`OpenList GET /d → HTTP ${res.status}`, res.status)
       }
@@ -258,6 +306,8 @@ export class OpenListClient {
       body?: unknown
       signal?: AbortSignal
       timeoutMs?: number
+      /** 置 false 表示不再自动重登（登录自身、重试后的那次调用） */
+      allowAuthRetry?: boolean
     } = {}
   ): Promise<T> {
     const headers: Record<string, string> = {
@@ -292,6 +342,30 @@ export class OpenListClient {
 
       const text = await res.text()
       if (!res.ok) {
+        if (res.status === 401 && opts.allowAuthRetry !== false && !this.authenticating) {
+          // 凭据过期（JWT 有效期约 48h）。
+          // 请求体若是流则已被消费、无法原地重放：
+          // 先刷新 token，再把错误抛给上层，由上层重新发起（会重读文件）。
+          const replayable = !(opts.body instanceof ReadableStream)
+          try {
+            await this.reauth()
+          } catch (err) {
+            const detail = err instanceof Error ? err.message : String(err)
+            throw new OpenListError(
+              `OpenList ${method} ${path} → HTTP 401，且重新登录失败：${detail}`,
+              401,
+              text
+            )
+          }
+          if (replayable) {
+            return this.request<T>(method, path, { ...opts, allowAuthRetry: false })
+          }
+          throw new OpenListError(
+            `OpenList ${method} ${path} → HTTP 401（凭据已过期，已自动重新登录，需重新发起本次请求）`,
+            401,
+            text
+          )
+        }
         throw new OpenListError(`OpenList ${method} ${path} → HTTP ${res.status}`, res.status, text)
       }
 

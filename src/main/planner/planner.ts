@@ -139,6 +139,26 @@ export class Planner {
       return
     }
 
+    // ── 超限拦截 ──
+    // 夸克单文件上限可配（默认 20GB）。超限文件上传必然失败，
+    // 与其进队列把重试次数耗光，不如当场拦下并说明原因。
+    if (this.isOversize(probe.size, config)) {
+      const message = `文件超过单文件上限（${formatBytes(probe.size)} > ${formatBytes(
+        config.quarkMaxFileBytes
+      )}），已跳过`
+      this.opts.manifest.upsertFile({
+        localPath: relPath,
+        localSize: probe.size,
+        mtimeMs: probe.mtimeMs,
+        state: 'error'
+      })
+      this.opts.manifest.setState(relPath, 'error', { errorMsg: message })
+      this.opts.manifest.log('error', `${message}：${relPath}`)
+      this.opts.onLog?.('error', `${message}：${relPath}`)
+      this.touch(relPath, { state: 'failed', errorMsg: message, size: probe.size })
+      return
+    }
+
     this.opts.manifest.upsertFile({
       localPath: relPath,
       localSize: probe.size,
@@ -192,6 +212,17 @@ export class Planner {
     const absPath = absolutize(config.syncRoot, diff.localPath)
     const probe = await this.probe(absPath)
     if (!probe.ok) return
+
+    // 同样受单文件上限约束：超限文件回流重传也只会失败
+    if (this.isOversize(probe.size, config)) {
+      const message = `文件超过单文件上限（${formatBytes(probe.size)} > ${formatBytes(
+        config.quarkMaxFileBytes
+      )}），已跳过`
+      this.opts.manifest.setState(diff.localPath, 'error', { errorMsg: message })
+      this.opts.onLog?.('error', `${message}：${diff.localPath}`)
+      this.touch(diff.localPath, { state: 'failed', errorMsg: message, size: probe.size })
+      return
+    }
 
     this.autoFixed++
     this.opts.onLog?.(
@@ -351,10 +382,11 @@ export class Planner {
       return
     }
 
-    // 失败重试
+    // 失败重试。确定性失败（如超限）标记为不可重试，直接落地失败状态。
     item.attempts++
     const maxAttempts = config.retry.maxAttempts
-    if (item.attempts < maxAttempts && this.running) {
+    const retryable = result.retryable !== false
+    if (retryable && item.attempts < maxAttempts && this.running) {
       this.touch(item.relPath, {
         state: 'queued',
         attempts: item.attempts,
@@ -502,6 +534,11 @@ export class Planner {
 
   // ── 文件探针 ──────────────────────────────────────────
 
+  /** 是否超过单文件上限；上限为 0 表示不限制 */
+  private isOversize(size: number, config: AppConfig): boolean {
+    return config.quarkMaxFileBytes > 0 && size > config.quarkMaxFileBytes
+  }
+
   /**
    * 读取文件元信息。
    *
@@ -568,6 +605,18 @@ export class Planner {
 function backoff(base: number, attempt: number): number {
   const exp = base * 2 ** Math.max(0, attempt - 1)
   return exp + Math.random() * base
+}
+
+/** 字节数转可读文本，用于超限提示 */
+function formatBytes(bytes: number): string {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let value = bytes
+  let i = 0
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024
+    i++
+  }
+  return `${i === 0 ? value : value.toFixed(2)} ${units[i]}`
 }
 
 function sleep(ms: number): Promise<void> {
