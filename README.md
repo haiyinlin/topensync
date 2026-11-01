@@ -1,4 +1,4 @@
-# TopOpenSync
+# TopenSync
 
 Windows 桌面同步程序：**本地目录 →（内网 HTTP）→ OpenList →（外网）→ 夸克网盘**。
 

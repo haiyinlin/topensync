@@ -35,7 +35,7 @@ function createWindow(): void {
     show: false,
     autoHideMenuBar: true,
     backgroundColor: '#0A0A0B',
-    title: 'TopOpenSync',
+    title: 'TopenSync',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,

@@ -42,7 +42,7 @@
   },
   "build": {
     "appId": "dev.topensync.desktop",
-    "productName": "TopOpenSync",
+    "productName": "TopenSync",
     "directories": {
       "output": "release"
     },
