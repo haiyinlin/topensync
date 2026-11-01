@@ -26,8 +26,8 @@ export function Reconcile(): React.JSX.Element {
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
-    const offDiff = window.quarksync?.onDiffUpdate((d) => setDiffs((prev) => [d, ...prev]))
-    const offScan = window.quarksync?.onScanUpdate((s) => {
+    const offDiff = window.topensync?.onDiffUpdate((d) => setDiffs((prev) => [d, ...prev]))
+    const offScan = window.topensync?.onScanUpdate((s) => {
       if (s.kind === 'remote') setScan(s)
     })
     return () => {
@@ -45,7 +45,7 @@ export function Reconcile(): React.JSX.Element {
   const shown = diffs.filter((d) => filter === 'all' || d.kind === filter)
 
   const resolve = (id: number, resolution: DiffResolution): void => {
-    window.quarksync?.resolveDiff(id, resolution)
+    window.topensync?.resolveDiff(id, resolution)
     setDiffs((prev) =>
       prev.map((d) => (d.id === id ? { ...d, resolvedAt: Date.now(), resolution } : d))
     )
@@ -53,7 +53,7 @@ export function Reconcile(): React.JSX.Element {
 
   const trigger = (): void => {
     setBusy(true)
-    window.quarksync?.triggerScan('remote')
+    window.topensync?.triggerScan('remote')
     setTimeout(() => setBusy(false), 2600)
   }
 

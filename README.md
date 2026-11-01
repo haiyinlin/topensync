@@ -1,8 +1,10 @@
-# QuarkSync
+# TopOpenSync
 
 Windows 桌面同步程序：**本地目录 →（内网 HTTP）→ OpenList →（外网）→ 夸克网盘**。
 
 远端保持**原始文件树**，在 OpenList 里可直接浏览、预览、播放。
+
+仓库地址：https://github.com/haiyinlin/topensync
 
 ---
 

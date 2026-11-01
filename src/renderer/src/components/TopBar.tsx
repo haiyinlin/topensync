@@ -15,7 +15,7 @@ export function TopBar(): React.JSX.Element {
   const triggerReconcile = (): void => {
     if (reconciling) return
     setReconciling(true)
-    window.quarksync?.triggerScan('remote')
+    window.topensync?.triggerScan('remote')
     setTimeout(() => setReconciling(false), 2600)
   }
 
@@ -43,7 +43,7 @@ export function TopBar(): React.JSX.Element {
         <button
           className="btn ghost"
           title="重新扫描本地同步目录（Ctrl+R）"
-          onClick={() => window.quarksync?.triggerScan('local')}
+          onClick={() => window.topensync?.triggerScan('local')}
         >
           <Icon name="monitor" />
           扫描本地
