@@ -1,19 +1,13 @@
 import * as React from 'react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Icon } from '../components/Icon'
 import type { TransferTask } from '@shared/types'
+import { useAppStore } from '../store'
 
 /** 传输队列：进行中 / 等待 / 失败任务，分片进度与逐项重试。 */
 export function Queue(): React.JSX.Element {
-  const [tasks, setTasks] = useState<TransferTask[]>([])
+  const tasks = useAppStore((s) => s.tasks)
   const [filter, setFilter] = useState<'all' | 'uploading' | 'queued' | 'failed'>('all')
-
-  useEffect(() => {
-    const off = window.topensync?.onTransferUpdate((t) =>
-      setTasks((prev) => [...prev.filter((x) => x.id !== t.id), t])
-    )
-    return () => off?.()
-  }, [])
 
   const counts = {
     all: tasks.length,

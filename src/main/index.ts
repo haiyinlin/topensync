@@ -1,6 +1,8 @@
 import { app, BrowserWindow, shell } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
+import { Engine } from './engine'
+import { registerIpc, emit } from './ipc'
 
 /**
  * 主进程入口。
@@ -11,6 +13,7 @@ import { electronApp, optimizer, is } from '@electron-toolkit/utils'
  */
 
 let mainWindow: BrowserWindow | null = null
+let engine: Engine | null = null
 
 // ── 单实例锁 ──────────────────────────────────────────────
 // 必须尽早获取。第二个实例直接退出，避免并发写库与重复上传。
@@ -68,7 +71,23 @@ app.whenReady().then(() => {
     optimizer.watchWindowShortcuts(window)
   })
 
+  // 引擎先于窗口建立：IPC 通道要在渲染进程开始请求前注册好
+  engine = new Engine({
+    onTransfer: (task) => emit('transfer:update', task),
+    onScan: (scan) => emit('scan:update', scan),
+    onDiff: (diff) => emit('diff:update', diff),
+    onConfig: (config) => emit('config:update', config),
+    onLog: (entry) => emit('log:append', entry)
+  })
+  registerIpc(engine)
+
   createWindow()
+
+  // 引擎启动失败不应让窗口打不开：连接问题由连接页展示并允许重试
+  void engine.start().catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err)
+    emit('log:append', { ts: Date.now(), level: 'error', message: `引擎启动失败：${message}` })
+  })
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -77,4 +96,9 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
+})
+
+app.on('before-quit', () => {
+  engine?.stop()
+  engine = null
 })

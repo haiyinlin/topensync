@@ -72,6 +72,17 @@ Windows 桌面同步程序：**本地目录 →（内网 HTTP）→ OpenList →
 5. `As-Task: true` 会强制服务端把整文件落盘，本项目**不使用**。
 6. 带宽瓶颈在 **OpenList → 夸克**（按账号共享限速），不在内网段。提高并发不会更快，只会招风控。
 
+### L1 去重的基准
+
+省上行的主力是**本地清单命中**，不是服务端秒传。清单里存了两组值，含义不同：
+
+- `local_size` / `mtime_ms`——文件的**当前**状态，每次扫描都被覆盖。
+- `synced_size` / `synced_mtime_ms`——**最近一次成功同步时**确认的值。
+
+去重必须比对后者。用前者等于自己跟自己比，命中率为 100%，表现为「文件改了也不重传」。
+
+比对时 mtime 留 1ms 容差：写入侧可能做过取整，严格相等会让去重永远不命中。
+
 ---
 
 ## 开发
@@ -91,18 +102,33 @@ npm test             # 单元测试
 ```
 src/
 ├── main/                 主进程
+│   ├── index.ts          入口：单实例锁、窗口、引擎装配
+│   ├── engine.ts         引擎：把四个模块装配成整机，对外暴露能力
+│   ├── ipc.ts            IPC 通道注册（只转发，不含业务逻辑）
 │   ├── config/store.ts   配置持久化（safeStorage 加密凭据）
 │   ├── db/manifest.ts    SQLite 清单（node:sqlite）
-│   ├── hash/hashes.ts    双哈希计算
+│   ├── hash/hashes.ts    双哈希计算（MD5 + SHA1 一次读出）
 │   ├── openlist/client.ts OpenList REST 客户端
-│   ├── reconcile/        远端对账器
-│   └── transfer/         传输执行器（两档路径）
+│   ├── planner/          汇合点：L1 去重 + 哈希池 + 上传池 + 删除熔断
+│   ├── reconcile/        远端对账器（remote_snapshot → diffs → 回流）
+│   ├── transfer/         传输执行器（单次 PUT / 分片两档）
+│   └── watcher/          本地监控（chokidar + Windows 边界处理）
 ├── preload/              预加载（最小 API 面）
-├── renderer/             渲染进程（React）
+├── renderer/             渲染进程（React + Zustand）
 └── shared/types.ts       主/预/渲染共享的类型定义
 
 ui-prototype/             静态视觉基准（浏览器可直接打开）
+tests/                    单元测试
 ```
+
+**四个进程内模块的分工**（与设计文档一致）：
+
+| 模块 | 职责 | 不做什么 |
+|---|---|---|
+| **Watcher** | 监听本地目录，产出归一化事件（add/change/unlink） | 不做上传决策，不碰远端 |
+| **Reconciler** | 列举远端文件树 → 比对 → 产出差异 | 不回传内容到本地 |
+| **Planner** | 两条通道的汇合点：去重决策 → 上传队列 → 删除队列 | 不直接发 HTTP |
+| **Transfer** | 执行上传：哈希、双哈希头、单次 PUT / 分片 | 不做去重判断 |
 
 ---
 

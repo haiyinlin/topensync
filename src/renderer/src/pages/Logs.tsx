@@ -1,23 +1,11 @@
 import * as React from 'react'
-import { useEffect, useState } from 'react'
-
-interface LogEntry {
-  ts: number
-  level: 'info' | 'warn' | 'error'
-  message: string
-}
+import { useState } from 'react'
+import { useAppStore } from '../store'
 
 /** 运行日志：时间线，按 info / warn / error 过滤。 */
 export function Logs(): React.JSX.Element {
-  const [logs, setLogs] = useState<LogEntry[]>([])
+  const logs = useAppStore((s) => s.logs)
   const [filter, setFilter] = useState<'all' | 'info' | 'warn' | 'error'>('all')
-
-  useEffect(() => {
-    const off = window.topensync?.onLogAppend((entry) =>
-      setLogs((prev) => [entry, ...prev].slice(0, 500))
-    )
-    return () => off?.()
-  }, [])
 
   const shown = logs.filter((l) => filter === 'all' || l.level === filter)
 

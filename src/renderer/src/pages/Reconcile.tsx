@@ -1,7 +1,8 @@
 import * as React from 'react'
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Icon } from '../components/Icon'
-import type { DiffEntry, DiffKind, DiffResolution, ScanRecord } from '@shared/types'
+import type { DiffKind, DiffResolution } from '@shared/types'
+import { useAppStore } from '../store'
 
 /**
  * 远端对账页。
@@ -20,21 +21,11 @@ const KIND_META: Record<DiffKind, { label: string; tone: string; desc: string }>
 type Filter = DiffKind | 'all'
 
 export function Reconcile(): React.JSX.Element {
-  const [diffs, setDiffs] = useState<DiffEntry[]>([])
-  const [scan, setScan] = useState<ScanRecord | null>(null)
+  const diffs = useAppStore((s) => s.diffs)
+  const refreshDiffs = useAppStore((s) => s.refreshDiffs)
+  const scan = useAppStore((s) => s.stats?.remoteScan ?? null)
   const [filter, setFilter] = useState<Filter>('all')
   const [busy, setBusy] = useState(false)
-
-  useEffect(() => {
-    const offDiff = window.topensync?.onDiffUpdate((d) => setDiffs((prev) => [d, ...prev]))
-    const offScan = window.topensync?.onScanUpdate((s) => {
-      if (s.kind === 'remote') setScan(s)
-    })
-    return () => {
-      offDiff?.()
-      offScan?.()
-    }
-  }, [])
 
   const counts = useMemo(() => {
     const c: Record<string, number> = {}
@@ -46,9 +37,8 @@ export function Reconcile(): React.JSX.Element {
 
   const resolve = (id: number, resolution: DiffResolution): void => {
     window.topensync?.resolveDiff(id, resolution)
-    setDiffs((prev) =>
-      prev.map((d) => (d.id === id ? { ...d, resolvedAt: Date.now(), resolution } : d))
-    )
+    // 处置结果由主进程落库，这里重新拉一次未处置差异
+    setTimeout(() => void refreshDiffs(), 400)
   }
 
   const trigger = (): void => {
@@ -75,32 +65,34 @@ export function Reconcile(): React.JSX.Element {
       <div className="card recon-bar">
         <div className="rb-item">
           <span className="rb-k">上次对账</span>
-          <b className="mono">{scan ? new Date(scan.startedAt).toLocaleString('zh-CN') : '尚未运行'}</b>
-        </div>
-        <div className="rb-item">
-          <span className="rb-k">耗时</span>
           <b className="mono">
-            {scan?.finishedAt ? `${Math.round((scan.finishedAt - scan.startedAt) / 1000)} 秒` : '—'}
+            {scan?.lastScanAt ? new Date(scan.lastScanAt).toLocaleString('zh-CN') : '尚未运行'}
           </b>
         </div>
         <div className="rb-item">
-          <span className="rb-k">扫描目录</span>
+          <span className="rb-k">耗时</span>
+          <b className="mono">{scan?.running ? '进行中' : '—'}</b>
+        </div>
+        <div className="rb-item">
+          <span className="rb-k">扫描文件</span>
           <b className="mono">{scan?.scannedCount ?? 0}</b>
         </div>
         <div className="rb-item">
           <span className="rb-k">发现差异</span>
-          <b className="mono">{scan?.changedCount ?? 0}</b>
+          <b className="mono">{scan?.diffCount ?? 0}</b>
         </div>
         <div className="rb-item rb-status">
           <span className="rb-k">状态</span>
-          <b className={scan?.status === 'done' ? 'ok' : undefined}>
-            {scan?.status === 'done'
+          <b className={scan?.lastScanStatus === 'done' ? 'ok' : undefined}>
+            {scan?.lastScanStatus === 'done'
               ? '已完成'
-              : scan?.status === 'running'
+              : scan?.lastScanStatus === 'running'
                 ? '进行中'
-                : scan?.status === 'failed'
+                : scan?.lastScanStatus === 'failed'
                   ? '失败'
-                  : '—'}
+                  : scan?.lastScanStatus === 'cancelled'
+                    ? '超时中止'
+                    : '—'}
           </b>
         </div>
       </div>

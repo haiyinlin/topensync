@@ -24,6 +24,11 @@ CREATE TABLE IF NOT EXISTS files (
   remote_path     TEXT,
   remote_size     INTEGER,
   remote_etag     TEXT,
+  -- 最近一次「成功同步」时确认的本地 size / mtime。
+  -- L1 去重的基准必须是这两个值，而不是 local_size/mtime_ms——
+  -- 后者会被 upsert 覆盖，拿它做基准会让去重永远命中。
+  synced_size     INTEGER,
+  synced_mtime_ms INTEGER,
   state           TEXT NOT NULL DEFAULT 'pending',
   last_sync_at    INTEGER,
   last_verify_at  INTEGER,
@@ -178,18 +183,74 @@ export class Manifest {
     return rows.map((r) => mapFileRow(r) as unknown as FileEntry)
   }
 
-  /** L1 本地去重的快筛：size + mtime 都一致则可跳过 */
+  /** 按多个状态批量查询（启动时恢复未完成任务用） */
+  listFilesByStates(states: FileState[], limit = 1000): FileEntry[] {
+    if (states.length === 0) return []
+    const placeholders = states.map(() => '?').join(',')
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM files WHERE state IN (${placeholders}) ORDER BY local_path LIMIT ?`
+      )
+      .all(...(states as string[]), limit) as Record<string, unknown>[]
+    return rows.map((r) => mapFileRow(r) as unknown as FileEntry)
+  }
+
+  /** 各状态的文件计数，用于概览统计卡 */
+  countByState(): Record<string, number> {
+    const rows = this.db
+      .prepare('SELECT state, COUNT(*) AS n FROM files GROUP BY state')
+      .all() as { state: string; n: number }[]
+    const out: Record<string, number> = {}
+    for (const r of rows) out[r.state] = r.n
+    return out
+  }
+
+  /** 清空远端快照（远端根目录变更时用） */
+  clearRemoteSnapshot(): void {
+    this.db.prepare('DELETE FROM remote_snapshot').run()
+  }
+
+  /**
+   * L1 本地去重的快筛。
+   *
+   * 基准是**最近一次成功同步时**确认的 size + mtime：
+   * 两者都与当前文件一致 → 文件自上次同步以来没变 → 完全不上传。
+   *
+   * 注意不能用 local_size / mtime_ms 做基准——那两列会被 upsertFile
+   * 覆盖成当前值，拿它比较等于自己跟自己比，去重会永远命中。
+   *
+   * mtime 比较留 1ms 容差：文件系统的修改时间精度不一，
+   * 而写入侧可能做过取整，直接用 `===` 会让去重永远不命中。
+   */
   isUnchanged(localPath: string, size: number, mtimeMs: number): boolean {
     const row = this.db
-      .prepare('SELECT local_size, mtime_ms FROM files WHERE local_path = ?')
-      .get(localPath) as { local_size: number; mtime_ms: number } | undefined
-    return !!row && row.local_size === size && row.mtime_ms === mtimeMs
+      .prepare('SELECT synced_size, synced_mtime_ms FROM files WHERE local_path = ?')
+      .get(localPath) as { synced_size: number | null; synced_mtime_ms: number | null } | undefined
+    if (!row || row.synced_size === null || row.synced_mtime_ms === null) return false
+    if (row.synced_size !== size) return false
+    return Math.abs(row.synced_mtime_ms - mtimeMs) < 1
+  }
+
+  /** 该文件是否已经成功同步过（无论此后是否被修改） */
+  isSynced(localPath: string): boolean {
+    const row = this.db
+      .prepare('SELECT synced_size FROM files WHERE local_path = ?')
+      .get(localPath) as { synced_size: number | null } | undefined
+    return !!row && row.synced_size !== null
   }
 
   setState(
     localPath: string,
     state: FileState,
-    extra: { md5?: string; sha1?: string; remoteSize?: number; errorMsg?: string | null } = {}
+    extra: {
+      md5?: string
+      sha1?: string
+      remoteSize?: number
+      /** 成功同步时写入 L1 去重基准 */
+      syncedSize?: number
+      syncedMtimeMs?: number
+      errorMsg?: string | null
+    } = {}
   ): void {
     this.db
       .prepare(
@@ -198,6 +259,8 @@ export class Manifest {
            md5 = COALESCE(?, md5),
            sha1 = COALESCE(?, sha1),
            remote_size = COALESCE(?, remote_size),
+           synced_size = COALESCE(?, synced_size),
+           synced_mtime_ms = COALESCE(?, synced_mtime_ms),
            error_msg = ?,
            last_sync_at = CASE WHEN ? = 'synced' THEN ? ELSE last_sync_at END,
            deleted_at = CASE WHEN ? = 'deleted' THEN ? ELSE deleted_at END
@@ -208,6 +271,8 @@ export class Manifest {
         extra.md5 ?? null,
         extra.sha1 ?? null,
         extra.remoteSize ?? null,
+        extra.syncedSize ?? null,
+        extra.syncedMtimeMs ?? null,
         extra.errorMsg ?? null,
         state,
         Date.now(),
@@ -362,6 +427,8 @@ function mapFileRow(r: Record<string, unknown>): Record<string, unknown> {
     remotePath: r['remote_path'],
     remoteSize: r['remote_size'],
     remoteEtag: r['remote_etag'],
+    syncedSize: r['synced_size'],
+    syncedMtimeMs: r['synced_mtime_ms'],
     state: r['state'],
     lastSyncAt: r['last_sync_at'],
     lastVerifyAt: r['last_verify_at'],

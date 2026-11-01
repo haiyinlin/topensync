@@ -1,13 +1,66 @@
 import * as React from 'react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Icon } from '../components/Icon'
+import { useAppStore } from '../store'
+import type { RemoteScanConfig } from '@shared/types'
 
-/** 对账规则：远端对账的周期、并发与差异处置策略。 */
+/**
+ * 对账规则：远端对账的周期、并发与差异处置策略。
+ *
+ * 「穿透服务端目录缓存」是这里的要害：
+ * refresh:true 需要目标目录写权限，关闭后对账读到的只是服务端缓存，
+ * 发现不了「远端被外部删除」——那是最危险的一类静默备份缺失。
+ */
 export function ReconcileRules(): React.JSX.Element {
+  const config = useAppStore((s) => s.config)
+  const saveConfig = useAppStore((s) => s.saveConfig)
+
+  const [enabled, setEnabled] = useState(true)
   const [intervalHours, setIntervalHours] = useState(6)
+  const [onStartup, setOnStartup] = useState(true)
   const [maxConcurrency, setMaxConcurrency] = useState(1)
   const [timeoutMinutes, setTimeoutMinutes] = useState(30)
+  const [refresh, setRefresh] = useState(true)
+  const [conflictPolicy, setConflictPolicy] = useState<RemoteScanConfig['conflictPolicy']>(
+    'local-wins'
+  )
+  const [remoteOnlyPolicy, setRemoteOnlyPolicy] = useState<
+    RemoteScanConfig['remoteOnlyPolicy']
+  >('record-only')
   const [autoFixLimit, setAutoFixLimit] = useState(20)
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    if (!config) return
+    const rs = config.remoteScan
+    setEnabled(rs.enabled)
+    setIntervalHours(rs.intervalHours)
+    setOnStartup(rs.onStartup)
+    setMaxConcurrency(rs.maxConcurrency)
+    setTimeoutMinutes(rs.timeoutMinutes)
+    setRefresh(rs.refresh)
+    setConflictPolicy(rs.conflictPolicy)
+    setRemoteOnlyPolicy(rs.remoteOnlyPolicy)
+    setAutoFixLimit(rs.autoFixLimit)
+  }, [config])
+
+  const save = async (): Promise<void> => {
+    await saveConfig({
+      remoteScan: {
+        enabled,
+        intervalHours,
+        onStartup,
+        maxConcurrency,
+        timeoutMinutes,
+        refresh,
+        conflictPolicy,
+        remoteOnlyPolicy,
+        autoFixLimit
+      }
+    })
+    setSaved(true)
+    setTimeout(() => setSaved(false), 1600)
+  }
 
   return (
     <section>
@@ -16,13 +69,20 @@ export function ReconcileRules(): React.JSX.Element {
           <h1>对账规则</h1>
           <p className="sub">远端对账的周期、并发与差异处置策略。</p>
         </div>
+        <div className="head-actions">
+          <button className="btn primary" onClick={() => void save()}>
+            {saved ? '已保存' : '保存'}
+          </button>
+        </div>
       </div>
 
       <div className="grid two">
         <div className="card form">
           <div className="card-head">
             <h2>对账计划</h2>
-            <span className="pill green">已启用</span>
+            <span className={`pill ${enabled ? 'green' : 'gray'}`}>
+              {enabled ? '已启用' : '已关闭'}
+            </span>
           </div>
           <label className="switch-row">
             <span>
@@ -30,7 +90,11 @@ export function ReconcileRules(): React.JSX.Element {
               <em>关闭后无法发现远端被外部删除或修改</em>
             </span>
             <span className="switch">
-              <input type="checkbox" defaultChecked />
+              <input
+                type="checkbox"
+                checked={enabled}
+                onChange={(e) => setEnabled(e.target.checked)}
+              />
               <i />
             </span>
           </label>
@@ -54,7 +118,11 @@ export function ReconcileRules(): React.JSX.Element {
               <em>异步执行，不阻塞启动</em>
             </span>
             <span className="switch">
-              <input type="checkbox" defaultChecked />
+              <input
+                type="checkbox"
+                checked={onStartup}
+                onChange={(e) => setOnStartup(e.target.checked)}
+              />
               <i />
             </span>
           </label>
@@ -95,7 +163,11 @@ export function ReconcileRules(): React.JSX.Element {
               <em>refresh:true，否则看不到外部删除</em>
             </span>
             <span className="switch">
-              <input type="checkbox" defaultChecked />
+              <input
+                type="checkbox"
+                checked={refresh}
+                onChange={(e) => setRefresh(e.target.checked)}
+              />
               <i />
             </span>
           </label>
@@ -116,14 +188,24 @@ export function ReconcileRules(): React.JSX.Element {
         </div>
         <div className="radios">
           <label className="radio">
-            <input type="radio" name="cp" defaultChecked />
+            <input
+              type="radio"
+              name="cp"
+              checked={conflictPolicy === 'local-wins'}
+              onChange={() => setConflictPolicy('local-wins')}
+            />
             <span>
               <b>本地为准</b>
               <em>远端缺失自动重传，内容不符覆盖远端（推荐）</em>
             </span>
           </label>
           <label className="radio">
-            <input type="radio" name="cp" />
+            <input
+              type="radio"
+              name="cp"
+              checked={conflictPolicy === 'manual'}
+              onChange={() => setConflictPolicy('manual')}
+            />
             <span>
               <b>全部交由我确认</b>
               <em>只列出差异，任何修复都需手动触发</em>
@@ -133,21 +215,36 @@ export function ReconcileRules(): React.JSX.Element {
         <div className="hr" />
         <div className="radios">
           <label className="radio">
-            <input type="radio" name="ro" defaultChecked />
+            <input
+              type="radio"
+              name="ro"
+              checked={remoteOnlyPolicy === 'record-only'}
+              onChange={() => setRemoteOnlyPolicy('record-only')}
+            />
             <span>
               <b>仅远端存在的文件：只记录</b>
               <em>不删除也不下载，避免误删其他设备刚上传的内容（推荐）</em>
             </span>
           </label>
           <label className="radio">
-            <input type="radio" name="ro" />
+            <input
+              type="radio"
+              name="ro"
+              checked={remoteOnlyPolicy === 'pull'}
+              onChange={() => setRemoteOnlyPolicy('pull')}
+            />
             <span>
               <b>下载到本地</b>
               <em>远端多出的文件拉回同步目录</em>
             </span>
           </label>
           <label className="radio">
-            <input type="radio" name="ro" />
+            <input
+              type="radio"
+              name="ro"
+              checked={remoteOnlyPolicy === 'delete'}
+              onChange={() => setRemoteOnlyPolicy('delete')}
+            />
             <span>
               <b>移入回收站</b>
               <em>远端多出的文件移入 _trash/，破坏性操作</em>

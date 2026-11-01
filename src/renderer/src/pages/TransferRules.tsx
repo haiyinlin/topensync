@@ -1,16 +1,58 @@
 import * as React from 'react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Icon } from '../components/Icon'
+import { useAppStore } from '../store'
+import type { AppConfig, DeletePolicy } from '@shared/types'
 
-/** 传输规则：并发、阈值与删除策略。 */
+/**
+ * 传输规则：并发、阈值与删除策略。
+ *
+ * 控件绑定真实配置；改动后需显式保存——滑块拖动过程中不适合每帧落盘。
+ */
 export function TransferRules(): React.JSX.Element {
+  const config = useAppStore((s) => s.config)
+  const saveConfig = useAppStore((s) => s.saveConfig)
+
   const [uploadConcurrency, setUploadConcurrency] = useState(4)
   const [hashConcurrency, setHashConcurrency] = useState(2)
   const [chunkConcurrency, setChunkConcurrency] = useState(2)
   const [singlePutMB, setSinglePutMB] = useState(8)
   const [quarkMaxGB, setQuarkMaxGB] = useState(20)
+  const [verifyMode, setVerifyMode] = useState<AppConfig['verifyMode']>('size')
+  const [deletePolicy, setDeletePolicy] = useState<DeletePolicy>('trash')
   const [deleteLimit, setDeleteLimit] = useState(200)
   const [deleteBytesGB, setDeleteBytesGB] = useState(10)
+  const [saved, setSaved] = useState(false)
+
+  // 首次拿到配置时回填控件
+  useEffect(() => {
+    if (!config) return
+    setUploadConcurrency(config.uploadConcurrency)
+    setHashConcurrency(config.hashConcurrency)
+    setChunkConcurrency(config.chunkConcurrency)
+    setSinglePutMB(Math.round(config.singlePutMaxBytes / 1024 / 1024))
+    setQuarkMaxGB(Math.round(config.quarkMaxFileBytes / 1024 / 1024 / 1024))
+    setVerifyMode(config.verifyMode)
+    setDeletePolicy(config.deletePolicy)
+    setDeleteLimit(config.maxDeletesPerRun)
+    setDeleteBytesGB(Math.round(config.maxDeleteBytesPerRun / 1024 / 1024 / 1024))
+  }, [config])
+
+  const save = async (): Promise<void> => {
+    await saveConfig({
+      uploadConcurrency,
+      hashConcurrency,
+      chunkConcurrency,
+      singlePutMaxBytes: Math.round(singlePutMB * 1024 * 1024),
+      quarkMaxFileBytes: Math.round(quarkMaxGB * 1024 * 1024 * 1024),
+      verifyMode,
+      deletePolicy,
+      maxDeletesPerRun: deleteLimit,
+      maxDeleteBytesPerRun: Math.round(deleteBytesGB * 1024 * 1024 * 1024)
+    })
+    setSaved(true)
+    setTimeout(() => setSaved(false), 1600)
+  }
 
   return (
     <section>
@@ -18,6 +60,11 @@ export function TransferRules(): React.JSX.Element {
         <div>
           <h1>传输规则</h1>
           <p className="sub">并发、阈值与删除策略。</p>
+        </div>
+        <div className="head-actions">
+          <button className="btn primary" onClick={() => void save()}>
+            {saved ? '已保存' : '保存'}
+          </button>
         </div>
       </div>
 
@@ -100,9 +147,24 @@ export function TransferRules(): React.JSX.Element {
           <label className="field">
             <span>校验模式</span>
             <div className="seg">
-              <button>不校验</button>
-              <button className="active">校验大小</button>
-              <button>校验哈希</button>
+              <button
+                className={verifyMode === 'none' ? 'active' : ''}
+                onClick={() => setVerifyMode('none')}
+              >
+                不校验
+              </button>
+              <button
+                className={verifyMode === 'size' ? 'active' : ''}
+                onClick={() => setVerifyMode('size')}
+              >
+                校验大小
+              </button>
+              <button
+                className={verifyMode === 'hash' ? 'active' : ''}
+                onClick={() => setVerifyMode('hash')}
+              >
+                校验哈希
+              </button>
             </div>
           </label>
         </div>
@@ -114,21 +176,36 @@ export function TransferRules(): React.JSX.Element {
         </div>
         <div className="radios">
           <label className="radio">
-            <input type="radio" name="dp" defaultChecked />
+            <input
+              type="radio"
+              name="dp"
+              checked={deletePolicy === 'trash'}
+              onChange={() => setDeletePolicy('trash')}
+            />
             <span>
               <b>移入回收站</b>
               <em>远程文件先移动到 _trash/，可恢复（推荐）</em>
             </span>
           </label>
           <label className="radio">
-            <input type="radio" name="dp" />
+            <input
+              type="radio"
+              name="dp"
+              checked={deletePolicy === 'delete'}
+              onChange={() => setDeletePolicy('delete')}
+            />
             <span>
               <b>直接删除</b>
               <em>立即从夸克网盘移除，不可恢复</em>
             </span>
           </label>
           <label className="radio">
-            <input type="radio" name="dp" />
+            <input
+              type="radio"
+              name="dp"
+              checked={deletePolicy === 'keep'}
+              onChange={() => setDeletePolicy('keep')}
+            />
             <span>
               <b>保留远程</b>
               <em>本地删除不反映到远端（归档语义）</em>

@@ -63,6 +63,10 @@ export interface FileEntry {
   remotePath: string | null
   remoteSize: number | null
   remoteEtag: string | null
+  /** 最近一次成功同步时确认的本地大小；L1 去重的基准 */
+  syncedSize: number | null
+  /** 最近一次成功同步时确认的本地修改时间；L1 去重的基准 */
+  syncedMtimeMs: number | null
   state: FileState
   lastSyncAt: number | null
   lastVerifyAt: number | null
@@ -169,6 +173,69 @@ export interface RendererToMainEvents {
   'transfer:retry': (taskId: string) => void
   'transfer:cancel': (taskId: string) => void
   'diff:resolve': (diffId: number, resolution: DiffResolution) => void
-  'config:patch': (patch: Partial<AppConfig>) => void
   'app:quit': () => void
+}
+// 注：配置变更走 invoke（'config:patch'），因为调用方需要拿到合并后的新配置。
+
+// ── 渲染进程启动时拉取的初始快照 ────────────────────────────────
+
+/** 概览页统计卡的数据来源 */
+export interface AppStats {
+  /** 已同步文件数 */
+  synced: number
+  /** 待上传（排队中） */
+  queued: number
+  /** 本次运行 L1 去重命中、零上行的文件数 */
+  skipped: number
+  /** 失败数 */
+  failed: number
+  /** 进行中 */
+  active: number
+  /** 未处理的对账差异数 */
+  openDiffs: number
+  /** 已扫描的本地文件总数 */
+  totalFiles: number
+  /** 本地扫描通道状态 */
+  localScan: {
+    watching: boolean
+    lastScanAt: number | null
+    scannedCount: number
+  }
+  /** 远端对账通道状态 */
+  remoteScan: {
+    enabled: boolean
+    running: boolean
+    lastScanAt: number | null
+    lastScanStatus: ScanStatus | null
+    scannedCount: number
+    diffCount: number
+    nextScanAt: number | null
+  }
+}
+
+/** 首屏一次性拉取的全部数据 */
+export interface AppSnapshot {
+  config: AppConfig
+  stats: AppStats
+  files: FileEntry[]
+  diffs: DiffEntry[]
+  tasks: TransferTask[]
+  logs: { ts: number; level: string; message: string }[]
+  /** 主进程侧的连接自检结果 */
+  connection: ConnectionStatus
+}
+
+/** 连接页的权限自检结果 */
+export interface ConnectionStatus {
+  /** 配置是否完整（同步根目录 + OpenList 地址 + 账号） */
+  configured: boolean
+  /** OpenList 是否可达且登录成功 */
+  reachable: boolean
+  /** 能否读取远端根目录 */
+  canRead: boolean
+  /** 能否写入远端根目录（refresh:true 的前提） */
+  canWrite: boolean
+  /** 上一次检查的错误信息 */
+  error: string | null
+  checkedAt: number | null
 }

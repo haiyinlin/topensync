@@ -1,3 +1,5 @@
+import { writeFile } from 'fs/promises'
+
 /**
  * OpenList REST 客户端。
  *
@@ -219,6 +221,32 @@ export class OpenListClient {
   /** 移动/重命名。远程删除走回收站时用它把文件移到 _trash/。 */
   async move(src: string, dst: string): Promise<void> {
     await this.request('POST', '/api/fs/move', { body: { src, dst } })
+  }
+
+  /**
+   * 下载远端文件到本地路径。
+   *
+   * 走 OpenList 的 raw 下载端点 `/d/<path>`。
+   * 部分驱动要求 sign 参数（列举结果里带 sign），这里先不处理——
+   * 拿不到时会抛错，由调用方记录，差异保持未处置状态。
+   */
+  async downloadTo(remotePath: string, localPath: string): Promise<void> {
+    const url = `${this.baseUrl}/d${encodeURI(remotePath)}`
+    const headers: Record<string, string> = {
+      ...(this.token ? { Authorization: this.token } : {})
+    }
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs)
+    try {
+      const res = await fetch(url, { headers, signal: controller.signal })
+      if (!res.ok || !res.body) {
+        throw new OpenListError(`OpenList GET /d → HTTP ${res.status}`, res.status)
+      }
+      await writeFile(localPath, Buffer.from(await res.arrayBuffer()))
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   // ── 内部工具 ─────────────────────────────────────────

@@ -1,8 +1,15 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type {
+  AppConfig,
+  AppSnapshot,
+  AppStats,
+  ConnectionStatus,
+  DiffEntry,
+  DiffResolution,
+  FileEntry,
   MainToRendererEvents,
   ScanKind,
-  DiffResolution
+  TransferTask
 } from '@shared/types'
 
 /**
@@ -24,7 +31,7 @@ function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
 }
 
 const api = {
-  // 主进程 → 渲染进程
+  // ── 主进程 → 渲染进程（订阅）──────────────────────────
   onTransferUpdate: (cb: MainToRendererEvents['transfer:update']) =>
     subscribe('transfer:update', cb),
   onScanUpdate: (cb: MainToRendererEvents['scan:update']) => subscribe('scan:update', cb),
@@ -32,13 +39,28 @@ const api = {
   onConfigUpdate: (cb: MainToRendererEvents['config:update']) => subscribe('config:update', cb),
   onLogAppend: (cb: MainToRendererEvents['log:append']) => subscribe('log:append', cb),
 
-  // 渲染进程 → 主进程
+  // ── 读取（请求-响应）──────────────────────────────────
+  /** 首屏一次性拉取全部数据 */
+  getSnapshot: (): Promise<AppSnapshot> => ipcRenderer.invoke('app:snapshot'),
+  getStats: (): Promise<AppStats> => ipcRenderer.invoke('app:stats'),
+  getConfig: (): Promise<AppConfig> => ipcRenderer.invoke('config:get'),
+  listFiles: (opts?: { limit?: number }): Promise<FileEntry[]> =>
+    ipcRenderer.invoke('files:list', opts ?? {}),
+  listDiffs: (): Promise<DiffEntry[]> => ipcRenderer.invoke('diffs:list'),
+  listLogs: (limit?: number): Promise<{ ts: number; level: string; message: string }[]> =>
+    ipcRenderer.invoke('logs:list', limit ?? 200),
+  listTasks: (): Promise<TransferTask[]> => ipcRenderer.invoke('tasks:list'),
+  checkConnection: (): Promise<ConnectionStatus> => ipcRenderer.invoke('connection:check'),
+
+  // ── 动作 ──────────────────────────────────────────────
+  /** 改配置走请求-响应：调用方需要拿到合并后的新配置 */
+  patchConfig: (patch: Partial<AppConfig>): Promise<AppConfig> =>
+    ipcRenderer.invoke('config:patch', patch),
   triggerScan: (kind: ScanKind) => ipcRenderer.send('scan:trigger', kind),
   retryTransfer: (taskId: string) => ipcRenderer.send('transfer:retry', taskId),
   cancelTransfer: (taskId: string) => ipcRenderer.send('transfer:cancel', taskId),
   resolveDiff: (diffId: number, resolution: DiffResolution) =>
     ipcRenderer.send('diff:resolve', diffId, resolution),
-  patchConfig: (patch: Record<string, unknown>) => ipcRenderer.send('config:patch', patch),
   quit: () => ipcRenderer.send('app:quit')
 }
 
