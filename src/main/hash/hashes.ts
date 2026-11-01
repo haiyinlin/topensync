@@ -3,7 +3,7 @@ import { createReadStream } from 'fs'
 import { stat } from 'fs/promises'
 
 /**
- * 双哈希计算（计划书 §7）。
+ * 双哈希计算。
  *
  * 夸克秒传需要 **MD5 + SHA1 同时提供**：
  * drivers/quark_open/seed_rapid.go 中 RapidHashAlgos = MD5+SHA1。
@@ -46,7 +46,7 @@ export async function hashFile(path: string): Promise<FileHashes> {
 /**
  * 哈希前后的文件一致性校验。
  *
- * 计划书 §7.4 提到的竞态：先算哈希、后封包/上传，期间文件可能被改写，
+ * 竞态：先算哈希、后封包/上传，期间文件可能被改写，
  * 导致「记录的哈希」与「实际传输的字节」不符。上传前必须复核。
  */
 export async function verifyUnchanged(
@@ -57,7 +57,7 @@ export async function verifyUnchanged(
   return st.size === expected.size && Math.floor(st.mtimeMs) === Math.floor(expected.mtimeMs)
 }
 
-/** 取文件 stat，用于分流规则（计划书 §8.1 的两档路径判定） */
+/** 取文件 stat，用于分流规则（两档路径判定） */
 export async function fileStat(path: string): Promise<{ size: number; mtimeMs: number }> {
   const st = await stat(path)
   return { size: st.size, mtimeMs: st.mtimeMs }

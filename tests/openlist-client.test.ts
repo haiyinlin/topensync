@@ -4,7 +4,7 @@ import { OpenListClient } from '../src/main/openlist/client'
 /**
  * OpenList 客户端的接口契约测试。
  *
- * 这两个断言锁住的是《计划.md》§2 里两个真实踩过的坑：
+ * 这两个断言锁住的是两个真实踩过的坑：
  *   1. per_page: 0 会返回空列表（server/handles/fsread.go:215）
  *   2. refresh: true 需要写权限，否则 403（server/handles/fsread.go:93）
  *

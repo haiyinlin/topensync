@@ -5,9 +5,9 @@ import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 /**
  * 主进程入口。
  *
- * 关键约束（见《计划.md》）：
- * - 单实例锁：多实例并发会同时写 SQLite 并重复上传（§9）。
- * - 凭据经 safeStorage 加密，不落明文（§10）。
+ * 关键约束：
+ * - 单实例锁：多实例并发会同时写 SQLite 并重复上传。
+ * - 凭据经 safeStorage 加密，不落明文。
  */
 
 let mainWindow: BrowserWindow | null = null

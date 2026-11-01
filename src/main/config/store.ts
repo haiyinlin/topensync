@@ -7,12 +7,12 @@ import type { AppConfig } from '@shared/types'
  * 配置持久化。
  *
  * 凭据（OpenList 密码）经 Electron safeStorage 加密后落盘，
- * 密文与明文同文件但以独立字段保存，绝不写明文（计划书 §10）。
+ * 密文与明文同文件但以独立字段保存，绝不写明文。
  */
 
 const CONFIG_FILE = 'config.json'
 
-/** 默认配置：与计划书 §10 的配置块一致 */
+/** 默认配置：各配置块的出厂默认值 */
 export const DEFAULT_CONFIG: AppConfig = {
   syncRoot: '',
   openlist: {

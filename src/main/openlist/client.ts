@@ -1,7 +1,7 @@
 /**
  * OpenList REST 客户端。
  *
- * 全部接口行为已对照 OpenList v4 main 分支源码核实（计划书 §2）。
+ * 全部接口行为已对照 OpenList v4 main 分支源码核实。
  * 两条关键约束写在下面，改动前务必重读：
  *
  * 1. 上传是 `PUT /api/fs/put`，**不是 POST**（server/router.go:304）。
@@ -76,7 +76,7 @@ export class OpenListClient {
 
   // ── 上传 ─────────────────────────────────────────────
   /**
-   * 单次流式上传（计划书 §8.2）。
+   * 单次流式上传。
    *
    * 必带头：
    * - Authorization
@@ -115,7 +115,7 @@ export class OpenListClient {
     })
   }
 
-  // ── 分片上传（计划书 §8.3）──────────────────────────
+  // ── 分片上传 ───────────────────────────────────────────
   async multipartInit(
     remotePath: string,
     opts: {

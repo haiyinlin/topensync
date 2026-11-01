@@ -3,7 +3,7 @@ import type { Manifest } from '../db/manifest'
 import type { AppConfig, DiffKind, ScanKind, ScanTrigger } from '@shared/types'
 
 /**
- * 远端对账器（计划书 §6.5）。
+ * 远端对账器。
  *
  * 职责：周期性列举远端文件树 → 写入 remote_snapshot → 与 files 表比对
  *      → 产出 diffs → 需要修正的差异回流进 Planner。
