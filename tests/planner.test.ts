@@ -189,6 +189,74 @@ describe('Planner', () => {
     expect(upload).not.toHaveBeenCalled()
   })
 
+  it('超过单文件上限的文件不上传，并写明原因', async () => {
+    const p = join(syncRoot, 'big.bin')
+    writeFileSync(p, 'x'.repeat(2048))
+
+    const limited = new Planner({
+      manifest,
+      transfer: { upload } as unknown as Transfer,
+      client: {
+        mkdir: vi.fn().mockResolvedValue(undefined),
+        move: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue(undefined)
+      } as unknown as OpenListClient,
+      getConfig: () => ({ ...CONFIG, syncRoot, quarkMaxFileBytes: 1024 })
+    })
+    limited.start()
+
+    await limited.handleEvent('big.bin', true)
+    await settle()
+
+    expect(upload).not.toHaveBeenCalled()
+    const entry = manifest.getFile('big.bin')
+    expect(entry?.state).toBe('error')
+    expect(entry?.errorMsg).toContain('超过单文件上限')
+    limited.stop()
+  })
+
+  it('对账回流时同样受单文件上限约束', async () => {
+    const p = join(syncRoot, 'big2.bin')
+    writeFileSync(p, 'x'.repeat(2048))
+
+    const limited = new Planner({
+      manifest,
+      transfer: { upload } as unknown as Transfer,
+      client: {
+        mkdir: vi.fn().mockResolvedValue(undefined),
+        move: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue(undefined)
+      } as unknown as OpenListClient,
+      getConfig: () => ({ ...CONFIG, syncRoot, quarkMaxFileBytes: 1024 })
+    })
+    limited.start()
+
+    await limited.handleDiff({
+      kind: 'missing_remote',
+      localPath: 'big2.bin',
+      remotePath: '/quark-backup/big2.bin'
+    })
+    await settle()
+
+    expect(upload).not.toHaveBeenCalled()
+    limited.stop()
+  })
+
+  it('确定性失败（不可重试）不消耗重试次数', async () => {
+    const p = join(syncRoot, 'f.txt')
+    writeFileSync(p, 'data')
+
+    upload.mockResolvedValue({ ok: false, error: '文件超过单文件上限', retryable: false })
+
+    await planner.handleEvent('f.txt', true)
+    await settle(500)
+
+    // 可重试的失败会重试到 maxAttempts=3 次；不可重试的只试 1 次
+    expect(upload).toHaveBeenCalledTimes(1)
+    const task = planner.getTasks().find((t) => t.localPath === 'f.txt')
+    expect(task?.state).toBe('failed')
+  })
+
   it('冲突策略为「全部交由我确认」时不自动重传', async () => {
     const p = join(syncRoot, 'e.txt')
     writeFileSync(p, 'data')

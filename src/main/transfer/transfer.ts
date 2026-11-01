@@ -38,6 +38,13 @@ export interface TransferResult {
   error?: string
   /** 是否命中服务端秒传（远端已存在同样内容） */
   rapidUpload?: boolean
+  /**
+   * 是否值得重试。
+   *
+   * 缺省视为可重试（网络抖动、限流等）。确定性失败（文件超限）置 false，
+   * 让上层直接标记失败，不再消耗重试次数。
+   */
+  retryable?: boolean
 }
 
 export interface UploadRequest {
@@ -65,6 +72,16 @@ export class Transfer {
     const st = await stat(req.absPath)
     const mtimeMs = st.mtimeMs
     const size = st.size
+
+    // 超限拦截（兜底）：夸克单文件上限可配，超限文件上传必然失败。
+    // 正常路径上 Planner 已在入队前拦下，这里防的是其他调用方绕过 Planner。
+    const limit = config.quarkMaxFileBytes
+    if (limit > 0 && size > limit) {
+      const message = `文件大小 ${size} 字节超过单文件上限 ${limit} 字节`
+      manifest.setState(req.relPath, 'error', { errorMsg: message })
+      manifest.log('error', `跳过超限文件：${req.relPath}（${message}）`, req.fileId, req.remotePath)
+      return { ok: false, error: message, retryable: false }
+    }
 
     // 双哈希（夸克秒传的硬性要求）。Planner 阶段已算过就复用，不重复读盘。
     const hashes = req.hashes ?? (await hashFile(req.absPath))
