@@ -46,7 +46,7 @@ export function Rail({ current, onNavigate }: RailProps): React.JSX.Element {
       <div className="rail-head">
         <div className="brand">
           <span className="brand-mark" />
-          <span className="brand-name">TopOpenSync</span>
+          <span className="brand-name">TopenSync</span>
         </div>
         <button className="icon-btn" title="全局设置">
           <Icon name="gear" />
