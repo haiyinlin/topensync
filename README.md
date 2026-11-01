@@ -83,6 +83,23 @@ Windows 桌面同步程序：**本地目录 →（内网 HTTP）→ OpenList →
 
 比对时 mtime 留 1ms 容差：写入侧可能做过取整，严格相等会让去重永远不命中。
 
+### 界面样式与原型的同步
+
+`ui-prototype/` 是视觉基准，`src/renderer/src/styles/app.css` 是它的实现。搬样式时
+**基元本体不能漏**——只搬「上下文覆盖」（如 `.stat-head .ic`）而漏掉 `.ic` 本身，
+图标 SVG 会退回浏览器默认的 300×150 且 `fill` 为默认黑，界面上就是盖住内容的大黑块。
+
+改完样式用 `scripts/shot.cjs` 截图核对实际渲染：
+
+```bash
+npm run build
+env -u ELECTRON_RUN_AS_NODE npx electron scripts/shot.cjs ./shots
+```
+
+> Windows 下启动 Electron 必须剥掉 `ELECTRON_RUN_AS_NODE`（沙箱会设这个变量，
+> 它让 Electron 以纯 Node 模式运行，`app` 会是 undefined）。`scripts/smoke.cjs`
+> 走全链路冒烟，用法相同。
+
 ---
 
 ## 开发
