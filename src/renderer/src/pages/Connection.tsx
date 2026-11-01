@@ -204,15 +204,13 @@ export function Connection(): React.JSX.Element {
           </label>
           <label className="field">
             <span>排除规则</span>
-            <div className="input">
-              <textarea
-                className="mono"
-                rows={4}
-                value={excludeText}
-                onChange={(e) => setExcludeText(e.target.value)}
-                placeholder={'**/node_modules/**\n**/.git/**\n**/*.tmp\n~$*'}
-              />
-            </div>
+            <textarea
+              className="textarea mono"
+              rows={4}
+              value={excludeText}
+              onChange={(e) => setExcludeText(e.target.value)}
+              placeholder={'**/node_modules/**\n**/.git/**\n**/*.tmp\n~$*'}
+            />
             <em>glob 语法，每行一条；Watcher 与 Planner 两层同时生效</em>
           </label>
         </div>
