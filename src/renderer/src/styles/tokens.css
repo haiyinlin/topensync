@@ -1,0 +1,83 @@
+/*
+ * 设计令牌 —— 与 ui-prototype/styles.css 保持一致。
+ *
+ * 视觉基准：深色底、单一青绿强调色、卡片 + 1px 低对比边框、
+ * 等宽字体仅用于哈希/尺寸/路径/时间。
+ */
+:root {
+  --bg: #0a0a0b;
+  --panel: #0f0f11;
+  --rail: #0c0c0e;
+  --card: #161619;
+  --card-hi: #1b1b1f;
+  --line: rgba(255, 255, 255, 0.075);
+  --line-soft: rgba(255, 255, 255, 0.045);
+  --tx1: #ededef;
+  --tx2: #9c9ca3;
+  --tx3: #6a6a72;
+
+  --accent: #2fd8a4;
+  --accent-bg: rgba(47, 216, 164, 0.13);
+  --blue: #5b9cff;
+  --blue-bg: rgba(91, 156, 255, 0.13);
+  --amber: #f5a524;
+  --amber-bg: rgba(245, 165, 36, 0.13);
+  --red: #e5484d;
+  --red-bg: rgba(229, 72, 77, 0.13);
+  --green: #3fb950;
+  --green-bg: rgba(63, 185, 80, 0.13);
+  --orange: #ff8a3d;
+  --orange-bg: rgba(255, 138, 61, 0.13);
+  --purple: #a78bfa;
+  --purple-bg: rgba(167, 139, 250, 0.13);
+
+  --radius: 14px;
+  --font:
+    'Inter', 'Segoe UI Variable Text', 'Segoe UI', -apple-system, BlinkMacSystemFont,
+    'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --mono:
+    'JetBrains Mono', 'Cascadia Mono', ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--tx1);
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* 背景微光，呼应整体氛围 */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(680px 420px at 6% -8%, rgba(24, 120, 96, 0.2), transparent 70%),
+    radial-gradient(620px 380px at 96% 2%, rgba(52, 86, 160, 0.16), transparent 72%),
+    radial-gradient(520px 320px at 88% 104%, rgba(70, 52, 140, 0.12), transparent 70%);
+}
+
+.mono {
+  font-family: var(--mono);
+  font-variant-ligatures: none;
+}
+
+.dim {
+  color: var(--tx3);
+}
