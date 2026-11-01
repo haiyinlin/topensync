@@ -7,7 +7,7 @@ import { hashFile, verifyUnchanged } from '../hash/hashes'
 import type { AppConfig } from '@shared/types'
 
 /**
- * 传输执行器（计划书 §8）。
+ * 传输执行器。
  *
  * 两档路径：
  * - ≤ singlePutMaxBytes（默认 8MB）：单次 PUT /api/fs/put
@@ -70,7 +70,7 @@ export class Transfer {
       : this.uploadSingle(fileId, localPath, remotePath, hashes.md5, hashes.sha1, size, mtimeMs)
   }
 
-  /** 小/中文件：单次流式 PUT（计划书 §8.2） */
+  /** 小/中文件：单次流式 PUT */
   private async uploadSingle(
     fileId: number,
     localPath: string,
@@ -112,7 +112,7 @@ export class Transfer {
     }
   }
 
-  /** 大文件：分片上传（计划书 §8.3） */
+  /** 大文件：分片上传 */
   private async uploadMultipart(
     fileId: number,
     localPath: string,

@@ -1,11 +1,11 @@
 /**
  * 全局共享类型定义（主进程 / 预加载 / 渲染进程共用）。
  *
- * 数据模型对应《计划.md》§5，此处为唯一权威定义；
- * SQLite 表结构见计划书 §5.1，字段命名与本文件保持一致。
+ * 数据模型的唯一权威定义；
+ * SQLite 表结构的字段命名与本文件保持一致。
  */
 
-// ── 文件同步状态（计划书 §5.2 状态机）────────────────────────────
+// ── 文件同步状态（状态机）────────────────────────────
 export type FileState =
   | 'pending' // 待处理（新增或已排入队列）
   | 'hashing' // 正在计算 md5 + sha1
@@ -19,7 +19,7 @@ export type FileState =
   | 'remote_only' // 仅远端存在（本地无此文件）
   | 'conflict' // 两侧内容分叉
 
-// ── 对账差异类型（计划书 §6.5）────────────────────────────────────
+// ── 对账差异类型────────────────────────────────────
 export type DiffKind =
   | 'local_only' // 本地有，远端无
   | 'remote_only' // 远端有，本地无
@@ -34,7 +34,7 @@ export type DiffResolution =
   | 'overwritten' // 已用本地版本覆盖远端
   | 'pulled' // 已下载到本地
 
-// ── 扫描批次（计划书 §5.1 scans 表）──────────────────────────────
+// ── 扫描批次（scans 表）──────────────────────────────
 export type ScanKind = 'local' | 'remote'
 export type ScanTrigger = 'startup' | 'timer' | 'manual' | 'event'
 export type ScanStatus = 'running' | 'done' | 'failed' | 'cancelled'
@@ -52,7 +52,7 @@ export interface ScanRecord {
   errorMsg: string | null
 }
 
-// ── 文件条目（计划书 §5.1 files 表）───────────────────────────────
+// ── 文件条目（files 表）───────────────────────────────
 export interface FileEntry {
   id: number
   localPath: string // 相对同步根目录，POSIX 分隔
@@ -71,7 +71,7 @@ export interface FileEntry {
   deletedAt: number | null
 }
 
-// ── 差异条目（计划书 §5.1 diffs 表）──────────────────────────────
+// ── 差异条目（diffs 表）──────────────────────────────
 export interface DiffEntry {
   id: number
   kind: DiffKind
@@ -86,7 +86,7 @@ export interface DiffEntry {
   resolution: DiffResolution | null
 }
 
-// ── 传输任务（计划书 §8）────────────────────────────────────────
+// ── 传输任务────────────────────────────────────────
 export type TransferMode = 'single' // 单次 PUT /api/fs/put
 export type TransferState = 'queued' | 'hashing' | 'uploading' | 'verifying' | 'done' | 'failed' | 'canceled'
 
@@ -112,7 +112,7 @@ export interface TransferTask {
   attempts: number
 }
 
-// ── 配置（计划书 §10）──────────────────────────────────────────
+// ── 配置──────────────────────────────────────────
 export interface RemoteScanConfig {
   enabled: boolean
   intervalHours: number

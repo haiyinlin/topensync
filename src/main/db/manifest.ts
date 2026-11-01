@@ -6,7 +6,7 @@ import type { AppConfig, FileEntry, FileState, DiffEntry, ScanRecord } from '@sh
 /**
  * 本地清单数据库（node:sqlite，Electron 36+ 内置，无 native 编译）。
  *
- * Schema 与《计划.md》§5.1 一一对应，是唯一权威定义。
+ * Schema 是数据层的唯一权威定义。
  */
 
 const SCHEMA = `
@@ -178,7 +178,7 @@ export class Manifest {
     return rows.map((r) => mapFileRow(r) as unknown as FileEntry)
   }
 
-  /** L1 本地去重的快筛：size + mtime 都一致则可跳过（计划书 §6.3） */
+  /** L1 本地去重的快筛：size + mtime 都一致则可跳过 */
   isUnchanged(localPath: string, size: number, mtimeMs: number): boolean {
     const row = this.db
       .prepare('SELECT local_size, mtime_ms FROM files WHERE local_path = ?')
