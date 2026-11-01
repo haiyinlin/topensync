@@ -12,6 +12,7 @@ import { TransferRules } from './pages/TransferRules'
 import { ReconcileRules } from './pages/ReconcileRules'
 import { Advanced } from './pages/Advanced'
 import { Help } from './pages/Help'
+import { useAppStore } from './store'
 
 /**
  * 渲染进程根组件。
@@ -57,6 +58,12 @@ function readHash(): PageKey {
 
 export function App(): React.JSX.Element {
   const [page, setPage] = useState<PageKey>(readHash)
+  const init = useAppStore((s) => s.init)
+
+  // 首屏拉一次全量快照，并建立与主进程的事件订阅
+  useEffect(() => {
+    void init()
+  }, [init])
 
   useEffect(() => {
     const onHash = (): void => setPage(readHash())

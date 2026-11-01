@@ -1,8 +1,7 @@
 import * as React from 'react'
-import { useEffect, useState } from 'react'
 import { Icon } from '../components/Icon'
 import type { PageKey } from '../App'
-import type { DiffEntry, ScanRecord, TransferTask } from '@shared/types'
+import { useAppStore } from '../store'
 
 /**
  * 概览页。
@@ -11,31 +10,18 @@ import type { DiffEntry, ScanRecord, TransferTask } from '@shared/types'
  * 远端对账（周期性）必须视觉可区分，不能合并成一个进度条。
  */
 export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): React.JSX.Element {
-  const [tasks, setTasks] = useState<TransferTask[]>([])
-  const [diffs, setDiffs] = useState<DiffEntry[]>([])
-  const [remoteScan, setRemoteScan] = useState<ScanRecord | null>(null)
+  const stats = useAppStore((s) => s.stats)
+  const tasks = useAppStore((s) => s.tasks)
+  const diffs = useAppStore((s) => s.diffs)
+  const remoteScan = useAppStore((s) => s.stats?.remoteScan ?? null)
+  const localScan = useAppStore((s) => s.stats?.localScan ?? null)
 
-  useEffect(() => {
-    const offTask = window.topensync?.onTransferUpdate((t) =>
-      setTasks((prev) => [...prev.filter((x) => x.id !== t.id), t])
-    )
-    const offDiff = window.topensync?.onDiffUpdate((d) => setDiffs((prev) => [d, ...prev]))
-    const offScan = window.topensync?.onScanUpdate((s) => {
-      if (s.kind === 'remote') setRemoteScan(s)
-    })
-    return () => {
-      offTask?.()
-      offDiff?.()
-      offScan?.()
-    }
-  }, [])
-
-  const failed = tasks.filter((t) => t.state === 'failed').length
-  const queued = tasks.filter((t) => t.state === 'queued').length
-  const active = tasks.filter((t) => t.state === 'uploading')
+  const failed = stats?.failed ?? 0
+  const queued = stats?.queued ?? 0
+  const active = tasks.filter((t) => t.state === 'uploading' || t.state === 'hashing')
   const openDiffs = diffs.filter((d) => !d.resolvedAt)
 
-  const remoteState = remoteScan?.status === 'running' ? 'running' : 'idle'
+  const remoteState = remoteScan?.running ? 'running' : 'idle'
 
   return (
     <section>
@@ -86,7 +72,11 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
                   实时监控中
                 </span>
               </div>
-              <div className="ch-sub mono">监听本地同步目录 · 待处理变更 {queued}</div>
+              <div className="ch-sub mono">
+                {localScan?.watching
+                  ? `监听本地同步目录 · 待处理变更 ${queued}`
+                  : '未在监控中（尚未设置同步目录）'}
+              </div>
               <div className="bar thin idle">
                 <i style={{ width: '100%' }} />
               </div>
@@ -96,7 +86,12 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
                 <span className="mono">{queued}</span>
                 <em>待处理变更</em>
               </div>
-              <button className="btn tiny ghost">重新扫描</button>
+              <button
+                className="btn tiny ghost"
+                onClick={() => window.topensync?.triggerScan('local')}
+              >
+                重新扫描
+              </button>
             </div>
           </div>
 
@@ -119,8 +114,8 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
                 </span>
               </div>
               <div className="ch-sub mono">
-                {remoteScan
-                  ? `扫描 ${remoteScan.scannedCount} 个目录 · 发现 ${remoteScan.changedCount} 处差异`
+                {remoteScan?.lastScanAt
+                  ? `上次扫描 ${remoteScan.scannedCount} 个文件 · 发现 ${remoteScan.diffCount} 处差异`
                   : '尚未执行对账'}
               </div>
               <div className="bar thin idle">
@@ -146,7 +141,7 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
             <Icon name="check" className="ic teal" />
             已同步
           </div>
-          <div className="stat-val mono">0</div>
+          <div className="stat-val mono">{stats?.synced ?? 0}</div>
           <div className="stat-foot">远端已确认存在且大小一致</div>
         </div>
         <div className="card stat">
@@ -162,7 +157,7 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
             <Icon name="filters" className="ic dim" />
             本次跳过
           </div>
-          <div className="stat-val mono">0</div>
+          <div className="stat-val mono">{stats?.skipped ?? 0}</div>
           <div className="stat-foot">本地去重命中 · 零上行</div>
         </div>
         <div className="card stat">

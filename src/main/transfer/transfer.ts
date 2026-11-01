@@ -3,7 +3,7 @@ import { stat } from 'fs/promises'
 import { Readable } from 'stream'
 import type { OpenListClient } from '../openlist/client'
 import type { Manifest } from '../db/manifest'
-import { hashFile, verifyUnchanged } from '../hash/hashes'
+import { hashFile, verifyUnchanged, type FileHashes } from '../hash/hashes'
 import type { AppConfig } from '@shared/types'
 
 /**
@@ -23,6 +23,8 @@ export interface TransferOptions {
   config: AppConfig
   onProgress?: (info: {
     fileId: number
+    /** 相对同步根的路径，用于把进度对应回 UI 上的任务 */
+    relPath: string
     sent: number
     total: number
     chunksDone: number
@@ -38,6 +40,18 @@ export interface TransferResult {
   rapidUpload?: boolean
 }
 
+export interface UploadRequest {
+  fileId: number
+  /** 清单键：相对同步根的路径。清单的状态更新都用它。 */
+  relPath: string
+  /** 实际读盘路径（绝对路径，可能带 \\?\ 长路径前缀） */
+  absPath: string
+  /** 远端路径 */
+  remotePath: string
+  /** 预计算的双哈希；有则跳过重复读盘 */
+  hashes?: FileHashes
+}
+
 export class Transfer {
   constructor(private readonly opts: TransferOptions) {}
 
@@ -45,58 +59,63 @@ export class Transfer {
    * 上传一个文件。调用方需已确保该文件需要上传
    * （L1 去重命中时不要走这里）。
    */
-  async upload(fileId: number, localPath: string, remotePath: string): Promise<TransferResult> {
+  async upload(req: UploadRequest): Promise<TransferResult> {
     const { manifest, config } = this.opts
 
-    const st = await stat(localPath)
+    const st = await stat(req.absPath)
     const mtimeMs = st.mtimeMs
     const size = st.size
 
-    // 双哈希（夸克秒传的硬性要求）
-    const hashes = await hashFile(localPath)
+    // 双哈希（夸克秒传的硬性要求）。Planner 阶段已算过就复用，不重复读盘。
+    const hashes = req.hashes ?? (await hashFile(req.absPath))
 
     // 竞态复核：哈希期间文件可能已被改写
-    const unchanged = await verifyUnchanged(localPath, { size: st.size, mtimeMs })
+    const unchanged = await verifyUnchanged(req.absPath, { size: st.size, mtimeMs })
     if (!unchanged) {
-      manifest.setState(localPath, 'stale', { errorMsg: '哈希期间文件已变更' })
+      manifest.setState(req.relPath, 'stale', { errorMsg: '哈希期间文件已变更' })
       return { ok: false, error: '哈希期间文件已变更，需重新计算' }
     }
 
-    manifest.setState(localPath, 'hashed', { md5: hashes.md5, sha1: hashes.sha1 })
+    manifest.setState(req.relPath, 'hashed', { md5: hashes.md5, sha1: hashes.sha1 })
 
     const useMultipart = size > config.singlePutMaxBytes
     return useMultipart
-      ? this.uploadMultipart(fileId, localPath, remotePath, hashes.md5, hashes.sha1, size, mtimeMs)
-      : this.uploadSingle(fileId, localPath, remotePath, hashes.md5, hashes.sha1, size, mtimeMs)
+      ? this.uploadMultipart(req, hashes.md5, hashes.sha1, size, mtimeMs)
+      : this.uploadSingle(req, hashes.md5, hashes.sha1, size, mtimeMs)
   }
 
   /** 小/中文件：单次流式 PUT */
   private async uploadSingle(
-    fileId: number,
-    localPath: string,
-    remotePath: string,
+    req: UploadRequest,
     md5: string,
     sha1: string,
     size: number,
     mtimeMs: number
   ): Promise<TransferResult> {
     const { client, manifest } = this.opts
-    manifest.setState(localPath, 'uploading')
+    manifest.setState(req.relPath, 'uploading')
 
     try {
-      const stream = createReadStream(localPath)
+      const stream = createReadStream(req.absPath)
       const body = Readable.toWeb(stream) as ReadableStream<Uint8Array>
 
-      await client.putFile(remotePath, body, {
+      await client.putFile(req.remotePath, body, {
         size,
         md5,
         sha1,
         lastModifiedMs: Math.floor(mtimeMs)
       })
 
-      manifest.setState(localPath, 'synced', { remoteSize: size })
+      // syncedSize / syncedMtimeMs 是 L1 去重的基准，必须写实际传输的那组值。
+      // mtime 存原始浮点值，不取整——取整会让后续比较对不上，去重永远不命中。
+      manifest.setState(req.relPath, 'synced', {
+        remoteSize: size,
+        syncedSize: size,
+        syncedMtimeMs: mtimeMs
+      })
       this.opts.onProgress?.({
-        fileId,
+        fileId: req.fileId,
+        relPath: req.relPath,
         sent: size,
         total: size,
         chunksDone: 1,
@@ -106,27 +125,25 @@ export class Transfer {
       return { ok: true }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      manifest.setState(localPath, 'error', { errorMsg: message })
-      manifest.log('error', `上传失败：${localPath}（${message}）`, fileId, remotePath)
+      manifest.setState(req.relPath, 'error', { errorMsg: message })
+      manifest.log('error', `上传失败：${req.relPath}（${message}）`, req.fileId, req.remotePath)
       return { ok: false, error: message }
     }
   }
 
   /** 大文件：分片上传 */
   private async uploadMultipart(
-    fileId: number,
-    localPath: string,
-    remotePath: string,
+    req: UploadRequest,
     md5: string,
     sha1: string,
     size: number,
     mtimeMs: number
   ): Promise<TransferResult> {
     const { client, manifest } = this.opts
-    manifest.setState(localPath, 'uploading')
+    manifest.setState(req.relPath, 'uploading')
 
     try {
-      const init = await client.multipartInit(remotePath, {
+      const init = await client.multipartInit(req.remotePath, {
         size,
         md5,
         sha1,
@@ -154,12 +171,13 @@ export class Transfer {
         const offset = i * chunkSize
         const length = Math.min(chunkSize, size - offset)
 
-        await this.sendChunkWithRetry(uploadId, i, localPath, offset, length)
+        await this.sendChunkWithRetry(uploadId, i, req.absPath, offset, length)
 
         sent += length
         const elapsed = (Date.now() - startedAt) / 1000
         this.opts.onProgress?.({
-          fileId,
+          fileId: req.fileId,
+          relPath: req.relPath,
           sent,
           total: size,
           chunksDone: i + 1,
@@ -170,12 +188,16 @@ export class Transfer {
 
       await client.multipartComplete(uploadId)
 
-      manifest.setState(localPath, 'synced', { remoteSize: size })
+      manifest.setState(req.relPath, 'synced', {
+        remoteSize: size,
+        syncedSize: size,
+        syncedMtimeMs: mtimeMs
+      })
       return { ok: true }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      manifest.setState(localPath, 'error', { errorMsg: message })
-      manifest.log('error', `分片上传失败：${localPath}（${message}）`, fileId, remotePath)
+      manifest.setState(req.relPath, 'error', { errorMsg: message })
+      manifest.log('error', `分片上传失败：${req.relPath}（${message}）`, req.fileId, req.remotePath)
       return { ok: false, error: message }
     }
   }

@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "description": "Windows 桌面同步程序：本地目录 → OpenList → 夸克网盘",
   "private": true,
-  "type": "module",
   "main": "./out/main/index.js",
   "engines": {
     "node": ">=22.0.0"
@@ -21,9 +20,10 @@
   },
   "dependencies": {
     "chokidar": "^4.0.3",
-    "zustand": "^5.0.3",
+    "minimatch": "^10.2.6",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "zustand": "^5.0.3"
   },
   "devDependencies": {
     "@electron-toolkit/utils": "^3.0.0",

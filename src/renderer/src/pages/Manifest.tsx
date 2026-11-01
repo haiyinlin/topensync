@@ -2,8 +2,9 @@ import * as React from 'react'
 import { useMemo, useState } from 'react'
 import { Icon } from '../components/Icon'
 import type { PageKey } from '../App'
-import type { DiffKind, FileEntry } from '@shared/types'
+import type { DiffKind } from '@shared/types'
 import { formatSize } from './Queue'
+import { useAppStore } from '../store'
 
 /**
  * 文件清单。
@@ -17,17 +18,37 @@ type StatusFilter = 'all' | 'synced' | 'pending' | 'deleted'
 type DiffFilter = DiffKind | 'all' | 'none'
 
 export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void }): React.JSX.Element {
-  const [files] = useState<FileEntry[]>([])
+  const files = useAppStore((s) => s.files)
+  const diffs = useAppStore((s) => s.diffs)
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [diffFilter, setDiffFilter] = useState<DiffFilter>('all')
+
+  // 本地路径 → 对账差异类型。一个文件可能同时「已同步」且「远端缺失」，
+  // 两个维度必须分开呈现，绿色不能掩盖琥珀色。
+  const diffByPath = useMemo(() => {
+    const map = new Map<string, DiffKind>()
+    for (const d of diffs) {
+      if (d.localPath) map.set(d.localPath, d.kind)
+    }
+    return map
+  }, [diffs])
+
+  const diffCounts = useMemo(() => {
+    const map = new Map<DiffKind, number>()
+    for (const d of diffs) map.set(d.kind, (map.get(d.kind) ?? 0) + 1)
+    return map
+  }, [diffs])
 
   const shown = useMemo(
     () =>
       files.filter((f) => {
         if (statusFilter !== 'all' && f.state !== statusFilter) return false
+        const kind = diffByPath.get(f.localPath)
+        if (diffFilter === 'none') return !kind
+        if (diffFilter !== 'all') return kind === diffFilter
         return true
       }),
-    [files, statusFilter]
+    [files, statusFilter, diffFilter, diffByPath]
   )
 
   return (
@@ -76,7 +97,7 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
               className={`chip${diffFilter === kind ? ' active' : ''}`}
               onClick={() => setDiffFilter(kind)}
             >
-              {label} <i>0</i>
+              {label} <i>{diffCounts.get(kind) ?? 0}</i>
             </button>
           ))}
         </div>
@@ -124,7 +145,15 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
                   <span className={`pill ${stateTone(f.state)}`}>{STATE_LABELS[f.state] ?? f.state}</span>
                 </td>
                 <td>
-                  <span className="pill gray">—</span>
+                  {(() => {
+                    const kind = diffByPath.get(f.localPath)
+                    if (!kind) return <span className="pill gray">—</span>
+                    return (
+                      <span className={`pill ${diffTone(kind)}`}>
+                        {DIFF_KIND_LABELS[kind]}
+                      </span>
+                    )
+                  })()}
                 </td>
               </tr>
             ))}
@@ -148,6 +177,30 @@ const DIFF_LABELS: [DiffKind, string][] = [
   ['size_mismatch', '内容不符'],
   ['mtime_mismatch', '时间差异']
 ]
+
+const DIFF_KIND_LABELS: Record<DiffKind, string> = {
+  local_only: '仅本地存在',
+  missing_remote: '远端缺失',
+  remote_only: '仅远端存在',
+  size_mismatch: '内容不符',
+  mtime_mismatch: '时间差异'
+}
+
+/** 差异标签另起一套配色，不与同步状态标签共用 */
+function diffTone(kind: DiffKind): string {
+  switch (kind) {
+    case 'missing_remote':
+      return 'amber'
+    case 'remote_only':
+      return 'purple'
+    case 'size_mismatch':
+      return 'orange'
+    case 'mtime_mismatch':
+      return 'gray'
+    default:
+      return 'gray'
+  }
+}
 
 const STATE_LABELS: Record<string, string> = {
   pending: '等待',
