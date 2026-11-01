@@ -44,4 +44,4 @@ const api = {
 
 export type PreloadApi = typeof api
 
-contextBridge.exposeInMainWorld('quarksync', api)
+contextBridge.exposeInMainWorld('topensync', api)

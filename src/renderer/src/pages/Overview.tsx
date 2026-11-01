@@ -16,11 +16,11 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
   const [remoteScan, setRemoteScan] = useState<ScanRecord | null>(null)
 
   useEffect(() => {
-    const offTask = window.quarksync?.onTransferUpdate((t) =>
+    const offTask = window.topensync?.onTransferUpdate((t) =>
       setTasks((prev) => [...prev.filter((x) => x.id !== t.id), t])
     )
-    const offDiff = window.quarksync?.onDiffUpdate((d) => setDiffs((prev) => [d, ...prev]))
-    const offScan = window.quarksync?.onScanUpdate((s) => {
+    const offDiff = window.topensync?.onDiffUpdate((d) => setDiffs((prev) => [d, ...prev]))
+    const offScan = window.topensync?.onScanUpdate((s) => {
       if (s.kind === 'remote') setRemoteScan(s)
     })
     return () => {

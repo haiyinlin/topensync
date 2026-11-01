@@ -9,7 +9,7 @@ export function Queue(): React.JSX.Element {
   const [filter, setFilter] = useState<'all' | 'uploading' | 'queued' | 'failed'>('all')
 
   useEffect(() => {
-    const off = window.quarksync?.onTransferUpdate((t) =>
+    const off = window.topensync?.onTransferUpdate((t) =>
       setTasks((prev) => [...prev.filter((x) => x.id !== t.id), t])
     )
     return () => off?.()
@@ -99,7 +99,7 @@ export function Queue(): React.JSX.Element {
                     {t.state === 'failed' && (
                       <button
                         className="btn tiny primary"
-                        onClick={() => window.quarksync?.retryTransfer(t.id)}
+                        onClick={() => window.topensync?.retryTransfer(t.id)}
                       >
                         重试
                       </button>
@@ -107,7 +107,7 @@ export function Queue(): React.JSX.Element {
                     {t.state !== 'done' && (
                       <button
                         className="btn tiny ghost"
-                        onClick={() => window.quarksync?.cancelTransfer(t.id)}
+                        onClick={() => window.topensync?.cancelTransfer(t.id)}
                       >
                         取消
                       </button>

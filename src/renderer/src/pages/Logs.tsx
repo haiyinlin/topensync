@@ -13,7 +13,7 @@ export function Logs(): React.JSX.Element {
   const [filter, setFilter] = useState<'all' | 'info' | 'warn' | 'error'>('all')
 
   useEffect(() => {
-    const off = window.quarksync?.onLogAppend((entry) =>
+    const off = window.topensync?.onLogAppend((entry) =>
       setLogs((prev) => [entry, ...prev].slice(0, 500))
     )
     return () => off?.()

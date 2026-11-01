@@ -1,5 +1,5 @@
 {
-  "name": "quarksync-desktop",
+  "name": "topensync",
   "version": "0.1.0",
   "description": "Windows 桌面同步程序：本地目录 → OpenList → 夸克网盘",
   "private": true,
@@ -41,8 +41,8 @@
     "vitest": "^3.0.5"
   },
   "build": {
-    "appId": "dev.quarksync.desktop",
-    "productName": "QuarkSync",
+    "appId": "dev.topensync.desktop",
+    "productName": "TopOpenSync",
     "directories": {
       "output": "release"
     },

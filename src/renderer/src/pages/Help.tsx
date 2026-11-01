@@ -98,7 +98,7 @@ export function Help(): React.JSX.Element {
       <div className="card ver-card">
         <div className="ver-head">
           <span className="kv-k">版本</span>
-          <span className="mono ver-txt">QuarkSync v0.1.0 · dev</span>
+          <span className="mono ver-txt">TopOpenSync v0.1.0 · dev</span>
         </div>
         <div className="hr" />
         <p className="note">

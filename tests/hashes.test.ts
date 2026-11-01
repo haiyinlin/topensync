@@ -13,7 +13,7 @@ import { hashFile, verifyUnchanged } from '../src/main/hash/hashes'
  * 服务端就会退化成缓存整个文件，失去秒传并撑爆内存。
  */
 describe('hashFile', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'quarksync-test-'))
+  const dir = mkdtempSync(join(tmpdir(), 'topensync-test-'))
 
   afterAll(() => {
     rmSync(dir, { recursive: true, force: true })
@@ -58,7 +58,7 @@ describe('hashFile', () => {
 })
 
 describe('verifyUnchanged', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'quarksync-verify-'))
+  const dir = mkdtempSync(join(tmpdir(), 'topensync-verify-'))
 
   afterAll(() => {
     rmSync(dir, { recursive: true, force: true })
