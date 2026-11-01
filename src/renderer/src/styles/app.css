@@ -1,3 +1,153 @@
+/* ── 基元规则 ───────────────────────────────────────────────
+ *
+ * 视觉基准是仓库根目录的 ui-prototype/（浏览器可直接打开对照）。
+ * 应用此前只搬了各类「上下文覆盖」（如 .stat-head .ic），
+ * 漏掉了基元本体（.ic / .switch 等），于是图标 SVG 退回浏览器默认的
+ * 300×150，且 fill 取默认黑 —— 界面上表现为大块黑色图形盖住内容。
+ * 这里补齐基元本体，规则与 ui-prototype/styles.css 保持一致。
+ */
+
+/* 图标基元：固定尺寸 + 无填充 + 描边跟随文字色 */
+.ic {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.ic.chev {
+  width: 14px;
+  height: 14px;
+  color: var(--tx3);
+}
+
+/* 侧边栏图标：默认弱化，悬停与选中时提亮 */
+.nav-item .ic {
+  width: 15px;
+  height: 15px;
+  color: var(--tx3);
+  stroke-width: 1.7;
+}
+
+.nav-item:hover .ic {
+  color: var(--tx2);
+}
+
+.nav-item.active .ic {
+  color: var(--accent);
+}
+
+.rail-foot .nav-item .ic {
+  color: var(--accent);
+}
+
+/* 品牌标记：需要定位上下文承载 ::after 箭头 */
+.brand-mark {
+  position: relative;
+}
+
+.brand-mark::after {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 8px;
+  width: 8px;
+  height: 5px;
+  border-left: 1.8px solid rgba(0, 0, 0, 0.72);
+  border-bottom: 1.8px solid rgba(0, 0, 0, 0.72);
+  transform: rotate(-45deg);
+}
+
+.rail-search input::placeholder {
+  color: var(--tx3);
+}
+
+/* 开关轨道 */
+.switch {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  flex: none;
+  cursor: pointer;
+}
+
+.switch-row:first-of-type {
+  border-top: 0;
+}
+
+/* 键值行 / 表单字段 */
+.kv-row:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.field:last-child {
+  margin-bottom: 0;
+}
+
+.field > span b {
+  color: var(--tx1);
+  font-weight: 500;
+}
+
+.form .card-head {
+  margin-bottom: 14px;
+}
+
+/* 筛选 chips */
+.chip:hover {
+  color: var(--tx1);
+}
+
+.chip.active i {
+  color: var(--tx2);
+}
+
+/* 表格 */
+.tbl tr:last-child td {
+  border-bottom: 0;
+}
+
+.tbl td.nw {
+  white-space: nowrap;
+}
+
+/* 操作条与迷你按钮里的图标 */
+.act-row .btn .ic,
+.btn.tiny .ic {
+  width: 12px;
+  height: 12px;
+}
+
+.btn.busy .ic {
+  animation: spin 1.1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 进度条 */
+.bar.big {
+  height: 5px;
+}
+
+/* 表单控件兜底：裸 textarea 不得回落到浏览器默认外观（白底浅字） */
+textarea {
+  font: inherit;
+  color: var(--tx1);
+  background: #111113;
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  padding: 8px 11px;
+}
+
 /* 应用布局与通用组件样式。 */
 .app {
   position: relative;
@@ -627,6 +777,8 @@
 }
 
 .textarea {
+  display: block;
+  width: 100%;
   background: #111113;
   border: 1px solid var(--line-soft);
   border-radius: 9px;
@@ -636,6 +788,12 @@
   min-height: 84px;
   white-space: pre;
   line-height: 1.7;
+  resize: vertical;
+}
+
+.textarea:focus {
+  outline: 0;
+  border-color: rgba(47, 216, 164, 0.42);
 }
 
 .range {
