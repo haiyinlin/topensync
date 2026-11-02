@@ -422,6 +422,11 @@ export class Planner {
     return { queued, active, failed }
   }
 
+  /** 正在传输的数量（不含排队待传的） */
+  get inFlightCount(): number {
+    return this.inFlight.size + this.inFlightDownloads.size
+  }
+
   /**
    * 积压量：入口事件队列 + 哈希队列 + 上传队列 + 在途。
    *
@@ -437,6 +442,21 @@ export class Planner {
       this.inFlight.size +
       this.inFlightDownloads.size
     )
+  }
+
+  /**
+   * 这个路径当前是否正在传输（上传或下载）。
+   *
+   * 对账必须知道这件事：一个正在上传的文件，远端还没有（或只有半截），
+   * 如果拿它跟清单比，会得出「远端缺失」或「大小不符」——**假差异**。
+   * 假差异会触发重传，形成「上传 → 判缺失 → 重传」的死循环。
+   *
+   * 以前的做法是「等整个上传队列排空再对账」，在整盘场景下等于永远等不到
+   *（几万个文件排队），只能超时报一句「结果可能不完整」。
+   * 现在改成**跳过在途的那几个**，其余照常比对。
+   */
+  isTransferInFlight(relPath: string): boolean {
+    return this.inFlight.has(relPath) || this.inFlightDownloads.has(relPath)
   }
 
   /** 按相对路径取任务（进度回调用它把字节数对应回任务） */

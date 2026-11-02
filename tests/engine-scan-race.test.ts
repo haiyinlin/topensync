@@ -112,35 +112,7 @@ describe('对账与上传的时序', () => {
     rmSync(userDataDir, { recursive: true, force: true })
   })
 
-  it('上传队列排空后才开始对账', async () => {
-    const engine = new Engine({})
-    await engine.start()
-    await engine.updateConfig({
-      syncRoot: join(userDataDir, 'sync'),
-      openlist: {
-        baseUrl: 'http://192.168.100.10:5244',
-        username: 'admin',
-        password: 'secret'
-      },
-      remoteRoot: '/qh/backup',
-      remoteScan: { ...BASE_CONFIG.remoteScan }
-    })
-    // 调度器在「开始同步」之后才建——启动时默认不跑
-    engine.startSync()
-
-    const planner = (engine as unknown as { planner: { isIdle: boolean } }).planner
-    expect(planner).toBeDefined()
-
-    // 队列空闲时不该等待
-    const wait = (engine as unknown as {
-      waitForUploadsToSettle: (ms?: number) => Promise<void>
-    }).waitForUploadsToSettle.bind(engine)
-    await expect(wait(1000)).resolves.toBeUndefined()
-
-    engine.stop()
-  })
-
-  it('上传未完成时，对账会等而不是立刻开跑', async () => {
+  it('队列里还有成千上万个待传文件时，对账不再干等（这是「等待超时」那条告警的根因）', async () => {
     const engine = new Engine({})
     await engine.start()
     await engine.updateConfig({
@@ -156,27 +128,69 @@ describe('对账与上传的时序', () => {
     engine.startSync()
 
     const engineAny = engine as unknown as {
-      planner: { isIdle: boolean; pendingCount: number }
-      waitForUploadsToSettle: (ms?: number) => Promise<void>
+      planner: { isIdle: boolean; pendingCount: number; inFlightCount: number }
+      settleInFlightTransfers: (ms?: number) => Promise<number>
     }
     expect(engineAny.planner).toBeDefined()
 
-    // 假装队列里有东西在跑
-    Object.defineProperty(engineAny.planner, 'isIdle', {
-      get: () => false,
-      configurable: true
-    })
+    /*
+     * 真实场景：整盘首次扫描后有 2705 个任务排队，但**没有一个在途**。
+     * 这些文件还没碰远端，清单里也没有 remote_path，比对阶段根本不会看它们，
+     * 所以对账完全不用等——以前却会干等 30 秒然后报「结果可能不完整」。
+     */
+    Object.defineProperty(engineAny.planner, 'isIdle', { get: () => false, configurable: true })
     Object.defineProperty(engineAny.planner, 'pendingCount', {
-      get: () => 5,
+      get: () => 2705,
       configurable: true
     })
+    Object.defineProperty(engineAny.planner, 'inFlightCount', { get: () => 0, configurable: true })
 
     const started = Date.now()
-    await engineAny.waitForUploadsToSettle(600)
+    const left = await engineAny.settleInFlightTransfers(2_500)
     const elapsed = Date.now() - started
 
-    // 应该等到了超时附近，而不是立刻返回
+    expect(left).toBe(0)
+    expect(elapsed).toBeLessThan(500)
+
+    engine.stop()
+  })
+
+  it('确实有文件在途时只等一小会儿，等不到就交给「跳过在途」处理', async () => {
+    const engine = new Engine({})
+    await engine.start()
+    await engine.updateConfig({
+      syncRoot: join(userDataDir, 'sync'),
+      openlist: {
+        baseUrl: 'http://192.168.100.10:5244',
+        username: 'admin',
+        password: 'secret'
+      },
+      remoteRoot: '/qh/backup',
+      remoteScan: { ...BASE_CONFIG.remoteScan }
+    })
+    engine.startSync()
+
+    const engineAny = engine as unknown as {
+      planner: { isIdle: boolean; pendingCount: number; inFlightCount: number }
+      settleInFlightTransfers: (ms?: number) => Promise<number>
+    }
+
+    // 有 3 个文件正在传，而且一直传不完
+    Object.defineProperty(engineAny.planner, 'isIdle', { get: () => false, configurable: true })
+    Object.defineProperty(engineAny.planner, 'pendingCount', {
+      get: () => 3,
+      configurable: true
+    })
+    Object.defineProperty(engineAny.planner, 'inFlightCount', { get: () => 3, configurable: true })
+
+    const started = Date.now()
+    const left = await engineAny.settleInFlightTransfers(600)
+    const elapsed = Date.now() - started
+
+    // 等到了 grace 上限，并如实回报「还有 3 个会被跳过」
+    expect(left).toBe(3)
     expect(elapsed).toBeGreaterThanOrEqual(500)
+    expect(elapsed).toBeLessThan(3_000)
 
     engine.stop()
   })

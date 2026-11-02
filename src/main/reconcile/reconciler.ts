@@ -107,6 +107,17 @@ export interface ReconcilerOptions {
    */
   probeLocal?: (relPath: string) => { size: number; mtimeMs: number } | null
   /**
+   * 该路径当前是否正在传输（上传 / 下载）。
+   *
+   * 为什么对账需要它：正在上传的文件远端还没有、或只有半截，
+   * 拿它跟清单比就会得出「远端缺失」或「大小不符」——假差异。
+   * 假差异会触发重传，形成「上传 → 判缺失 → 重传」的死循环。
+   *
+   * 为什么不是「等上传跑完再对账」：整盘场景下队列里有几万个文件，
+   * 等是等不到的（只会超时），所以改成**跳过在途的那几个**。
+   */
+  isTransferInFlight?: (relPath: string) => boolean
+  /**
    * 「现在忙不忙」的探针。
    *
    * 对账和同步会同时跑（用户点完「开始同步」再点「对账远端」）。
@@ -131,6 +142,8 @@ export interface ReconcileResult {
   scannedFiles: number
   diffCount: number
   timedOut: boolean
+  /** 因「正在传输」而跳过的文件数：它们不是差异，下一轮会对上 */
+  skippedInFlight?: number
   error?: string
 }
 
@@ -229,6 +242,8 @@ export class Reconciler {
     let scannedFiles = 0
     let diffCount = 0
     let timedOut = false
+    /** 因正在传输而跳过的文件数（不是差异，下一轮会覆盖） */
+    let skippedInFlight = 0
 
     try {
       const root = config.remoteRoot
@@ -392,6 +407,15 @@ export class Reconciler {
         const local = localByRemote.get(remotePath)
         if (!local) {
           /*
+           * 正在上传的文件先跳过：远端此刻可能还没有它，或只有半截。
+           * 下一轮对账会覆盖到——跳过比误判安全得多。
+           */
+          const inFlightRel = relativizeRemote(config.remoteRoot, remotePath)
+          if (inFlightRel && this.opts.isTransferInFlight?.(inFlightRel)) {
+            skippedInFlight++
+            continue
+          }
+          /*
            * localPath 记「它本该在本地哪个位置」。
            *
            * 不是 null——null 会让这一条差异在清单页无从显示，
@@ -468,6 +492,11 @@ export class Reconciler {
         // 两边都有：比对大小与修改时间
         const remoteMtime = parseModified(obj.modified)
         if (local.remoteSize !== obj.size) {
+          // 正在上传（远端还是半截）→ 不是差异，是本轮不该看它
+          if (this.opts.isTransferInFlight?.(local.localPath)) {
+            skippedInFlight++
+            continue
+          }
           const entry = manifest.recordDiff({
             kind: 'size_mismatch',
             localPath: local.localPath,
@@ -509,6 +538,12 @@ export class Reconciler {
 
         // 所属目录本轮列举不可信 → 不能判它「缺失」
         if (isUnderAnyDir(local.remotePath, unreliableDirs)) continue
+
+        // 正在传输 → 远端本来就可能还没有，不是差异
+        if (this.opts.isTransferInFlight?.(local.localPath)) {
+          skippedInFlight++
+          continue
+        }
 
         // ⚠️ 「远端没有」这个结论必须复核后才能成立。
         //
@@ -557,7 +592,13 @@ export class Reconciler {
         errors: 0
       })
 
-      const result = { scanId, scannedDirs, scannedFiles, diffCount, timedOut }
+      const result = { scanId, scannedDirs, scannedFiles, diffCount, timedOut, skippedInFlight }
+      if (skippedInFlight > 0) {
+        manifest.log(
+          'info',
+          `本轮对账跳过 ${skippedInFlight} 个正在传输的文件（下一轮自动覆盖，不计为差异）`
+        )
+      }
       this.opts.onComplete?.(result)
       return result
     } catch (err) {
@@ -570,6 +611,7 @@ export class Reconciler {
         scannedFiles,
         diffCount,
         timedOut: false,
+        skippedInFlight,
         error: message
       }
       this.opts.onComplete?.(result)

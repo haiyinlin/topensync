@@ -1012,7 +1012,8 @@ export class Engine {
             ? `对账失败：${res.error}`
             : res.timedOut
               ? '对账超时结束'
-              : `对账完成，扫描 ${res.scannedFiles} 个文件，发现 ${res.diffCount} 处差异`,
+              : `对账完成，扫描 ${res.scannedFiles} 个文件，发现 ${res.diffCount} 处差异` +
+                (res.skippedInFlight ? `（跳过 ${res.skippedInFlight} 个正在传输的文件）` : ''),
           error: res.error ?? null
         })
         this.events.onScan?.({
@@ -1050,7 +1051,14 @@ export class Engine {
        * 两个后台任务抢同一个主线程，谁都不让的结果就是界面完全不响应。
        * 对账是「可以慢慢跑」的那一方，所以让它在分片之间多睡一会儿。
        */
-      isBusy: () => this.isForegroundBusy()
+      isBusy: () => this.isForegroundBusy(),
+      /*
+       * 正在传输的文件不参与比对。
+       *
+       * 它们远端还没有、或只有半截，比出来的「远端缺失」「大小不符」
+       * 全是假差异，还会触发重传形成死循环。跳过是唯一安全的做法。
+       */
+      isTransferInFlight: (relPath) => this.planner?.isTransferInFlight(relPath) ?? false
     })
 
     /*
@@ -1212,32 +1220,51 @@ export class Engine {
   }
 
   /**
-   * 等上传队列排空。
+   * 让「正在传输的那几个文件」先落地，最多等 graceMs。
    *
-   * 远端对账的前置条件：上传没跑完时清单里没有对应记录，
-   * 对账会把「本地有、远端也有、只是还没记进清单」的文件
-   * 判成「仅远端存在」——假差异，照着提示操作还会误删远端文件。
+   * 以前的实现是等**整个上传队列**排空（上限 30 秒）。整盘场景下队列里
+   * 有上万条，30 秒必然超时，于是只能打一句「对账结果可能不完整」的告警——
+   * 用户既没法据此判断结果能不能信，又什么都做不了。
    *
-   * 上限 30 秒：上传卡住时不能让对账一直排队。
+   * 现在的分工：
+   * 1. 在途的（最多 hash + upload 并发的那个数，通常 ≤6 个）给 2.5 秒落地，
+   *    能等到的就不用被跳过；
+   * 2. 等不到的交给对账的「跳过在途文件」逻辑——它们**不计为差异**，
+   *    下一轮自然会对上。
+   *
+   * 排队但还没开始的那些完全不影响对账：它们还没碰远端，
+   * 清单里也没有 remote_path，比对阶段根本不会看它们。
+   *
+   * @returns 仍然在途、会被本轮对账跳过的文件数
    */
-  private async waitForUploadsToSettle(timeoutMs = 30_000): Promise<void> {
+  private async settleInFlightTransfers(graceMs = 2_500): Promise<number> {
     const planner = this.planner
-    if (!planner || planner.isIdle) return
+    if (!planner) return 0
 
-    const pending = planner.pendingCount
-    this.pushLog('info', `等待 ${pending} 个上传任务完成后再执行对账…`)
-
-    const deadline = Date.now() + timeoutMs
-    while (!planner.isIdle && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 300))
+    if (planner.inFlightCount === 0) {
+      const queued = planner.pendingCount
+      if (queued > 0) {
+        this.pushLog(
+          'info',
+          `还有 ${queued} 个文件排队待传，本轮对账照常执行（正在传输的文件会被跳过，不计为差异）`
+        )
+      }
+      return 0
     }
 
-    if (!planner.isIdle) {
+    const deadline = Date.now() + graceMs
+    while (planner.inFlightCount > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+
+    const left = planner.inFlightCount
+    if (left > 0) {
       this.pushLog(
-        'warn',
-        `等待上传完成超时（仍有 ${planner.pendingCount} 个任务在跑），对账结果可能不完整`
+        'info',
+        `${left} 个文件正在传输，本轮对账跳过它们（不计为差异，下一轮自动覆盖）`
       )
     }
+    return left
   }
 
   /**
@@ -1294,14 +1321,14 @@ export class Engine {
        *
        * 等不了太久：上传卡住时不能让对账一直排队。
        */
-      await this.waitForUploadsToSettle()
+      await this.settleInFlightTransfers()
 
       this.remoteScanRunning = true
       const startedAt = Date.now()
       /*
-       * 进度从「等待上传完成」开始报。
+       * 进度从「准备阶段」开始报。
        *
-       * 对账之前要等上传队列排空，那段等待也是用户看得见的等待——
+       * 对账之前要等在途文件落地，那段等待也是用户看得见的等待——
        * 不报进度的话，界面会从「点了对账」一直静默到对账真正开始。
        */
       this.pushProgress({
@@ -1309,7 +1336,7 @@ export class Engine {
         running: true,
         done: 0,
         total: null,
-        detail: '正在等待上传队列完成…'
+        detail: '正在准备对账…'
       })
       this.events.onScan?.({
         id: 0,
