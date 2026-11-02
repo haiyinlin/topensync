@@ -565,7 +565,7 @@ describe('Planner 的未完成任务恢复', () => {
     })
     planner.start()
 
-    const recovered = planner.recoverPending()
+    const recovered = await planner.recoverPending()
     await settle(400)
 
     expect(recovered).toBe(0)
@@ -594,7 +594,7 @@ describe('Planner 的未完成任务恢复', () => {
     })
     planner.start()
 
-    const recovered = planner.recoverPending()
+    const recovered = await planner.recoverPending()
     await settle(400)
 
     expect(recovered).toBe(1)
@@ -660,7 +660,7 @@ describe('取消后的持久化语义', () => {
       getConfig: () => ({ ...CONFIG, syncRoot })
     })
     planner2.start()
-    const recovered = planner2.recoverPending()
+    const recovered = await planner2.recoverPending()
     await settle(400)
 
     expect(recovered).toBe(0)

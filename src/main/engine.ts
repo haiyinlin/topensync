@@ -410,11 +410,18 @@ export class Engine {
       this.planner = this.buildPlanner()
       this.planner.start()
 
-      // 恢复上次未完成的任务
-      const recovered = this.planner.recoverPending()
-      if (recovered > 0) {
-        this.pushLog('info', `恢复未完成任务 ${recovered} 个`)
-      }
+      /*
+       * 恢复上次未完成的任务（异步，不阻塞「开始同步」返回）。
+       *
+       * 整盘场景下待恢复文件可达上千个，逐个异步探测 SMB 盘要几秒，
+       * 同步调用会把主线程锁死——用户反馈的「点开始同步卡顿」，
+       * 一部分就来自这里。恢复在后台进行，界面即时响应。
+       */
+      void this.planner.recoverPending().then((recovered) => {
+        if (recovered > 0) {
+          this.pushLog('info', `恢复未完成任务 ${recovered} 个`)
+        }
+      })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       this.pushLog('error', `调度器启动失败：${message}`, { category: 'system' })
@@ -479,6 +486,25 @@ export class Engine {
         await new Promise((resolve) => setTimeout(resolve, 500))
       }
       if (!this.started || this.paused) return
+
+      /*
+       * 队列还没安静 → 跳过这一轮「启动对账」。
+       *
+       * 用户反馈「同步过程中又去重新扫对账」：整盘场景下队列里有几千到
+       * 几万个文件要传，30 秒根本等不到空闲。以前的逻辑是等满 30 秒后
+       * **照样**跑对账——于是同步还在传，对账又跟上传抢网络与主线程。
+       *
+       * 对账不是丢了：定时对账（remoteScan.intervalHours）仍然按周期跑，
+       * 用户也可以随时手动「立即对账」。这里只是**不趁同步正忙时硬插一轮**。
+       */
+      if (this.planner && !this.planner.isIdle) {
+        this.pushLog(
+          'info',
+          '上传队列仍在工作，跳过本轮启动对账（定时对账会照常进行，也可手动立即对账）',
+          { category: 'reconcile' }
+        )
+        return
+      }
 
       const res = await this.reconciler?.runStartup()
       if (res) {
@@ -1957,10 +1983,11 @@ export class Engine {
      * 它们在清单里停在 pending，而本次会话再也不会处理它们。
      * 用户点「恢复」却什么都没发生，看起来就是「暂停把同步搞坏了」。
      */
-    const recovered = this.planner.recoverPending()
-    if (recovered > 0) {
-      this.pushLog('info', `已恢复同步，重新排队 ${recovered} 个待处理文件`)
-    }
+    void this.planner.recoverPending().then((recovered) => {
+      if (recovered > 0) {
+        this.pushLog('info', `已恢复同步，重新排队 ${recovered} 个待处理文件`)
+      }
+    })
     const localReady = this.armLocalReady()
     this.startWatcher()
     this.startReconciler()

@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto'
-import { existsSync, statSync } from 'fs'
+import { existsSync } from 'fs'
 import { mkdir, rm, stat } from 'fs/promises'
 import { dirname } from 'path'
 import type { Manifest } from '../db/manifest'
@@ -8,6 +8,7 @@ import type { FileHashes } from '../hash/hashes'
 import { hashFile } from '../hash/hashes'
 import type { OpenListClient } from '../openlist/client'
 import { ioGovernor, isResourceExhausted, isResourceExhaustedMessage } from '../io/governor'
+import { tick } from '../io/tick'
 import {
   absolutize,
   isExcluded,
@@ -2122,14 +2123,23 @@ export class Planner {
    *
    * 上次退出时处于 uploading / error 的文件重新入队。
    * 哈希若已记录则复用（省一次读盘），否则重算。
+   *
+   * **异步**：整盘场景下待恢复文件可多达上千个，对每个文件做一次
+   * 磁盘探测（existsSync / statSync）。在 SMB 网络盘上单次同步探测
+   * 约 18ms，1000 个就是 18 秒——`startSync` 里同步调用它，
+   * 主线程被锁死十几秒，「点开始同步卡顿」就是这么来的。
+   *
+   * 改成异步 + 分批让出事件循环后，恢复在后台进行，界面即时响应。
    */
-  recoverPending(): number {
+  async recoverPending(): Promise<number> {
     const manifest = this.opts.manifest
     const config = this.opts.getConfig()
     const pending = manifest.listFilesByStates(['uploading', 'error', 'hashed', 'pending'])
 
     let recovered = 0
+    let i = 0
     for (const entry of pending) {
+      i++
       const absPath = absolutize(config.syncRoot, entry.localPath)
 
       /*
@@ -2142,55 +2152,64 @@ export class Planner {
        *
        * 判据：本地路径下**确实存在**这个文件，才算待恢复的任务。
        * 不存在 = 那是别的目录留下的历史记录，不该重传。
+       *
+       * 用异步 stat 而不是 existsSync：SMB 网络盘上同步探测单次约 18ms，
+       * 上千个待恢复文件就是十几秒的主线程阻塞（「开始同步卡顿」的根因）。
        */
-      if (!existsSync(absPath)) {
+      let exists = true
+      try {
+        await stat(absPath)
+      } catch {
+        exists = false
+      }
+      if (!exists) {
         manifest.setState(entry.localPath, 'error', { errorMsg: '本地文件已不存在' })
-        continue
-      }
-
-      const item: QueueItem = {
-        relPath: entry.localPath,
-        absPath,
-        size: entry.localSize,
-        mtimeMs: entry.mtimeMs,
-        reason: 'recovery',
-        attempts: 0
-      }
-
-      /*
-       * 复用清单里的哈希前，必须确认文件**还是当初哈希的那个版本**。
-       *
-       * 清单里的 md5/sha1 是上一次哈希时的残留值。应用关闭期间
-       * 用户改了文件（大小或 mtime 变了），这里照抄旧哈希，
-       * 就等于对着一份新内容声明旧哈希——
-       * 而 OpenList 侧的夸克驱动正是拿 MD5+SHA1 做秒传判断的。
-       *
-       * 结果就是：远端命中旧 blob 直接建链，**远端留着旧内容，
-       * 本地是新内容**，两边从此不一致，而且清单里记的哈希也是错的。
-       *
-       * 所以：大小或 mtime 对不上 → 老实回哈希队列重算。
-       */
-      let reusable = false
-      if (entry.md5 && entry.sha1) {
-        try {
-          // 这里用同步 stat：recoverPending 只在启动/恢复时调用一次，
-          // 文件数有限，且调用方（Engine.start / resume）本身就是同步流程。
-          const st = statSync(absPath)
-          reusable = st.size === entry.localSize && Math.abs(st.mtimeMs - entry.mtimeMs) < 1
-        } catch {
-          reusable = false
-        }
-      }
-
-      if (this.queuedPaths.has(item.relPath)) continue
-      this.queuedPaths.add(item.relPath)
-      if (reusable && entry.md5 && entry.sha1) {
-        item.hashes = { md5: entry.md5, sha1: entry.sha1, size: entry.localSize }
-        this.uploadQueue.push(item)
       } else {
-        this.hashQueue.push(item)
+        const item: QueueItem = {
+          relPath: entry.localPath,
+          absPath,
+          size: entry.localSize,
+          mtimeMs: entry.mtimeMs,
+          reason: 'recovery',
+          attempts: 0
+        }
+
+        /*
+         * 复用清单里的哈希前，必须确认文件**还是当初哈希的那个版本**。
+         *
+         * 清单里的 md5/sha1 是上一次哈希时的残留值。应用关闭期间
+         * 用户改了文件（大小或 mtime 变了），这里照抄旧哈希，
+         * 就等于对着一份新内容声明旧哈希——
+         * 而 OpenList 侧的夸克驱动正是拿 MD5+SHA1 做秒传判断的。
+         *
+         * 结果就是：远端命中旧 blob 直接建链，**远端留着旧内容，
+         * 本地是新内容**，两边从此不一致，而且清单里记的哈希也是错的。
+         *
+         * 所以：大小或 mtime 对不上 → 老实回哈希队列重算。
+         */
+        let reusable = false
+        if (entry.md5 && entry.sha1) {
+          try {
+            const st = await stat(absPath)
+            reusable = st.size === entry.localSize && Math.abs(st.mtimeMs - entry.mtimeMs) < 1
+          } catch {
+            reusable = false
+          }
+        }
+
+        if (this.queuedPaths.has(item.relPath)) continue
+        this.queuedPaths.add(item.relPath)
+        if (reusable && entry.md5 && entry.sha1) {
+          item.hashes = { md5: entry.md5, sha1: entry.sha1, size: entry.localSize }
+          this.uploadQueue.push(item)
+        } else {
+          this.hashQueue.push(item)
+        }
+        recovered++
       }
-      recovered++
+
+      // 每处理一批让出事件循环：不让出的话，界面在恢复期间一直卡着
+      if (i % 50 === 0) await tick()
     }
     // 恢复的项可能直接进了 uploadQueue（已有哈希），
     // 而 pump 只在有事件时才会被唤醒——这里主动推一次。

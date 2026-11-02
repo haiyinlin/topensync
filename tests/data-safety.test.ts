@@ -145,7 +145,7 @@ describe('数据库关闭后的写操作', () => {
 })
 
 describe('恢复任务时校验哈希是否仍然有效', () => {
-  it('文件在应用关闭期间被改过 → 不复用旧哈希，回到哈希队列重算', () => {
+  it('文件在应用关闭期间被改过 → 不复用旧哈希，回到哈希队列重算', async () => {
     const syncRoot = join(dir, 'sync')
     rmSync(syncRoot, { recursive: true, force: true })
     mkdirSync(syncRoot, { recursive: true })
@@ -194,7 +194,7 @@ describe('恢复任务时校验哈希是否仍然有效', () => {
       getConfig: () => ({ ...CONFIG, syncRoot })
     })
 
-    expect(planner.recoverPending()).toBe(1)
+    expect(await planner.recoverPending()).toBe(1)
 
     /*
      * 关键判据落在**真实状态**上：清单里存的 md5 仍是旧的占位值，
@@ -208,7 +208,7 @@ describe('恢复任务时校验哈希是否仍然有效', () => {
     expect(row?.sha1).toBe(oldSha1)
   })
 
-  it('文件没变 → 复用旧哈希（省掉一次读盘）', () => {
+  it('文件没变 → 复用旧哈希（省掉一次读盘）', async () => {
     const syncRoot = join(dir, 'sync')
     rmSync(syncRoot, { recursive: true, force: true })
     mkdirSync(syncRoot, { recursive: true })
@@ -251,7 +251,7 @@ describe('恢复任务时校验哈希是否仍然有效', () => {
       getConfig: () => ({ ...CONFIG, syncRoot })
     })
 
-    expect(planner.recoverPending()).toBe(1)
+    expect(await planner.recoverPending()).toBe(1)
     // 恢复成功，状态推进到 hashed/pending，说明确实被重新排上了
     expect(['hashed', 'pending', 'error']).toContain(manifest.getFile(relPath)?.state)
   })

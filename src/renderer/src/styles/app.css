@@ -1868,37 +1868,51 @@ textarea {
 .batch-check input[type='checkbox'] {
   appearance: none;
   -webkit-appearance: none;
+  -moz-appearance: none;
   width: 15px;
   height: 15px;
   flex: none;
   margin: 0;
+  cursor: pointer;
+  position: relative;
+  /*
+   * 方框**不**由 input 自身画，交给下面的 ::before。
+   *
+   * 为什么：`appearance:none` 对 checkbox 的生效情况随 Chromium 版本 /
+   * 显示缩放而异——在用户实机上它退化成渲染一个「…」占位符
+   * （input 里没有可画的内容，又顶着 td 的 text-overflow:ellipsis）。
+   * 把 input 自身的背景/边框全部清空，方框与勾完全由伪元素绘制，
+   * 就彻底不依赖 appearance 的行为了。
+   */
+  background: transparent;
+  border: none;
+  outline: none;
+  /* 残余的 value 文本（默认 "on"）一律不画 */
+  font-size: 0;
+  color: transparent;
+  text-indent: -9999px;
+  overflow: hidden;
+  transition: none;
+}
+
+/* 未选中态方框：由 ::before 画，跟 appearance 无关 */
+.batch-check input[type='checkbox']::before {
+  content: '';
+  position: absolute;
+  inset: 0;
   border: 1px solid var(--line);
   border-radius: 4px;
   background: #101013;
-  cursor: pointer;
-  position: relative;
   transition: background 0.12s ease, border-color 0.12s ease;
 }
 
-.batch-check input[type='checkbox']:hover {
+.batch-check input[type='checkbox']:hover::before {
   border-color: var(--tx3);
 }
 
-.batch-check input[type='checkbox']:checked {
+.batch-check input[type='checkbox']:checked::before {
   background: var(--accent);
   border-color: var(--accent);
-}
-
-.batch-check input[type='checkbox']::after {
-  /*
-   * 未选中态也必须显式给一个空的 ::after。
-   *
-   * `appearance: none` 之后，<input type="checkbox"> 仍是一个「替换元素」，
-   * Chromium 在没有 appearance、也没有内容时，会把它退化成默认的文本内容——
-   * 表现就是勾选框里出现一个「…」（省略号）。只给 :checked 画勾，未选中态
-   * 就一直露着那个点。这里把两种状态的内容都接管掉，省略号才不会冒出来。
-   */
-  content: '';
 }
 
 .batch-check input[type='checkbox']:checked::after {
