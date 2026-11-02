@@ -82,3 +82,5 @@ System Volume Information/
 *.temp
 ~$*
 Thumbs.db:encryptable
+# 截图输出目录（scripts/shot.cjs 生成，随时可重跑）
+shots/
