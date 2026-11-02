@@ -1889,6 +1889,18 @@ textarea {
   border-color: var(--accent);
 }
 
+.batch-check input[type='checkbox']::after {
+  /*
+   * 未选中态也必须显式给一个空的 ::after。
+   *
+   * `appearance: none` 之后，<input type="checkbox"> 仍是一个「替换元素」，
+   * Chromium 在没有 appearance、也没有内容时，会把它退化成默认的文本内容——
+   * 表现就是勾选框里出现一个「…」（省略号）。只给 :checked 画勾，未选中态
+   * 就一直露着那个点。这里把两种状态的内容都接管掉，省略号才不会冒出来。
+   */
+  content: '';
+}
+
 .batch-check input[type='checkbox']:checked::after {
   content: '';
   position: absolute;

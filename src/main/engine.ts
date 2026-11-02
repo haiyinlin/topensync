@@ -810,6 +810,19 @@ export class Engine {
         exclude: this.config.exclude,
         safetyScanMs: Math.max(0, this.config.watchSafetyScanMinutes) * 60_000,
         /*
+         * 已入库的基准快照：清单里已经有文件记录了就不重扫整盘。
+         *
+         * 这是「开始同步不再卡顿 / 不再自动重扫 / 已完成不再变已跳过」
+         * 三条反馈的共同根因：以前每次 startSync 都无条件 scanAndCompare(true)
+         * 全盘遍历一遍——5~10 分钟的 stat 风暴跟上传抢主线程，还把每个
+         * 已同步的文件重新走一遍 recordSkip，状态被从「已同步」改成「已跳过」。
+         *
+         * 现在只要清单非空，就把 size:mtime 指纹灌给 Watcher 当基准，
+         * 跳过首次全盘遍历；增量监听照常实时工作，漏掉的变更由周期兜底比对补齐。
+         * 只有清单为空（真·首次使用）才全盘扫一遍。
+         */
+        initialSnapshot: this.manifest.listLocalFingerprints(),
+        /*
          * 首轮全树遍历的进度。
          *
          * 整块盘要五到十分钟，期间必须让界面看到「已扫描 N 个文件」，

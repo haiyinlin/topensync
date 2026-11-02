@@ -756,15 +756,30 @@ export class Planner {
     this.opts.onSkip?.(detail.total)
     this.opts.onSkipDetail?.(detail)
 
-    this.touch(relPath, {
-      state: 'skipped',
-      category: 'skip',
-      skipReason: reason,
-      size,
-      progress: 0,
-      speed: 0,
-      errorMsg: null
-    })
+    /*
+     * 「本地未变」不写任务表。
+     *
+     * 这是「已完成的内容变到已跳过」的根因：L1 快筛命中（内容与上次
+     * 同步一致）时，文件根本不需要任何处理，但以前这里照样 touch 一条
+     * `state: 'skipped'` 的任务——于是传输队列里原本「已完成」的那一行
+     * 被覆盖成「已跳过」，用户以为同步把文件跳过去了。
+     *
+     * 另外三种跳过（远端同名同大小认领 / 哈希判重 / 文件消失）才有
+     * 必要在任务表里留痕：它们是「有个文件要传，但被判定不用传」，
+     * 用户需要看到这个结论与原因。「本地未变」连「要传」都算不上，
+     * 属于常态，记进任务表只会把队列淹没。
+     */
+    if (reason !== 'local_duplicate') {
+      this.touch(relPath, {
+        state: 'skipped',
+        category: 'skip',
+        skipReason: reason,
+        size,
+        progress: 0,
+        speed: 0,
+        errorMsg: null
+      })
+    }
 
     // 跳过原因要说清楚：四种跳过的含义完全不同，
     // 用户需要知道「没传」是因为内容一样，还是因为远端已有同名同大小，

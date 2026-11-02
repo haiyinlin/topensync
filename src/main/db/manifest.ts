@@ -696,6 +696,34 @@ export class Manifest {
   }
 
   /**
+   * 列出所有本地文件的「相对路径 → size:mtimeMs」指纹。
+   *
+   * 给 Watcher 建立差异比对的初始基准用：清单里已经有几万条记录了，
+   * 重新开始同步时**不该**再全盘扫一遍拿磁盘现状（那是 5~10 分钟的
+   * stat 风暴），直接用这份快照当基准，增量事件会把它逐步修正。
+   *
+   * 只取 local_path + local_size + mtime_ms 三列、按路径升序，一次查完；
+   * 几万行也就几 MB 内存，比 `listFiles` 一页一页捞要简单得多。
+   *
+   * 注意：这里必须用 `local_size / mtime_ms`（当前值），
+   * 不能用 `synced_size / synced_mtime_ms`——快照要反映「磁盘现在的样子」
+   * 而不是「上次同步时的样子」，否则下一轮兜底比对会把所有改过的文件
+   * 都误判成「新变化」再发一遍。
+   */
+  listLocalFingerprints(): Map<string, string> {
+    const rows = this.db
+      .prepare(
+        'SELECT local_path, local_size, mtime_ms FROM files WHERE local_size IS NOT NULL ORDER BY local_path'
+      )
+      .all() as { local_path: string; local_size: number; mtime_ms: number | null }[]
+    const out = new Map<string, string>()
+    for (const r of rows) {
+      out.set(r.local_path, `${r.local_size}:${Math.round(r.mtime_ms ?? 0)}`)
+    }
+    return out
+  }
+
+  /**
    * 「同名同大小」弱认定：把远端已有的文件认领成本地文件的同步基准。
    *
    * 场景：本地有文件、远端也有同名同大小的文件，但**本程序从未同步过它**

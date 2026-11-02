@@ -117,6 +117,11 @@ describe('Planner', () => {
 
     expect(upload).not.toHaveBeenCalled()
     expect(planner.skippedCount).toBe(1)
+    /*
+     * 「本地未变」不写任务表：文件内容没变，连「要传」都算不上，
+     * 不该在传输队列里冒出一条「已跳过」——那正是「已完成变已跳过」的根因。
+     */
+    expect(planner.getTasks().filter((t) => t.state === 'skipped')).toHaveLength(0)
   })
 
   it('文件从未同步过时会上传', async () => {

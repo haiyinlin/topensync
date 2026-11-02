@@ -102,7 +102,7 @@ describe('传输类别与跳过原因', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('L1 命中产出「跳过 / 本地重复」任务，且不上传', async () => {
+  it('L1 命中：不上传、计入跳过统计，但不产出「跳过」任务', async () => {
     const p = join(syncRoot, 'same.txt')
     writeFileSync(p, 'hello')
     const st = statSync(p)
@@ -124,11 +124,17 @@ describe('传输类别与跳过原因', () => {
 
     expect(upload).not.toHaveBeenCalled()
 
+    /*
+     * 「本地未变」不产出任务表条目。
+     *
+     * 文件内容与上次同步一致，连「要传」都算不上，属于常态；
+     * 在任务表里为它造一条「已跳过」，整盘重扫时会把几万条「已完成」
+     * 全部刷成「已跳过」——这正是用户反馈「已完成的内容变到已跳过」的根因。
+     *
+     * 跳过统计（省下的上行）与日志仍然保留，用户照样能看到「跳过了多少」。
+     */
     const task = planner.getTasks().find((t) => t.localPath === 'same.txt')
-    expect(task, '跳过也要有任务记录，用户才问得出「为什么没传」').toBeDefined()
-    expect(task!.category).toBe('skip')
-    expect(task!.skipReason).toBe('local_duplicate')
-    expect(task!.state).toBe('skipped')
+    expect(task, '本地未变不应产出任务条目').toBeUndefined()
 
     expect(skipDetail.local).toBe(1)
     expect(skipDetail.remote).toBe(0)
@@ -267,25 +273,34 @@ describe('传输类别与跳过原因', () => {
 
   it('跳过的任务不提供重试（重试会把判定结论变成一次真实上传）', async () => {
     const p = join(syncRoot, 'skipme.txt')
-    writeFileSync(p, 'hello')
+    writeFileSync(p, 'same-content')
     const st = statSync(p)
 
+    // 造一条「远端已存着同样内容」的记录（L2 哈希判重场景，仍产 skipped 任务）
     manifest.upsertFile({
       localPath: 'skipme.txt',
       localSize: st.size,
       mtimeMs: st.mtimeMs,
       state: 'synced'
     })
+    const { hashFile } = await import('../src/main/hash/hashes')
+    const hashes = await hashFile(p)
     manifest.setState('skipme.txt', 'synced', {
       remoteSize: st.size,
       syncedSize: st.size,
-      syncedMtimeMs: Math.floor(st.mtimeMs)
+      syncedMtimeMs: Math.floor(st.mtimeMs),
+      syncedMd5: hashes.md5,
+      syncedSha1: hashes.sha1
     })
+    // 改 mtime 让 L1 不命中，进入 L2 哈希判重 → remote_duplicate
+    const future = new Date(Date.now() + 5000)
+    require('fs').utimesSync(p, future, future)
 
     await planner.handleEvent('skipme.txt', true)
     await settle()
 
     const task = planner.getTasks().find((t) => t.localPath === 'skipme.txt')!
+    expect(task.category).toBe('skip')
     planner.retry(task.id)
     await settle()
 

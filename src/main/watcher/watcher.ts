@@ -157,6 +157,19 @@ export interface WatcherOptions {
    * （6 万文件 ≈ 5 分钟），跑太密会长期占着网络与主线程。
    */
   safetyScanMs?: number
+  /**
+   * 已入库的基准快照：`相对路径 → size:mtimeMs` 指纹。
+   *
+   * 为什么需要它：用户已经在上一轮把整块盘扫完、清单里有几万条记录了，
+   * 此时再点「开始同步」**不该**又跑一遍全盘遍历——那 5~10 分钟的
+   * stat 风暴会跟正在进行的上传抢主线程，还顺手把「已同步」的文件
+   * 重新走一遍判重、写成「已跳过」。
+   *
+   * 传了这个快照（且非空）时，`start()` 会**跳过首次全盘扫描**，
+   * 直接用快照建立差异比对基准，监听照常实时起。只有没传（首次启动、
+   * 清单为空）时才全盘扫一遍把基准建起来。
+   */
+  initialSnapshot?: Map<string, string>
 }
 /** chokidar 递归深度上限，防止病态目录把进程拖死 */
 const MAX_DEPTH = 24
@@ -255,6 +268,15 @@ export class Watcher {
     this.watchErrorCount = 0
     this.watchErrorLogged = 0
 
+    // 有已入库的基准快照 → 跳过首次全盘扫描，直接用它建立比对基准
+    if (this.opts.initialSnapshot && this.opts.initialSnapshot.size > 0) {
+      for (const [rel, fp] of this.opts.initialSnapshot) {
+        this.pollSnapshot.set(rel, fp)
+      }
+      this.initialDone = true
+      this.lastReadyAt = Date.now()
+    }
+
     /*
      * 强制轮询（或已经降级过）：不建任何监听。
      *
@@ -317,6 +339,17 @@ export class Watcher {
       .on('ready', () => {
         this.initialDone = true
         this.lastReadyAt = Date.now()
+        /*
+         * 有已入库的基准快照 → 不重扫整盘，直接上报就绪。
+         *
+         * 首次扫描只在「没有快照」时才跑（见 start() 里对
+         * initialSnapshot 的处理）。chokidar 的 ready 只是说
+         * 「增量监听就绪了」，不代表一定要再走一遍全树。
+         */
+        if (this.pollSnapshot.size > 0) {
+          this.opts.onReady?.(this.pollSnapshot.size)
+          return
+        }
         /*
          * 初始扫描自己走一遍目录树（见上方 ignoreInitial 的说明）。
          *
@@ -381,13 +414,26 @@ export class Watcher {
     this.nativeWatcher.on('rename', (_event, filename) => this.onNativeEvent(filename))
 
     this.opts.onLog?.('info', '已启用整树单句柄监听（实时）')
+
+    // 兜底：周期全树比对，补上丢掉的变更（不管首扫不首扫都要挂）
+    this.startSafetyScan()
+
+    if (this.initialDone && this.pollSnapshot.size > 0) {
+      /*
+       * 已有入库的基准快照 → 不重扫整盘。
+       *
+       * 直接把「就绪」上报，放行等待中的对账；增量监听照常实时工作。
+       * 漏掉的变化由上面的周期兜底比对补齐，不会永久丢失。
+       */
+      this.opts.onReady?.(this.pollSnapshot.size)
+      return true
+    }
+
     // 首次全树：把磁盘现状喂给上层，同时建立差异比对的基准
     void this.scanAndCompare(true).catch((err: unknown) => {
       const e = err instanceof Error ? err : new Error(String(err))
       this.opts.onError?.(e)
     })
-    // 兜底：周期全树比对，补上丢掉的变更
-    this.startSafetyScan()
     return true
   }
 
@@ -762,10 +808,20 @@ export class Watcher {
   private startPolling(): void {
     if (this.pollTimer || this.stopped) return
     if (this.mode !== 'poll') return
-    void this.pollOnce(true).catch((err: unknown) => {
-      const e = err instanceof Error ? err : new Error(String(err))
-      this.opts.onError?.(e)
-    })
+    /*
+     * 有已入库的基准快照 → 跳过首轮完整遍历，直接进入周期比对。
+     *
+     * 首轮遍历在整盘场景下是 5~10 分钟的 stat 风暴，重启 / 重新开始同步
+     * 时不该每次都重跑一遍——快照已经在上次跑过了。
+     */
+    if (this.initialDone && this.pollSnapshot.size > 0) {
+      this.opts.onReady?.(this.pollSnapshot.size)
+    } else {
+      void this.pollOnce(true).catch((err: unknown) => {
+        const e = err instanceof Error ? err : new Error(String(err))
+        this.opts.onError?.(e)
+      })
+    }
     const interval = Math.max(5_000, this.opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS)
     this.pollTimer = setInterval(() => {
       void this.pollOnce(false).catch((err: unknown) => {
