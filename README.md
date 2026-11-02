@@ -8,6 +8,24 @@ Windows 桌面同步程序：**本地目录 →（内网 HTTP）→ OpenList →
 
 ---
 
+## 下载
+
+Windows 安装包（x64）：
+
+- 最新版：https://github.com/haiyinlin/topensync/releases/latest
+- v0.1.0：https://github.com/haiyinlin/topensync/releases/tag/v0.1.0
+
+下载 `TopenSync.Setup.0.1.0.exe` 运行安装。安装后在「设置」里填入 OpenList 地址、账号密码、本地同步目录与远端根目录，点「测试连接」确认连通，再点「开始同步」。
+
+自行构建安装包：
+
+```bash
+npm install
+npm run package      # 产物在 release/
+```
+
+---
+
 ## 这是什么
 
 一个只做一件事的备份工具：把指定的本地文件夹单向同步到自部署 OpenList 暴露的夸克网盘存储。
@@ -105,31 +123,32 @@ npm test             # 单元测试
 
 ```
 src/
-├── main/                 主进程
-│   ├── index.ts          入口：单实例锁、窗口、引擎装配
-│   ├── engine.ts         引擎：把四个模块装配成整机，对外暴露能力
-│   ├── ipc.ts            IPC 通道注册（只转发，不含业务逻辑）
-│   ├── config/store.ts   配置持久化（safeStorage 加密凭据）
-│   ├── db/manifest.ts    SQLite 清单（node:sqlite）
-│   ├── hash/hashes.ts    双哈希计算（MD5 + SHA1 一次读出）
+├── main/                  主进程
+│   ├── index.ts           入口：单实例锁、窗口、引擎装配
+│   ├── engine.ts          引擎：把四个模块装配成整机，对外暴露能力
+│   ├── ipc.ts             IPC 通道注册（只转发，不含业务逻辑）
+│   ├── config/store.ts    配置持久化（safeStorage 加密凭据）
+│   ├── db/manifest.ts     SQLite 清单（node:sqlite）
+│   ├── hash/hashes.ts     双哈希计算（MD5 + SHA1 一次读出）
 │   ├── openlist/client.ts OpenList REST 客户端
-│   ├── planner/          汇合点：L1 去重 + 哈希池 + 上传池 + 删除熔断
-│   ├── reconcile/        远端对账器（remote_snapshot → diffs → 回流）
-│   ├── transfer/         传输执行器（单次 PUT / 分片两档）
-│   ├── verify/           深度校验（下载远端重算哈希）
+│   ├── planner/           汇合点：L1 去重 + 哈希池 + 上传池 + 删除熔断
+│   ├── reconcile/         远端对账器（remote_snapshot → diffs → 回流）
+│   ├── transfer/          传输执行器（单次 PUT / 分片两档）
+│   ├── verify/            深度校验（下载远端重算哈希）
 │   ├── diagnostics/       诊断包导出
-│   └── watcher/          本地监控（chokidar + Windows 边界处理）
-├── preload/              预加载（最小 API 面）
-├── renderer/             渲染进程（React + Zustand）
-└── shared/types.ts       主/预/渲染共享的类型定义
+│   └── watcher/           本地监控（chokidar + Windows 边界处理）
+├── preload/               预加载（最小 API 面）
+├── renderer/              渲染进程（React + Zustand）
+└── shared/types.ts        主/预/渲染共享的类型定义
 
-docs/
-├── BUSINESS-FLOW.md      业务流程：决策链、差异处置、状态机、设计取舍
-└── ARCHITECTURE.md       技术架构：模块分工、路径约定、构建约束、验证脚本
+docs/                     业务流程与技术架构文档
+├── BUSINESS-FLOW.md       业务流程：决策链、差异处置、状态机、设计取舍
+└── ARCHITECTURE.md        技术架构：模块分工、路径约定、构建约束、验证脚本
 
-ui-prototype/             静态视觉基准（浏览器可直接打开）
+resources/                应用图标（icon.ico 为打包用多尺寸图标）
 scripts/                  实机验证脚本
 tests/                    单元测试
+ui-prototype/             静态视觉基准（浏览器可直接打开）
 ```
 
 **四个进程内模块的分工**：
