@@ -1,7 +1,15 @@
 import * as React from 'react'
 import { Icon } from '../components/Icon'
+import type { PageKey } from '../App'
 
-/** 帮助：快速开始、排障入口、快捷键与状态图例。 */
+/**
+ * 帮助：真实可用的入口、状态图例与版本信息。
+ *
+ * 这一页曾经列过一整套键盘快捷键，而渲染进程一个都没实现——
+ * 用户按了没反应，只会觉得软件坏了，所以整块拿掉了。
+ * 同样道理：这里只保留**点了真的能到达某处**的入口，
+ * 没有对应页面的说明（「秒传与去重」「常见问题」）宁可不放。
+ */
 export function Help(): React.JSX.Element {
   return (
     <section>
@@ -17,55 +25,37 @@ export function Help(): React.JSX.Element {
           <div className="card-head">
             <h2>快速开始</h2>
           </div>
-          <LinkRow icon="upload" title="首次配置向导" desc="连接 OpenList 并完成路径映射" />
-          <LinkRow icon="shield" title="秒传与去重" desc="两层去重机制是如何工作的" />
-          <LinkRow icon="files" title="大文件与分片" desc="断点续传、超限文件的处理" />
+          <LinkRow icon="upload" title="首次配置向导" desc="连接 OpenList 并完成路径映射" to="connection" />
+          <LinkRow icon="files" title="大文件与分片" desc="分片阈值与超限文件的处理" to="transfer" />
         </div>
         <div className="card link-card">
           <div className="card-head">
             <h2>排障</h2>
           </div>
-          <LinkRow icon="terminal" title="查看运行日志" desc="定位失败任务与错误原因" />
-          <LinkRow icon="alert" title="导出诊断包" desc="包含清单、日志与配置快照" />
-          <LinkRow icon="help" title="常见问题" desc="上传失败、文件占用、路径过长" />
+          <LinkRow icon="terminal" title="查看运行日志" desc="定位失败任务与错误原因" to="logs" />
+          <LinkRow icon="alert" title="导出诊断包" desc="包含清单、日志与配置快照" to="advanced" />
         </div>
       </div>
 
-      <div className="grid two">
-        <div className="card">
-          <div className="card-head">
-            <h2>键盘快捷键</h2>
-          </div>
-          <div className="keys">
-            <KeyRow label="启动 / 暂停同步" keys={['Ctrl', 'S']} />
-            <KeyRow label="扫描本地目录" keys={['Ctrl', 'R']} />
-            <KeyRow label="立即对账远端" keys={['Ctrl', 'D']} />
-            <KeyRow label="切换页面" keys={['Ctrl', 'K']} />
-            <KeyRow label="聚焦搜索" keys={['Ctrl', 'F']} />
-            <KeyRow label="导出日志" keys={['Ctrl', 'E']} />
-          </div>
+      <div className="card">
+        <div className="card-head">
+          <h2>状态说明</h2>
         </div>
-        <div className="card">
-          <div className="card-head">
-            <h2>状态说明</h2>
-          </div>
-          <div className="legend">
-            <LegendRow tone="green" label="已同步" desc="远端已确认存在且大小一致" />
-            <LegendRow tone="blue" label="等待" desc="已入队，等待上传" />
-            <LegendRow tone="accent" label="上传中" desc="传输进行中，分片可续传" />
-            <LegendRow tone="red" label="失败" desc="重试耗尽，需人工处理" />
-            <LegendRow tone="amber" label="已删除" desc="本地已删除，远程在回收站" />
-          </div>
-          <div className="hr" />
-          <div className="card-head" style={{ marginBottom: '10px' }}>
-            <h2>对账差异</h2>
-          </div>
-          <div className="legend">
-            <LegendRow tone="amber" label="远端缺失" desc="本地文件在远端不存在，将补传" />
-            <LegendRow tone="purple" label="仅远端存在" desc="远端有本地无，默认只记录" />
-            <LegendRow tone="orange" label="内容不符" desc="两侧大小不同，以本地为准" />
-            <LegendRow tone="gray" label="时间差异" desc="仅修改时间不同，不处理" />
-          </div>
+        <div className="legend">
+          <LegendRow tone="green" label="已同步" desc="远端已确认存在且大小一致" />
+          <LegendRow tone="blue" label="等待" desc="已入队，等待上传" />
+          <LegendRow tone="accent" label="上传中" desc="传输进行中，分片可续传" />
+          <LegendRow tone="red" label="失败" desc="重试耗尽，需人工处理" />
+          <LegendRow tone="amber" label="已删除" desc="本地已删除，远程在回收站" />
+        </div>
+        <div className="hr" />
+        <div className="card-head" style={{ marginBottom: '10px' }}>
+          <h2>对账差异</h2>
+        </div>
+        <div className="legend">
+          <LegendRow tone="amber" label="远端缺失" desc="本地文件在远端不存在，将补传" />
+          <LegendRow tone="purple" label="仅远端存在" desc="远端有本地无，默认只记录" />
+          <LegendRow tone="orange" label="内容不符" desc="两侧大小不同，以本地为准" />
         </div>
       </div>
 
@@ -109,17 +99,25 @@ export function Help(): React.JSX.Element {
   )
 }
 
+/**
+ * 入口行：点击后必须真的能到某页。
+ *
+ * 走 hash 路由（App 监听 hashchange），不必把 onNavigate 一路传下来；
+ * 没有对应页面的说明就不做成入口，点了没反应比没有更糟。
+ */
 function LinkRow({
   icon,
   title,
-  desc
+  desc,
+  to
 }: {
   icon: string
   title: string
   desc: string
+  to: PageKey
 }): React.JSX.Element {
   return (
-    <button className="link-row">
+    <button className="link-row" onClick={() => { location.hash = to }}>
       <span className="tile">
         <Icon name={icon} />
       </span>
@@ -129,20 +127,6 @@ function LinkRow({
       </span>
       <Icon name="chevron" className="ic chev" />
     </button>
-  )
-}
-
-function KeyRow({ label, keys }: { label: string; keys: string[] }): React.JSX.Element {
-  return (
-    <div className="key-row">
-      <span>{label}</span>
-      {keys.map((k, i) => (
-        <span key={k}>
-          {i > 0 && <span className="plus">+</span>}
-          <span className="cap">{k}</span>
-        </span>
-      ))}
-    </div>
   )
 }
 

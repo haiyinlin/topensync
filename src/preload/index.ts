@@ -4,9 +4,11 @@ import type {
   AppSnapshot,
   AppStats,
   ConnectionStatus,
+  DeepVerifyResult,
   DiffEntry,
   DiffResolution,
   FileEntry,
+  LogEntry,
   MainToRendererEvents,
   ScanKind,
   TransferTask
@@ -35,9 +37,13 @@ const api = {
   onTransferUpdate: (cb: MainToRendererEvents['transfer:update']) =>
     subscribe('transfer:update', cb),
   onScanUpdate: (cb: MainToRendererEvents['scan:update']) => subscribe('scan:update', cb),
+  /** 订阅扫描/对账进度 */
+  onScanProgress: (cb: MainToRendererEvents['scan:progress']) => subscribe('scan:progress', cb),
   onDiffUpdate: (cb: MainToRendererEvents['diff:update']) => subscribe('diff:update', cb),
   onConfigUpdate: (cb: MainToRendererEvents['config:update']) => subscribe('config:update', cb),
   onLogAppend: (cb: MainToRendererEvents['log:append']) => subscribe('log:append', cb),
+  onConnectionUpdate: (cb: MainToRendererEvents['connection:update']) =>
+    subscribe('connection:update', cb),
 
   // ── 读取（请求-响应）──────────────────────────────────
   /** 首屏一次性拉取全部数据 */
@@ -47,10 +53,16 @@ const api = {
   listFiles: (opts?: { limit?: number }): Promise<FileEntry[]> =>
     ipcRenderer.invoke('files:list', opts ?? {}),
   listDiffs: (): Promise<DiffEntry[]> => ipcRenderer.invoke('diffs:list'),
-  listLogs: (limit?: number): Promise<{ ts: number; level: string; message: string }[]> =>
+  listLogs: (limit?: number): Promise<LogEntry[]> =>
     ipcRenderer.invoke('logs:list', limit ?? 200),
   listTasks: (): Promise<TransferTask[]> => ipcRenderer.invoke('tasks:list'),
   checkConnection: (): Promise<ConnectionStatus> => ipcRenderer.invoke('connection:check'),
+  /** 导出诊断包，返回生成的文件路径 */
+  exportDiagnostics: (): Promise<string> => ipcRenderer.invoke('diagnostics:export'),
+  /** 暂停同步（停止本地监控与远端对账，保留清单与配置） */
+  pauseSync: (): Promise<boolean> => ipcRenderer.invoke('sync:pause'),
+  /** 恢复同步 */
+  resumeSync: (): Promise<boolean> => ipcRenderer.invoke('sync:resume'),
 
   // ── 动作 ──────────────────────────────────────────────
   /** 改配置走请求-响应：调用方需要拿到合并后的新配置 */
@@ -60,7 +72,36 @@ const api = {
   retryTransfer: (taskId: string) => ipcRenderer.send('transfer:retry', taskId),
   cancelTransfer: (taskId: string) => ipcRenderer.send('transfer:cancel', taskId),
   resolveDiff: (diffId: number, resolution: DiffResolution) =>
-    ipcRenderer.send('diff:resolve', diffId, resolution),
+    ipcRenderer.invoke('diff:resolve', diffId, resolution),
+
+  /*
+   * 删除（批量）。
+   *
+   * 三种语义分开暴露，界面上对应三种不同含义的按钮：
+   * - deleteLocalFiles：删本地文件，远端按删除策略跟进
+   * - removeTasks：只清队列里的任务记录，**不动文件**
+   * - deleteRemoteFiles：删远端文件（走回收站）并关闭对应差异
+   */
+  deleteLocalFiles: (relPaths: string[]): Promise<{ deleted: number; failed: number }> =>
+    ipcRenderer.invoke('files:deleteLocal', relPaths),
+  removeTasks: (taskIds: string[]): Promise<number> =>
+    ipcRenderer.invoke('tasks:remove', taskIds),
+  deleteRemoteFiles: (
+    targets: { remotePath: string; diffId?: number }[]
+  ): Promise<{ deleted: number; failed: number }> =>
+    ipcRenderer.invoke('files:deleteRemote', targets),
+
+  /** 清空运行日志（只清日志，不动同步状态） */
+  clearLogs: (): Promise<number> => ipcRenderer.invoke('logs:clear'),
+
+  /**
+   * 深度校验（批量）：把远端文件拉回来重算哈希，与本地比对。
+   *
+   * 用于给「同名同大小」的弱认定补做内容确认。
+   */
+  verifyRemoteFiles: (relPaths: string[]): Promise<DeepVerifyResult> =>
+    ipcRenderer.invoke('files:verifyRemote', relPaths),
+
   quit: () => ipcRenderer.send('app:quit')
 }
 

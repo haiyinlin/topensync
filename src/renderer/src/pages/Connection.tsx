@@ -59,7 +59,31 @@ export function Connection(): React.JSX.Element {
     setChecking(false)
   }
 
-  const reachable = connection?.reachable ?? false
+  /*
+   * 四态，而不是三态。
+   * connection 为 null 表示「主进程还没探测完」——这跟「探测完了，结论是未配置」
+   * 是两回事，混为一谈就会出现用户说的「进来默认显示未配置」。
+   */
+  const connState: 'checking' | 'ok' | 'bad' | 'unset' =
+    connection === null
+      ? 'checking'
+      : connection.reachable
+        ? 'ok'
+        : connection.configured
+          ? 'bad'
+          : 'unset'
+  const connLabel =
+    connState === 'checking'
+      ? '检测中…'
+      : connState === 'ok'
+        ? '已连接'
+        : connState === 'bad'
+          ? '连接失败'
+          : '未配置'
+
+  const checkedAtText = connection?.checkedAt
+    ? new Date(connection.checkedAt).toLocaleString('zh-CN', { hour12: false })
+    : null
 
   return (
     <section>
@@ -82,8 +106,12 @@ export function Connection(): React.JSX.Element {
         <div className="card form">
           <div className="card-head">
             <h2>OpenList</h2>
-            <span className={`pill ${reachable ? 'green' : connection?.configured ? 'red' : 'gray'}`}>
-              {reachable ? '已连接' : connection?.configured ? '连接失败' : '未配置'}
+            <span
+              className={`pill ${
+                connState === 'ok' ? 'green' : connState === 'bad' ? 'red' : 'gray'
+              }`}
+            >
+              {connLabel}
             </span>
           </div>
           <label className="field">
@@ -128,28 +156,40 @@ export function Connection(): React.JSX.Element {
           <div className="card-head" style={{ marginBottom: '8px' }}>
             <h2>远端权限自检</h2>
             <span
-              className={`pill ${connection?.canRead && connection?.canWrite ? 'green' : 'amber'}`}
+              className={`pill ${
+                connState === 'unset'
+                  ? 'gray'
+                  : connection?.canRead && connection?.canWrite
+                    ? 'green'
+                    : 'amber'
+              }`}
             >
-              {connection?.canRead && connection?.canWrite ? '全部通过' : '存在缺口'}
+              {connState === 'unset'
+                ? '未检测'
+                : connection?.canRead && connection?.canWrite
+                  ? '全部通过'
+                  : '存在缺口'}
             </span>
           </div>
           <div className="kv">
             <div className="kv-row">
               <span>读取远端目录</span>
               <b className={connection?.canRead ? 'ok' : 'bad'}>
-                {connection?.canRead ? '通过' : '未通过'}
+                {connState === 'unset' ? '—' : connection?.canRead ? '通过' : '未通过'}
               </b>
             </div>
             <div className="kv-row">
               <span>写入远端目录</span>
               <b className={connection?.canWrite ? 'ok' : 'bad'}>
-                {connection?.canWrite ? '通过' : '未通过'}
+                {connState === 'unset' ? '—' : connection?.canWrite ? '通过' : '未通过'}
               </b>
             </div>
             <div className="kv-row">
               <span>穿透目录缓存</span>
               <b className={connection?.canWrite ? 'ok' : 'bad'}>
-                {connection?.canWrite ? (
+                {connState === 'unset' ? (
+                  '—'
+                ) : connection?.canWrite ? (
                   <>
                     通过 <em className="tiny">refresh:true 可用</em>
                   </>
@@ -157,6 +197,10 @@ export function Connection(): React.JSX.Element {
                   '不可用'
                 )}
               </b>
+            </div>
+            <div className="kv-row">
+              <span>上次检测</span>
+              <b>{checkedAtText ?? '尚未检测'}</b>
             </div>
           </div>
           {connection?.error && (

@@ -15,6 +15,15 @@ import { registerIpc, emit } from './ipc'
 let mainWindow: BrowserWindow | null = null
 let engine: Engine | null = null
 
+/**
+ * 应用图标。
+ *
+ * 开发态 __dirname = <项目根>/out/main → ../../resources/icon.png 命中仓库里的图；
+ * 打包态 __dirname = app.asar/out/main → ../../resources/icon.png 命中 asar 内被打包进去的那份
+ * （electron-builder 的 build.files 已包含 resources/**\/*）。
+ */
+const APP_ICON = join(__dirname, '../../resources/icon.png')
+
 // ── 单实例锁 ──────────────────────────────────────────────
 // 必须尽早获取。第二个实例直接退出，避免并发写库与重复上传。
 if (!app.requestSingleInstanceLock()) {
@@ -39,6 +48,7 @@ function createWindow(): void {
     autoHideMenuBar: true,
     backgroundColor: '#0A0A0B',
     title: 'TopenSync',
+    icon: APP_ICON,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
@@ -75,9 +85,11 @@ app.whenReady().then(() => {
   engine = new Engine({
     onTransfer: (task) => emit('transfer:update', task),
     onScan: (scan) => emit('scan:update', scan),
+    onProgress: (progress) => emit('scan:progress', progress),
     onDiff: (diff) => emit('diff:update', diff),
     onConfig: (config) => emit('config:update', config),
-    onLog: (entry) => emit('log:append', entry)
+    onLog: (entry) => emit('log:append', entry),
+    onConnection: (status) => emit('connection:update', status)
   })
   registerIpc(engine)
 

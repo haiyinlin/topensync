@@ -32,7 +32,11 @@ export const DEFAULT_CONFIG: AppConfig = {
   retry: { maxAttempts: 3, baseDelayMs: 1000 },
   exclude: ['**/node_modules/**', '**/.git/**', '**/*.tmp', '~$*'],
   verifyMode: 'size',
+  verifyHashMaxBytes: 64 * 1024 * 1024,
   quarkMaxFileBytes: 20 * 1024 * 1024 * 1024,
+  syncEmptyDirs: false,
+  detectRenames: true,
+  renameWindowMs: 5000,
   remoteScan: {
     enabled: true,
     intervalHours: 6,
@@ -42,7 +46,12 @@ export const DEFAULT_CONFIG: AppConfig = {
     timeoutMinutes: 30,
     conflictPolicy: 'local-wins',
     remoteOnlyPolicy: 'record-only',
-    autoFixLimit: 20
+    autoFixLimit: 20,
+    // 默认开启「同名 + 同大小」认领：这是「换了设备/清了 userData 就整批重传」的解法。
+    // 它不校验内容，所以认领出来的记录会打上 verify_level='size' 标记，
+    // 需要时可对它们做深度校验。
+    adoptByNameAndSize: true,
+    exclude: ['_trash/**', '@eadir/**', '**/.DS_Store']
   }
 }
 
@@ -86,6 +95,23 @@ export function decryptSecret(cipher: string): string {
   }
 }
 
+/**
+ * 路径归一化：去掉首尾空白。
+ *
+ * 为什么要 trim：路径首尾的空白在界面上**完全不可见**，
+ * 却会改变它在文件系统/远端存储里的实际含义。
+ *
+ * 实测踩过的坑：远端根配成 `/qh/qh/download/photo/照片备份/公司 `（尾部一个空格），
+ * 应用便把整批文件传进了新建的「公司␣」目录，而用户原有的「公司」目录原封不动——
+ * 夸克侧出现两个「公司」，同一批照片传了两遍。
+ * 界面上看不出来（空格不可见），只有去网盘里翻才能发现。
+ *
+ * 所以路径一律在入口 trim 掉首尾空白，不让「看不见的字符」改变目标位置。
+ */
+function normalizePath(value: string): string {
+  return value.trim()
+}
+
 export function loadConfig(): AppConfig {
   const path = configPath()
   if (!existsSync(path)) return { ...DEFAULT_CONFIG }
@@ -102,10 +128,26 @@ export function loadConfig(): AppConfig {
       },
       remoteScan: { ...DEFAULT_CONFIG.remoteScan, ...(raw.remoteScan ?? {}) }
     }
-    return merged
+    // 读出来时也归一化：老配置可能存着带空白的路径
+    return normalizeConfig(merged)
   } catch {
     // 配置损坏时回退默认值，不阻断启动
     return { ...DEFAULT_CONFIG }
+  }
+}
+
+/** 对配置里的路径字段做归一化 */
+export function normalizeConfig(config: AppConfig): AppConfig {
+  return {
+    ...config,
+    syncRoot: normalizePath(config.syncRoot),
+    remoteRoot: normalizePath(config.remoteRoot),
+    trashRoot: normalizePath(config.trashRoot),
+    openlist: {
+      ...config.openlist,
+      baseUrl: normalizePath(config.openlist.baseUrl),
+      username: normalizePath(config.openlist.username)
+    }
   }
 }
 
@@ -113,11 +155,14 @@ export function saveConfig(config: AppConfig): void {
   const path = configPath()
   mkdirSync(dirname(path), { recursive: true })
 
+  // 落盘前再归一化一次：路径带首尾空白会静默改变目标位置
+  const normalized = normalizeConfig(config)
+
   const stored: StoredConfig = {
-    ...config,
+    ...normalized,
     openlist: {
-      ...config.openlist,
-      password: encryptSecret(config.openlist.password)
+      ...normalized.openlist,
+      password: encryptSecret(normalized.openlist.password)
     }
   }
   writeFileSync(path, JSON.stringify(stored, null, 2), 'utf8')

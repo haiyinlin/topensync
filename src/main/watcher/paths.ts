@@ -36,18 +36,54 @@ export function toLongPath(p: string): string {
   return LONG_PATH_PREFIX + p.replace(/\//g, '\\')
 }
 
+/**
+ * 剥掉 Windows 长路径前缀 `\\?\`。
+ *
+ * 加了前缀的路径和没加的路径在 Node 的 path API 眼里是**两个不同的根**：
+ * `relative('C:\\Sync', '\\\\?\\C:\\Sync\\a.txt')` 返回的是完整带前缀的路径，
+ * 而不是 `a.txt`。
+ *
+ * chokidar 监听的是加了前缀的路径，它回报的事件路径也带前缀；
+ * 而同步根是用户配的裸路径。两边一混，相对路径就算不出来，
+ * 文件会被当成「不在根内」而静默丢弃——用户表现为「文件传不上去」。
+ */
+export function stripLongPath(p: string): string {
+  return isWindows() && p.startsWith(LONG_PATH_PREFIX) ? p.slice(LONG_PATH_PREFIX.length) : p
+}
+
 /** 本地绝对路径 → 相对同步根的 POSIX 路径；不在根内则返回 null */
 export function relativize(root: string, abs: string): string | null {
-  const rel = relative(root, abs)
+  const rel = relative(stripLongPath(root), stripLongPath(abs))
   if (rel === '') return ''
-  if (rel.startsWith('..')) return null
+  /*
+   * 只在**确实是上一级**时才判为越界。
+   *
+   * 不能用 `startsWith('..')`：Windows 允许 `..foo.txt` 这种以两个点开头的
+   * 合法文件名，它会被误判成「在根外」而静默丢弃——
+   * 用户从压缩包解出来的文件就可能叫这种名字。
+   * 真正的越界形态只有 `..` 和 `../xxx`。
+   */
+  if (rel === '..' || rel.startsWith(`..${sep}`)) return null
   return rel.split(sep).join('/')
 }
 
-/** 相对路径 → 本地绝对路径 */
+/**
+ * 相对路径 → 本地绝对路径。
+ *
+ * 会拒绝任何试图逃出同步根的路径（`..` 分段）。
+ *
+ * 为什么必须拒：调用方有 IPC 边界——渲染进程把「要删的本地文件列表」
+ * 直接传进来，参数拼错或被篡改就可能指向同步根之外。
+ * 而删除操作是 `rm(abs, { force: true })`，**没有二次确认的机会**。
+ * 所以这里必须在拼接阶段就把越界挡掉。
+ */
 export function absolutize(root: string, rel: string): string {
   const parts = rel.split('/').filter(Boolean)
   if (parts.length === 0) return root
+  // 任何一段是 `..` 就说明想往根外走
+  if (parts.some((p) => p === '..')) {
+    throw new Error(`路径越出同步根，已拒绝：${rel}`)
+  }
   return root + sep + parts.join(sep)
 }
 
@@ -64,6 +100,24 @@ export function relativizeRemote(remoteRoot: string, remotePath: string): string
   if (remotePath === base) return ''
   if (!remotePath.startsWith(`${base}/`)) return remotePath
   return remotePath.slice(base.length + 1)
+}
+
+/**
+ * 远端路径的父目录；根路径归一为 '/'。
+ *
+ * 注意与本地路径的 `dirname` 区分：远端路径一律用 '/' 分隔，
+ * 且不能带上本地的盘符与反斜杠。
+ */
+export function remoteDirname(path: string): string {
+  const i = path.lastIndexOf('/')
+  if (i <= 0) return '/'
+  return path.slice(0, i)
+}
+
+/** 远端路径的文件名 */
+export function remoteBasename(path: string): string {
+  const i = path.lastIndexOf('/')
+  return i < 0 ? path : path.slice(i + 1)
 }
 
 /**
@@ -85,6 +139,24 @@ export function isExcluded(rel: string, patterns: string[]): boolean {
       return false
     }
   })
+}
+
+/**
+ * OpenList 覆盖上传时留下的内部标记文件。
+ *
+ * 现象：远端目录里出现 `数据.csv.openlist_to_delete`，
+ * 而 `数据.csv` 本体反而不见了（覆盖过程中旧文件被改名成标记名，
+ * 新文件写完前的空窗里留下的）。
+ *
+ * 它不是用户的文件，是服务端的中间态。
+ * 参与对账会出两样坏东西：
+ * - 一条假的「仅远端存在」差异，路径还带个怪后缀
+ * - 界面上「下载到本地」会下载出一个叫 `数据.csv.openlist_to_delete` 的文件
+ *
+ * 所以远端比对时要把它排除掉。
+ */
+export function isOpenListTempMarker(name: string): boolean {
+  return name.endsWith('.openlist_to_delete')
 }
 
 /**

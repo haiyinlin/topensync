@@ -45,21 +45,14 @@
   color: var(--accent);
 }
 
-/* 品牌标记：需要定位上下文承载 ::after 箭头 */
+/* 品牌标记：直接用应用图标本体，不再用 CSS 拼方块 */
 .brand-mark {
-  position: relative;
-}
-
-.brand-mark::after {
-  content: '';
-  position: absolute;
-  left: 5px;
-  top: 8px;
-  width: 8px;
-  height: 5px;
-  border-left: 1.8px solid rgba(0, 0, 0, 0.72);
-  border-bottom: 1.8px solid rgba(0, 0, 0, 0.72);
-  transform: rotate(-45deg);
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  flex: none;
+  display: block;
+  object-fit: contain;
 }
 
 .rail-search input::placeholder {
@@ -165,6 +158,8 @@ textarea {
   display: flex;
   flex-direction: column;
   padding: 14px 12px;
+  /* grid item 的 min-height 默认是 auto，会被内容撑破 100vh 的行高 */
+  min-height: 0;
 }
 
 .rail-head {
@@ -178,13 +173,6 @@ textarea {
   display: flex;
   align-items: center;
   gap: 9px;
-}
-
-.brand-mark {
-  width: 20px;
-  height: 20px;
-  border-radius: 6px;
-  background: linear-gradient(135deg, var(--accent), #1b9c78);
 }
 
 .brand-name {
@@ -289,6 +277,14 @@ textarea {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  /*
+   * min-height:0 是让内部产生滚动的关键。
+   * flex/grid item 的 min-height 默认是 auto —— 也就是「至少跟内容一样高」，
+   * 于是 .scroll 里的内容越长，.main 越高，页面底部直接被顶出视口，
+   * overflow-y:auto 形同虚设。置 0 后 .scroll 才被压到视口剩余高度并自己滚动。
+   */
+  min-height: 0;
+  overflow: hidden;
 }
 
 .topbar {
@@ -341,10 +337,114 @@ textarea {
   color: var(--tx3);
 }
 
+/* ── 扫描进度条 ───────────────────────────────────────
+ *
+ * 贴在顶栏下方，横贯整个内容区。
+ *
+ * 放在全局而不是某个页面里：扫描是对全局的操作，
+ * 用户可能在任何一页点了「扫描本地」，进度必须在他眼前。
+ */
+.scan-progress {
+  flex: none;
+  padding: 8px 18px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  background: rgba(10, 10, 11, 0.72);
+  backdrop-filter: blur(10px);
+}
+
+.scan-progress .sp-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.scan-progress .sp-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--tx1);
+  flex: none;
+}
+
+.scan-progress .sp-detail {
+  font-size: 11.5px;
+  color: var(--tx3);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scan-progress .sp-pct {
+  font-size: 11.5px;
+  color: var(--accent);
+  flex: none;
+}
+
+/*
+ * 不确定态：总量事先数不出来（遍历型操作），只知道「还在跑」。
+ * 用一段来回滑动的条表示「进行中」，配合上面的计数文字。
+ */
+.bar.thin.indeterminate i {
+  width: 34%;
+  animation: bar-slide 1.1s ease-in-out infinite;
+}
+
+@keyframes bar-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(295%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bar.thin.indeterminate i {
+    animation: none;
+    width: 100%;
+    opacity: 0.45;
+  }
+}
+
 .scroll {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 18px;
+}
+
+/*
+ * 页面区块之间的纵向间距统一在这里管。
+ *
+ * 每个页面顶层都是一个 <section>，里面的兄弟节点（页头、卡片、网格）原先
+ * 靠各自的 margin-top/margin-bottom 撑开，结果是「有的有缝、有的贴着」，
+ * 而且换个页面就得重新对一遍数值。
+ * 改成 section 变 flex 列容器 + gap，间距只有这一个来源；
+ * 原来那些零散的 margin 在这里统一归零，避免和 gap 叠加出双倍缝。
+ */
+.scroll > section {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* 内容不要被 flex 压扁（高度不足时宁可溢出到滚动区） */
+.scroll > section > * {
+  flex: none;
+}
+
+.scroll > section > .page-head,
+.scroll > section > .toolbar,
+.scroll > section > .recon-bar,
+.scroll > section > .diff-grid,
+.scroll > section > .stat-grid,
+.scroll > section > .channel-card,
+.scroll > section > .warn-note {
+  margin-top: 0;
+  margin-bottom: 0;
 }
 
 /* ── 按钮 ─────────────────────────────────────────────── */
@@ -659,6 +759,71 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/*
+ * 路径拆分显示：灰色根前缀 + 亮色相对路径。
+ *
+ * 「远端路径」与「本地路径」并排时，用户真正要读的是**相对路径**——
+ * 根目录只是基准，画灰一点，别跟内容抢注意力。
+ * 绝对路径留给 title，鼠标悬停能看全。
+ */
+.path-split {
+  display: inline-flex;
+  align-items: baseline;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.path-root {
+  color: var(--tx3);
+  /* 做成一个极淡的小标签：光靠颜色差，灰色前缀和亮色路径还是容易连成一片 */
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+  padding: 0 4px;
+  margin-right: 2px;
+  flex: none;
+}
+
+.path-rel {
+  color: var(--tx1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 远端位置与本地路径一致 → 压暗，让「不一致」的那些自己跳出来 */
+.path-rel.same {
+  color: var(--tx2);
+}
+
+/*
+ * 清单页的两张表必须一眼分得开。
+ *
+ * 「远端独有文件」和「本地文件」都带路径列，
+ * 表头名字接近、路径格式接近时，用户会把上表的行当成下表的行看。
+ * 这里用**左边框色**给上表一个独立身份：紫色＝远端侧，青色＝本地侧。
+ */
+.card-remote {
+  border-left: 2px solid var(--purple);
+}
+
+.card-remote .card-head h2 {
+  color: var(--purple);
+}
+
+.card-local {
+  border-left: 2px solid var(--accent);
+}
+
+.card-local .card-head h2 {
+  color: var(--accent);
+}
+
+/* 卡片内的标题行要留出内边距（table-card 的 padding 被重置成 0） */
+.table-card .card-head {
+  padding: 14px 16px 0;
+  margin-bottom: 10px;
 }
 
 /* ── 工具栏与筛选 ─────────────────────────────────────── */
@@ -987,6 +1152,14 @@ textarea {
   color: var(--tx3);
 }
 
+/* 长路径换行：Windows 路径动辄一两百字符，
+   不换行会把所在行撑爆，横向拖动才能看全 */
+.break {
+  word-break: break-all;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
 .lnk {
   color: var(--blue);
   text-decoration: none;
@@ -1283,10 +1456,31 @@ textarea {
   color: var(--amber);
 }
 
-.sub-toolbar .tb-link {
+/*
+ * 筛选条右侧的操作链接（清除筛选 / 前往对账页）。
+ * 绑 .toolbar 而不是 .sub-toolbar：状态条（第一行）也要用「清除筛选」。
+ * sub-toolbar 的元素同样带 .toolbar，两处都能命中。
+ */
+.toolbar .tb-link {
   margin-left: auto;
   flex: none;
   font-size: 12px;
+}
+
+/*
+ * 筛选行右侧的说明文字。
+ *
+ * 挂在「可信度」那一行：弱认定的风险点必须写在旁边，
+ * 否则用户只会看到「仅大小」这个标签，不知道它意味着什么。
+ */
+.sub-toolbar .tb-hint {
+  margin-left: auto;
+  flex: none;
+  max-width: 46%;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--tx3);
+  text-align: right;
 }
 
 .gone {
@@ -1618,6 +1812,11 @@ textarea {
   font-weight: 500;
 }
 
+.note b.ok {
+  color: var(--accent);
+  font-weight: 500;
+}
+
 .ver-foot {
   display: flex;
   align-items: center;
@@ -1645,4 +1844,132 @@ textarea {
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.14);
   background-clip: content-box;
+}
+
+/* ── 批量选择与删除 ───────────────────────────────────────────
+ *
+ * 三个列表（文件清单 / 传输队列 / 远端对账）共用一套勾选与批量操作。
+ *
+ * 勾选框要自己画而不是用浏览器默认样式：
+ * 默认勾选框在深色主题下几乎看不见，而「勾错了就删文件」的后果很重。
+ */
+
+/* 勾选框：画成一个方块，勾上时显示对勾 */
+.batch-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  color: var(--tx2);
+  font-size: 12px;
+}
+
+.batch-check input[type='checkbox'] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 15px;
+  height: 15px;
+  flex: none;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #101013;
+  cursor: pointer;
+  position: relative;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.batch-check input[type='checkbox']:hover {
+  border-color: var(--tx3);
+}
+
+.batch-check input[type='checkbox']:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.batch-check input[type='checkbox']:checked::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid #06251c;
+  border-width: 0 2px 2px 0;
+  transform: rotate(43deg);
+}
+
+/* 批量操作条：贴在列表下方，选中项数与操作按钮 */
+.batch-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--card);
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+}
+
+.batch-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* 危险操作按钮 */
+.btn.danger {
+  background: var(--red-bg);
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.btn.danger:hover {
+  background: var(--red);
+  color: #fff;
+}
+
+/* 确认弹窗 */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.62);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 24px;
+}
+
+.modal {
+  width: min(460px, 100%);
+  padding: 20px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--card);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+}
+
+.modal h3 {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--tx1);
+}
+
+.modal p {
+  margin: 0 0 18px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.act-row.end {
+  justify-content: flex-end;
 }
