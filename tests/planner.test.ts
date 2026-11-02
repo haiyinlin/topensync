@@ -600,6 +600,18 @@ describe('Planner 的未完成任务恢复', () => {
     expect(recovered).toBe(1)
     expect(upload).toHaveBeenCalledTimes(1)
 
+    /*
+     * 恢复的任务上传完成后，任务表里也要带上哈希前缀。
+     *
+     * 用户反馈「类型上传、状态已完成，哈希却显示 —」：恢复的任务
+     * 没经过 runHashStage，以前 touch 到 done 都没写 md5Prefix，
+     * 传输队列的哈希列就一直是空的。现在 doUploadStage 从 item.hashes
+     * 补上了 md5Prefix。
+     */
+    const task = planner.getTasks().find((t) => t.localPath === 'keep.txt')
+    expect(task).toBeDefined()
+    expect(task!.md5Prefix).toMatch(/^[0-9a-f]{8}$/)
+
     planner.stop()
     manifest.close()
     rmSync(dir, { recursive: true, force: true })

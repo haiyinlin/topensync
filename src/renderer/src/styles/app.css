@@ -2050,6 +2050,25 @@ textarea {
   text-overflow: ellipsis;
 }
 
+/*
+ * 勾选框列（每行第一列）禁用省略号。
+ *
+ * 数据行第一列只有 `label.batch-check > input[type=checkbox]`。
+ * `<input>` 是替换元素，`appearance:none` 后 Chromium 仍会把它的
+ * `value="on"` 当文本塞进 `<td>` 的文本流里，让这一列的
+ * `scrollWidth` 比 `clientWidth` 宽出 9px——配合 `overflow:hidden +
+ * text-overflow:ellipsis`，就在勾选框右侧渲染出一个「…」。
+ *
+ * 表头行 `<th>` 的 text-overflow 是 `clip`（`.tbl th` 的默认），
+ * 所以只有数据行出现「…」——跟用户反馈完全吻合。
+ *
+ * 勾选框列根本不需要省略号，直接 clip 掉即可；方框与勾由
+ * `::before` / `::after` 绘制，不受影响。
+ */
+.vtable-tbl tbody td:first-child {
+  text-overflow: clip;
+}
+
 /* 表头吸顶：滚动时列名始终可见 */
 .vtable-head th {
   position: sticky;

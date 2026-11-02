@@ -1128,6 +1128,16 @@ export class Engine {
   private isForegroundBusy(): boolean {
     const backlog = this.planner?.backlog ?? 0
     if (backlog > 0) return true
+    /*
+     * 上传队列还在传（哪怕 backlog 已经是 0）也算忙。
+     *
+     * 用户反馈「同步过程中还会触发对账」：事件入口队列（backlog）空了、
+     * 但 uploadQueue 里还有几千个文件在传时，以前这里返回 false——
+     * 定时对账到点就开跑，跟上传抢网络与主线程。
+     *
+     * 把「队列是否空闲」也纳入忙的判断：上传没传完，对账就别来凑热闹。
+     */
+    if (this.planner && !this.planner.isIdle) return true
     return this.localProgress?.running === true
   }
 

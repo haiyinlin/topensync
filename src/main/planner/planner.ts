@@ -1517,7 +1517,18 @@ export class Planner {
       remotePath,
       size: item.size,
       fileId,
-      mode: item.size > config.singlePutMaxBytes ? 'multipart' : 'single'
+      mode: item.size > config.singlePutMaxBytes ? 'multipart' : 'single',
+      /*
+       * 带上哈希前缀。
+       *
+       * 正常流程（经过 runHashStage）已经在 hashing 阶段写过了，
+       * 这里 `?? existing` 会保留；但 recoverPending 恢复的任务
+       * **没经过哈希阶段**，existing 里 md5Prefix 是空的——不在这里补，
+       * 上传完成的任务在传输队列里就永远显示「—」。
+       * 这正是用户反馈「类型上传、状态已完成，哈希却显示 —」的根因。
+       */
+      md5Prefix: item.hashes?.md5.slice(0, 8) ?? undefined,
+      sha1Prefix: item.hashes?.sha1.slice(0, 8) ?? undefined
     })
 
     // upsertFile 把状态写成了 uploading——如果这期间被取消了，
