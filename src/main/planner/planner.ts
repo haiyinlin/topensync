@@ -76,6 +76,15 @@ const TASK_EVICT_SLACK = 600
 export const TASK_TABLE_LIMIT = MAX_TASKS + TASK_EVICT_SLACK
 
 /**
+ * 「刚完成」的保护窗口（毫秒）。
+ *
+ * 任务表满到要淘汰时，完成时间在最近这个窗口内的任务暂不淘汰，
+ * 让用户来得及在传输队列里看到「刚刚完成了什么」。超过窗口、且仍是
+ * 终态的任务按完成时间从老到新淘汰。
+ */
+const EVICT_GRACE_MS = 60_000
+
+/**
  * 本地事件处理的并发度。
  *
  * 这里定 8，但**真正同时打开的文件句柄由 IO 闸门兜底**（见 io/governor.ts）：
@@ -108,6 +117,11 @@ const FD_RETRY_FALLBACK_MS = 1000
  */
 function isEvictable(state: TransferTask['state']): boolean {
   return state === 'canceled' || state === 'done' || state === 'skipped'
+}
+
+/** 终态：任务不会再被调度，可以安全淘汰并盖「完成时间」戳 */
+function isTerminal(state: TransferTask['state']): boolean {
+  return state === 'done' || state === 'skipped' || state === 'canceled'
 }
 
 export interface PlannerOptions {
@@ -2393,7 +2407,20 @@ export class Planner {
       md5Prefix: patch.md5Prefix ?? existing?.md5Prefix ?? '',
       sha1Prefix: patch.sha1Prefix ?? existing?.sha1Prefix ?? '',
       errorMsg: patch.errorMsg !== undefined ? patch.errorMsg : (existing?.errorMsg ?? null),
-      attempts: patch.attempts ?? existing?.attempts ?? 0
+      attempts: patch.attempts ?? existing?.attempts ?? 0,
+      /*
+       * 进入终态时盖一个「完成时间」戳。
+       *
+       * 只在**首次进入终态**时记：一个任务可能先 done、再因为重试回到
+       * queued，不该被旧的时间戳覆盖。重试重置（retryReset）时清掉，
+       * 让它重新开始计时。
+       */
+      finishedAt:
+        patch.retryReset === true
+          ? undefined
+          : isTerminal(nextState)
+            ? (existing?.finishedAt ?? Date.now())
+            : existing?.finishedAt
     }
 
     this.tasks.set(id, task)
@@ -2433,17 +2460,50 @@ export class Planner {
       return
     }
 
+    /*
+     * 收集可淘汰项，分级排序：
+     *
+     * 淘汰的优先级从高到低：
+     * 1. canceled —— 用户主动取消的，最不需要回看；
+     * 2. skipped —— 数量最大（整盘「本地未变」都往这里堆），淘汰主力；
+     * 3. done —— 用户最关心的「已完成」，放最后，且完成不久的有保护窗口。
+     *
+     * 以前直接按 Map 迭代序（入队序）从头删，但入队序 ≠ 完成序：
+     * 一个排队很久才传完的文件，done 一写入就因为入队位置靠前而被
+     * 立刻淘汰，用户看到「刚完成的内容凭空消失」。
+     */
+    const now = Date.now()
+    const rank = (state: TransferTask['state']): number =>
+      state === 'canceled' ? 0 : state === 'skipped' ? 1 : 2
+
+    const evictable: Array<{ id: string; localPath: string; state: TransferTask['state']; finishedAt: number }> = []
+    for (const [id, task] of this.tasks) {
+      if (!isEvictable(task.state)) continue
+      evictable.push({
+        id,
+        localPath: task.localPath,
+        state: task.state,
+        finishedAt: task.finishedAt ?? 0
+      })
+    }
+
+    // 先按「类别优先级」，再按「完成时间升序」（最久的先删）
+    evictable.sort((a, b) => rank(a.state) - rank(b.state) || a.finishedAt - b.finishedAt)
+
     let over = this.tasks.size - MAX_TASKS
     const evicted: string[] = []
-    for (const [id, task] of this.tasks) {
+    for (const item of evictable) {
       if (over <= 0) break
-      if (!isEvictable(task.state)) continue
-      this.tasks.delete(id)
-      // 路径索引必须一起清：留着它，同一路径再变更时会去找一个已删的 id
-      if (this.taskIdByPath.get(task.localPath) === id) {
-        this.taskIdByPath.delete(task.localPath)
+      // 保护窗口：只保护「刚完成的 done」，让用户来得及看到刚上传完的
+      if (item.state === 'done' && item.finishedAt > 0 && now - item.finishedAt < EVICT_GRACE_MS) {
+        continue
       }
-      evicted.push(id)
+      this.tasks.delete(item.id)
+      // 路径索引必须一起清：留着它，同一路径再变更时会去找一个已删的 id
+      if (this.taskIdByPath.get(item.localPath) === item.id) {
+        this.taskIdByPath.delete(item.localPath)
+      }
+      evicted.push(item.id)
       over--
     }
 

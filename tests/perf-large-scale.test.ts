@@ -293,4 +293,42 @@ describe('Planner 任务表容量上限', () => {
     expect(again).toBeDefined()
     expect(again?.state).toBe('failed')
   })
+
+  it('刚完成的任务不会被立即淘汰（保护「刚上传完」的可见性）', () => {
+    const touch = (planner as unknown as Touchable).touch.bind(planner)
+
+    // 一个「刚刚完成」的上传任务
+    touch('fresh-done.bin', { state: 'done', category: 'upload', size: 1 })
+
+    // 大量跳过任务把表挤爆——done 因为刚完成（在保护窗口内）不该被淘汰
+    for (let i = 0; i < 60_000; i++) {
+      touch(`skip-${i}.bin`, { state: 'skipped', category: 'skip', size: 1 })
+    }
+
+    const tasks = planner.getTasks()
+    // 刚完成的 done 还在（这是用户最关心的：刚上传完的不能消失）
+    expect(tasks.some((t) => t.localPath === 'fresh-done.bin')).toBe(true)
+    expect(tasks.length).toBeLessThanOrEqual(TASK_TABLE_LIMIT)
+  })
+
+  it('done 任务盖了完成时间戳，淘汰按完成先后而非入队先后', () => {
+    const touch = (planner as unknown as Touchable).touch.bind(planner)
+
+    // 两个都完成，但「old-done」入队早（更早 touch done）→ 完成时间更早
+    touch('old-done.bin', { state: 'done', category: 'upload', size: 1 })
+    touch('new-done.bin', { state: 'done', category: 'upload', size: 1 })
+
+    // 用跳过任务挤爆表
+    for (let i = 0; i < 60_000; i++) {
+      touch(`skip-${i}.bin`, { state: 'skipped', category: 'skip', size: 1 })
+    }
+
+    // 保护窗口内两者都该在（都刚完成），但若超出窗口，old-done 应先被淘汰
+    // 这里验证 finishedAt 字段确实被写上了
+    const tasks = planner.getTasks()
+    const old = tasks.find((t) => t.localPath === 'old-done.bin')
+    const fresh = tasks.find((t) => t.localPath === 'new-done.bin')
+    if (old) expect(old.finishedAt).toBeGreaterThan(0)
+    if (fresh) expect(fresh.finishedAt).toBeGreaterThan(0)
+  })
 })

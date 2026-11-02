@@ -209,6 +209,15 @@ export interface TransferTask {
   sha1Prefix: string
   errorMsg: string | null
   attempts: number
+  /**
+   * 任务进入终态（done / skipped / canceled）的时间戳。
+   *
+   * 任务表淘汰时用它排序：优先淘汰「完成得最久」的，保护「刚完成的」。
+   * 没有它的话，淘汰只能按 Map 的插入序（入队序）——一个排队很久才传完
+   * 的文件，一完成就因为入队位置靠前而被立刻淘汰，用户看到的就是
+   * 「刚完成的内容凭空消失」。
+   */
+  finishedAt?: number
 }
 
 /**
