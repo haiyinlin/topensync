@@ -630,11 +630,29 @@ export class Watcher {
         shouldStop: () => this.stopped,
         withStat: true,
         onFile: async (rel, abs, done, info) => {
-          const fingerprint = `${info?.size ?? 0}:${Math.round(info?.mtimeMs ?? 0)}`
-          current.set(rel, fingerprint)
           count = done
 
-          const prev = this.pollSnapshot.get(rel)
+          /*
+           * stat 失败（info 为 null）：文件这一轮读不到，但**不判删除**。
+           *
+           * 网络盘 / 整盘场景下 stat 偶发失败是常态（抖动、句柄不足）。
+           * 以前 stat 失败的文件会被整个跳过、缺席本轮 current，下一轮
+           * 「上一轮有这一轮没有」就把它误判成删除，发出 remove 事件，
+           * 已完成的状态被写成 deleted。这里继承上一轮的指纹，
+           * 让它在 current 里保持存在——等哪一轮真的读到了、且指纹变了，
+           * 才作为 upsert 处理；只有「目录本身读不到、文件从列表里消失」
+           * 才会走到删除分支。
+           */
+          const prevFp = this.pollSnapshot.get(rel)
+          if (info === null || info === undefined) {
+            if (prevFp !== undefined) current.set(rel, prevFp)
+            return
+          }
+
+          const fingerprint = `${info.size}:${Math.round(info.mtimeMs)}`
+          current.set(rel, fingerprint)
+
+          const prev = prevFp
           if (!initial && prev === fingerprint) return
 
           this.discovered.add(abs.toLowerCase())
@@ -1046,7 +1064,7 @@ export interface LocalScanOptions {
     rel: string,
     abs: string,
     done: number,
-    info?: { size: number; mtimeMs: number }
+    info?: { size: number; mtimeMs: number } | null
   ) => void | Promise<void>
   /** 返回 true 时中止扫描 */
   shouldStop?: () => boolean
@@ -1133,8 +1151,20 @@ export async function scanLocalTree(opts: LocalScanOptions): Promise<number> {
     for (let i = 0; i < items.length; i++) {
       if (opts.shouldStop?.()) return
       const info = infos[i]
-      if (!info) continue
       count++
+      /*
+       * stat 失败（被删 / 被占用 / 句柄不足）时**仍然回调**，但 info 传 null。
+       *
+       * 为什么不能像以前那样 `if (!info) continue` 直接跳过：
+       * 上层 `scanAndCompare` 用「上一轮有、这一轮没有」来判定文件被删除。
+       * 如果一个文件只是 stat 瞬时失败（网络盘抖动、句柄不足），却因为
+       * 被跳过而缺席本轮 `current`，下一轮就会被误判成「已删除」——
+       * 发出 remove 事件 → handleRemoval → 状态写成 deleted。
+       * 这正是「本地扫描到下一轮，就把已完成给清了」的根因。
+       *
+       * 传 null 让上层能区分「这轮读不到」与「真的不在」，继承上一轮
+       * 指纹而非判删除。
+       */
       const ret = opts.onFile?.(items[i].rel, items[i].abs, count, info)
       if (ret && typeof ret.then === 'function') await ret
     }
