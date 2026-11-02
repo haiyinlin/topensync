@@ -53,6 +53,24 @@ async function settle(ms = 300): Promise<void> {
   await new Promise((r) => setTimeout(r, ms))
 }
 
+/**
+ * 轮询等待条件成立，而不是固定 sleep。
+ * 依赖真实定时器的场景（删除挂起窗口过期）在机器负载高时，
+ * 固定 sleep 可能在定时器触发前就返回 → 偶发失败。
+ */
+async function waitUntil(
+  predicate: () => boolean,
+  timeoutMs = 5000,
+  intervalMs = 50
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await settle(intervalMs)
+  }
+  return predicate()
+}
+
 describe('重命名识别', () => {
   let dir: string
   let syncRoot: string
@@ -247,7 +265,8 @@ describe('重命名识别', () => {
 
     require('fs').unlinkSync(filePath)
     await short.handleEvent('gone.txt', false)
-    await settle(1500)
+    // 等挂起窗口真正过期（定时器触发），而不是赌一个固定 sleep 够长
+    await waitUntil(() => move.mock.calls.some((c) => String(c[1]).includes('/_trash/')))
 
     // 窗口过后，删除必须真的执行（移进 _trash/）
     expect(
@@ -268,7 +287,8 @@ describe('重命名识别', () => {
     seedSynced('old.txt', '/quark-backup/old.txt', ino)
 
     await short.handleEvent('old.txt', false)
-    await settle(1500)
+    // 等过期删除真的落到远端（窗口已过），再放新的同名 inode 进来
+    await waitUntil(() => move.mock.calls.some((c) => String(c[1]).includes('/_trash/')))
 
     // 窗口过后，同 inode 的新文件出现了 —— 不该被认成重命名。
     // 注意区分：过期删除本身会移进 _trash/（源路径同为 old.txt），
