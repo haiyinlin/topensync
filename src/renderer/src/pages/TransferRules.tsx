@@ -22,6 +22,9 @@ export function TransferRules(): React.JSX.Element {
   const [deletePolicy, setDeletePolicy] = useState<DeletePolicy>('trash')
   const [deleteLimit, setDeleteLimit] = useState(200)
   const [deleteBytesGB, setDeleteBytesGB] = useState(10)
+  const [syncEmptyDirs, setSyncEmptyDirs] = useState(false)
+  const [detectRenames, setDetectRenames] = useState(true)
+  const [renameWindowMs, setRenameWindowMs] = useState(5000)
   const [saved, setSaved] = useState(false)
 
   // 首次拿到配置时回填控件
@@ -36,6 +39,9 @@ export function TransferRules(): React.JSX.Element {
     setDeletePolicy(config.deletePolicy)
     setDeleteLimit(config.maxDeletesPerRun)
     setDeleteBytesGB(Math.round(config.maxDeleteBytesPerRun / 1024 / 1024 / 1024))
+    setSyncEmptyDirs(config.syncEmptyDirs)
+    setDetectRenames(config.detectRenames)
+    setRenameWindowMs(config.renameWindowMs)
   }, [config])
 
   const save = async (): Promise<void> => {
@@ -48,7 +54,10 @@ export function TransferRules(): React.JSX.Element {
       verifyMode,
       deletePolicy,
       maxDeletesPerRun: deleteLimit,
-      maxDeleteBytesPerRun: Math.round(deleteBytesGB * 1024 * 1024 * 1024)
+      maxDeleteBytesPerRun: Math.round(deleteBytesGB * 1024 * 1024 * 1024),
+      syncEmptyDirs,
+      detectRenames,
+      renameWindowMs
     })
     setSaved(true)
     setTimeout(() => setSaved(false), 1600)
@@ -166,8 +175,60 @@ export function TransferRules(): React.JSX.Element {
                 校验哈希
               </button>
             </div>
+            <em>
+              上传成功后回读远端确认内容。哈希模式需下载远端重算，流量成本与文件大小成正比。
+            </em>
           </label>
         </div>
+      </div>
+
+      <div className="card form">
+        <div className="card-head">
+          <h2>目录与重命名</h2>
+        </div>
+        <label className="switch-row">
+          <span>
+            <b>同步空目录</b>
+            <em>本地没有文件的目录也在远端建出来</em>
+          </span>
+          <span className="switch">
+            <input
+              type="checkbox"
+              checked={syncEmptyDirs}
+              onChange={(e) => setSyncEmptyDirs(e.target.checked)}
+            />
+            <i />
+          </span>
+        </label>
+        <label className="switch-row">
+          <span>
+            <b>识别重命名</b>
+            <em>改名时远端移动而非删除加重传，省一次完整上行</em>
+          </span>
+          <span className="switch">
+            <input
+              type="checkbox"
+              checked={detectRenames}
+              onChange={(e) => setDetectRenames(e.target.checked)}
+            />
+            <i />
+          </span>
+        </label>
+        <label className="field">
+          <span>
+            重命名判定窗口 <b className="mono val">{renameWindowMs}</b> 毫秒
+          </span>
+          <div className="input narrow">
+            <input
+              value={renameWindowMs}
+              onChange={(e) => setRenameWindowMs(Number(e.target.value))}
+            />
+            <span className="unit">ms</span>
+          </div>
+          <em>
+            删除与新增两条事件的间隔超过此值就不再视为重命名。期间远端的删除会推迟执行。
+          </em>
+        </label>
       </div>
 
       <div className="card form">

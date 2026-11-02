@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { Icon } from '../components/Icon'
 import type { PageKey } from '../App'
+import type { TransferTask } from '@shared/types'
 import { useAppStore } from '../store'
 
 /**
@@ -9,19 +10,42 @@ import { useAppStore } from '../store'
  * 核心是「扫描通道」双行状态卡：本地扫描（常驻实时）与
  * 远端对账（周期性）必须视觉可区分，不能合并成一个进度条。
  */
+
+/**
+ * 「进行中」的口径：上传、哈希、下载都算。
+ *
+ * 以前只算 uploading，正在下载远端文件时概览会显示「已空闲 0 个文件」，
+ * 进度条空转、侧栏徽章也不亮——用户只会以为程序死了。
+ * 与队列页保持同一口径，三处数字才对得上。
+ */
+function isActiveState(state: TransferTask['state']): boolean {
+  return state === 'uploading' || state === 'hashing' || state === 'downloading'
+}
+
 export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): React.JSX.Element {
   const stats = useAppStore((s) => s.stats)
   const tasks = useAppStore((s) => s.tasks)
   const diffs = useAppStore((s) => s.diffs)
   const remoteScan = useAppStore((s) => s.stats?.remoteScan ?? null)
   const localScan = useAppStore((s) => s.stats?.localScan ?? null)
+  const progress = useAppStore((s) => s.progress)
 
   const failed = stats?.failed ?? 0
   const queued = stats?.queued ?? 0
-  const active = tasks.filter((t) => t.state === 'uploading' || t.state === 'hashing')
+  const active = tasks.filter((t) => isActiveState(t.state))
   const openDiffs = diffs.filter((d) => !d.resolvedAt)
 
-  const remoteState = remoteScan?.running ? 'running' : 'idle'
+  // 扫描进行中：进度条与按钮都用真实状态驱动
+  const localScanning = progress?.running === true && progress.kind === 'local'
+  const remoteScanning = progress?.running === true && progress.kind === 'remote'
+
+  // 总进度：进行中任务的平均完成度。有任务才显示，否则 0。
+  const overallProgress =
+    active.length > 0
+      ? Math.round(
+          (active.reduce((sum, t) => sum + (t.progress ?? 0), 0) / active.length) * 100
+        )
+      : 0
 
   return (
     <section>
@@ -39,7 +63,8 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
           </div>
           <div className="hero-text">
             <div className="hero-title">
-              {active.length > 0 ? '正在同步' : '已空闲'} <span className="mono dim">0</span> 个文件
+              {active.length > 0 ? '正在同步' : '已空闲'}{' '}
+              <span className="mono dim">{active.length}</span> 个文件
             </div>
             <div className="hero-sub">
               {active.length > 0
@@ -47,7 +72,7 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
                 : '当前无进行中的传输'}
             </div>
             <div className="bar big">
-              <i style={{ width: active.length > 0 ? '32%' : '0%' }} />
+              <i style={{ width: `${overallProgress}%` }} />
             </div>
           </div>
         </div>
@@ -67,18 +92,25 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
             <div className="ch-main">
               <div className="ch-title">
                 本地扫描
-                <span className="ch-state live">
-                  <i className="pulse" />
-                  实时监控中
-                </span>
+                {localScan?.watching ? (
+                  <span className="ch-state live">
+                    <i className="pulse" />
+                    实时监控中
+                  </span>
+                ) : (
+                  <span className="ch-state">未在监控</span>
+                )}
               </div>
               <div className="ch-sub mono">
-                {localScan?.watching
-                  ? `监听本地同步目录 · 待处理变更 ${queued}`
-                  : '未在监控中（尚未设置同步目录）'}
+                {localScanning
+                  ? progress?.detail ?? '正在扫描…'
+                  : localScan?.watching
+                    ? `监听本地同步目录 · 已扫描 ${localScan.scannedCount} 个文件`
+                    : '未在监控中（尚未设置同步目录）'}
               </div>
-              <div className="bar thin idle">
-                <i style={{ width: '100%' }} />
+              {/* 扫描中才显示进度条；平时那条 100% 的条是假的 */}
+              <div className={localScanning ? 'bar thin indeterminate' : 'bar thin idle'}>
+                <i />
               </div>
             </div>
             <div className="ch-end">
@@ -87,10 +119,11 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
                 <em>待处理变更</em>
               </div>
               <button
-                className="btn tiny ghost"
+                className={`btn tiny ghost${localScanning ? ' busy' : ''}`}
                 onClick={() => window.topensync?.triggerScan('local')}
+                disabled={localScanning}
               >
-                重新扫描
+                {localScanning ? '扫描中…' : '重新扫描'}
               </button>
             </div>
           </div>
@@ -102,24 +135,29 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
             <div className="ch-main">
               <div className="ch-title">
                 远端对账
-                <span className={remoteState === 'running' ? 'ch-state live' : 'ch-state idle'}>
-                  {remoteState === 'running' ? (
-                    <>
-                      <i className="pulse" />
-                      对账进行中
-                    </>
-                  ) : (
-                    '尚未运行'
-                  )}
-                </span>
+                {remoteScanning ? (
+                  <span className="ch-state live">
+                    <i className="pulse" />
+                    对账进行中
+                  </span>
+                ) : remoteScan?.enabled ? (
+                  <span className="ch-state">等待下一轮</span>
+                ) : (
+                  <span className="ch-state">已禁用</span>
+                )}
               </div>
               <div className="ch-sub mono">
-                {remoteScan?.lastScanAt
-                  ? `上次扫描 ${remoteScan.scannedCount} 个文件 · 发现 ${remoteScan.diffCount} 处差异`
-                  : '尚未执行对账'}
+                {remoteScanning
+                  ? progress?.detail ?? '正在对账…'
+                  : remoteScan?.lastScanAt
+                    ? `上次扫描 ${remoteScan.scannedCount} 个文件 · 发现 ${remoteScan.diffCount} 处差异`
+                    : remoteScan?.enabled
+                      ? '尚未执行对账'
+                      : '远端对账已关闭'}
               </div>
-              <div className="bar thin idle">
-                <i style={{ width: '100%' }} />
+              {/* 扫描中才显示进度条；平时那条 100% 的条是假的 */}
+              <div className={remoteScanning ? 'bar thin indeterminate' : 'bar thin idle'}>
+                <i />
               </div>
             </div>
             <div className="ch-end">
@@ -158,7 +196,17 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
             本次跳过
           </div>
           <div className="stat-val mono">{stats?.skipped ?? 0}</div>
-          <div className="stat-foot">本地去重命中 · 零上行</div>
+          <div className="stat-foot">
+            本地未变 {stats?.skippedLocal ?? 0} · 远端已有 {stats?.skippedRemote ?? 0}
+          </div>
+        </div>
+        <div className="card stat">
+          <div className="stat-head">
+            <Icon name="down" className="ic blue" />
+            本次下载
+          </div>
+          <div className="stat-val mono">{stats?.downloaded ?? 0}</div>
+          <div className="stat-foot">远端 → 本地</div>
         </div>
         <div className="card stat">
           <div className="stat-head">

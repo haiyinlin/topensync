@@ -28,6 +28,8 @@ export function ReconcileRules(): React.JSX.Element {
     RemoteScanConfig['remoteOnlyPolicy']
   >('record-only')
   const [autoFixLimit, setAutoFixLimit] = useState(20)
+  const [adoptByNameAndSize, setAdoptByNameAndSize] = useState(true)
+  const [excludeText, setExcludeText] = useState('')
   const [saved, setSaved] = useState(false)
 
   useEffect(() => {
@@ -42,6 +44,8 @@ export function ReconcileRules(): React.JSX.Element {
     setConflictPolicy(rs.conflictPolicy)
     setRemoteOnlyPolicy(rs.remoteOnlyPolicy)
     setAutoFixLimit(rs.autoFixLimit)
+    setAdoptByNameAndSize(rs.adoptByNameAndSize)
+    setExcludeText((rs.exclude ?? []).join('\n'))
   }, [config])
 
   const save = async (): Promise<void> => {
@@ -55,7 +59,13 @@ export function ReconcileRules(): React.JSX.Element {
         refresh,
         conflictPolicy,
         remoteOnlyPolicy,
-        autoFixLimit
+        autoFixLimit,
+        adoptByNameAndSize,
+        // 空行忽略：文本框里留空行是自然编辑行为，不该变成一条空规则
+        exclude: excludeText
+          .split('\n')
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0)
       }
     })
     setSaved(true)
@@ -171,14 +181,19 @@ export function ReconcileRules(): React.JSX.Element {
               <i />
             </span>
           </label>
-          <div className="field">
+          <label className="field">
             <span>远端扫描排除项</span>
-            <div className="textarea mono">
-              {`_trash/**
-其他设备上传/**`}
-            </div>
-            <em>这些路径不会参与差异比对</em>
-          </div>
+            <textarea
+              className="textarea mono"
+              rows={4}
+              value={excludeText}
+              onChange={(e) => setExcludeText(e.target.value)}
+              placeholder={'_trash/**\n其他设备上传/**'}
+            />
+            <em>
+              glob 语法，每行一条；作用于相对远端根目录的路径。这些路径不参与差异比对。
+            </em>
+          </label>
         </div>
       </div>
 
@@ -262,6 +277,30 @@ export function ReconcileRules(): React.JSX.Element {
           </div>
           <em>超过则只记录差异并在对账页列出，防止一次对账引发大批重传</em>
         </label>
+        <div className="hr" />
+        <label className="switch-row">
+          <span>
+            <b>按「文件名 + 大小」认领远端已有文件</b>
+            <em>
+              远端已有同名同大小的文件时直接认定已同步，不再上传。
+              关闭后这类文件一律重新上传。哈希去重不受影响。
+            </em>
+          </span>
+          <span className="switch">
+            <input
+              type="checkbox"
+              checked={adoptByNameAndSize}
+              onChange={(e) => setAdoptByNameAndSize(e.target.checked)}
+            />
+            <i />
+          </span>
+        </label>
+        <p className="warn-note">
+          <Icon name="shield" />
+          认领只比对文件名与大小，<b>不校验内容</b>。因此认领出来的记录会标记为「仅大小」，
+          需要时可对它们做深度校验（文件清单页 → 勾选 → 深度校验）确认内容是否真的一致。
+          哈希去重比的是内容，永远准确，不受这个开关影响。
+        </p>
         <p className="warn-note">
           <Icon name="shield" />
           远端对账只做单向校正——从远端下载文件到本地属于独立动作，始终需要你显式确认。

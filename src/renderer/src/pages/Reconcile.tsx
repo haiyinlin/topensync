@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { useMemo, useState } from 'react'
 import { Icon } from '../components/Icon'
+import { BatchBar } from '../components/BatchBar'
 import type { DiffKind, DiffResolution } from '@shared/types'
 import { useAppStore } from '../store'
 
@@ -9,13 +10,36 @@ import { useAppStore } from '../store'
  *
  * 差异是「需要人判断」的东西，与「机器正在传」是两种事，
  * 所以差异有专属页面，不塞进概览或队列。
+ *
+ * 删除语义：**删远端文件**（移入回收站），并关闭该差异。
+ * 本地文件不动——远端有本地无的差异删掉的是远端那份，
+ * 本地有远端无的差异要删得去文件清单页。
+ *
+ * 差异只回答「这个文件在不在」：
+ * 「仅修改时间不同」不算差异（复制、解压、跨设备同步都会改 mtime，
+ * 而内容可能一模一样），列出来只是噪声。
  */
 const KIND_META: Record<DiffKind, { label: string; tone: string; desc: string }> = {
   missing_remote: { label: '远端缺失', tone: 'amber', desc: '本地文件在远端不存在，将重新上传' },
-  remote_only: { label: '仅远端存在', tone: 'purple', desc: '远端有本地无，默认只记录不处理' },
+  remote_only: { label: '仅在远端', tone: 'purple', desc: '远端有本地无，默认只记录不处理' },
   size_mismatch: { label: '内容不符', tone: 'orange', desc: '两侧大小不同，将以本地为准覆盖' },
-  mtime_mismatch: { label: '时间差异', tone: 'gray', desc: '仅修改时间不同，大小一致' },
-  local_only: { label: '仅本地存在', tone: 'gray', desc: '尚未上传到远端' }
+  local_only: { label: '仅本地', tone: 'gray', desc: '尚未上传到远端' }
+}
+
+/**
+ * 差异类型 → 统计卡配色类。
+ *
+ * 早先用 `kind.split('_')[0]` 拼类名，结果 size_mismatch 拼出 `d-size`、
+ * local_only 拼出 `d-local`——这两个类样式表里根本没有，
+ * 卡片就没了颜色，跟「有控件但不生效」一样是骗人的。
+ * 这里改成显式映射，类名与样式表一一对应。
+ */
+const KIND_CARD_CLASS: Record<DiffKind, string> = {
+  missing_remote: 'd-missing',
+  remote_only: 'd-remote',
+  size_mismatch: 'd-conflict',
+  // 仅本地＝远端也缺这个文件，语义上与「远端缺失」同源
+  local_only: 'd-missing'
 }
 
 type Filter = DiffKind | 'all'
@@ -23,9 +47,32 @@ type Filter = DiffKind | 'all'
 export function Reconcile(): React.JSX.Element {
   const diffs = useAppStore((s) => s.diffs)
   const refreshDiffs = useAppStore((s) => s.refreshDiffs)
+  const deleteRemoteFiles = useAppStore((s) => s.deleteRemoteFiles)
   const scan = useAppStore((s) => s.stats?.remoteScan ?? null)
+  const progress = useAppStore((s) => s.progress)
   const [filter, setFilter] = useState<Filter>('all')
+  const [query, setQuery] = useState('')
   const [busy, setBusy] = useState(false)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+
+  /*
+   * 对账进行中：本地标记 + 主进程推来的真实进度。
+   *
+   * 以前用 setTimeout(2600) 猜「对账大概要这么久」——
+   * 远端文件多的时候对账要好几分钟，按钮早就恢复了常态，
+   * 用户会以为没生效。现在由真实进度驱动。
+   */
+  const reconciling = busy || (progress?.running === true && progress.kind === 'remote')
+
+  // 进度结束就清掉本地标记，否则按钮永远停在禁用态
+  React.useEffect(() => {
+    if (!progress?.running) setBusy(false)
+  }, [progress?.running])
+
+  // 进页面刷一次差异：对账是后台跑的，差异可能在你不看这个页面时产生或消失
+  React.useEffect(() => {
+    void refreshDiffs()
+  }, [refreshDiffs])
 
   const counts = useMemo(() => {
     const c: Record<string, number> = {}
@@ -33,18 +80,43 @@ export function Reconcile(): React.JSX.Element {
     return c
   }, [diffs])
 
-  const shown = diffs.filter((d) => filter === 'all' || d.kind === filter)
+  /*
+   * 筛选结果必须先记忆化再派生 ID 列表：
+   * 之前 shown 是每次渲染现场 filter 出来的新数组，
+   * useMemo 的依赖每次都变，缓存永远不命中，全选也就永远选不全。
+   */
+  const shown = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    return diffs.filter(
+      (d) =>
+        (filter === 'all' || d.kind === filter) &&
+        (q === '' || d.remotePath.toLowerCase().includes(q))
+    )
+  }, [diffs, filter, query])
+  const shownIds = useMemo(() => shown.map((d) => String(d.id)), [shown])
 
   const resolve = (id: number, resolution: DiffResolution): void => {
-    window.topensync?.resolveDiff(id, resolution)
-    // 处置结果由主进程落库，这里重新拉一次未处置差异
-    setTimeout(() => void refreshDiffs(), 400)
+    /*
+     * 等主进程真的处理完再刷新列表。
+     *
+     * 以前是 `send` + `setTimeout(400)` 猜时间：
+     * 「移入回收站」要走网络请求，400ms 常常不够，
+     * 差异行就留在表里，用户以为操作没生效，反复点。
+     * 现在改成 invoke，await 完再刷新，时序是确定的。
+     */
+    void window.topensync
+      ?.resolveDiff(id, resolution)
+      .then(() => refreshDiffs())
+      .catch(() => refreshDiffs())
   }
 
   const trigger = (): void => {
+    if (reconciling) return
     setBusy(true)
     window.topensync?.triggerScan('remote')
-    setTimeout(() => setBusy(false), 2600)
+    // 对账结束后主进程会推 scan:update，store 届时刷新差异列表。
+    // 这里再兜一次：慢速服务端上对账可能超过 3 秒。
+    setTimeout(() => void refreshDiffs(), 2600)
   }
 
   return (
@@ -55,9 +127,9 @@ export function Reconcile(): React.JSX.Element {
           <p className="sub">列举远端文件树并与本地清单比对，找出两侧不一致之处。</p>
         </div>
         <div className="head-actions">
-          <button className={`btn ghost${busy ? ' busy' : ''}`} onClick={trigger} disabled={busy}>
+          <button className={`btn ghost${reconciling ? ' busy' : ''}`} onClick={trigger} disabled={reconciling}>
             <Icon name="diff" />
-            {busy ? '对账中…' : '立即对账'}
+            {reconciling ? '对账中…' : '立即对账'}
           </button>
         </div>
       </div>
@@ -98,24 +170,34 @@ export function Reconcile(): React.JSX.Element {
       </div>
 
       <div className="grid diff-grid">
-        {(['missing_remote', 'remote_only', 'size_mismatch', 'mtime_mismatch'] as DiffKind[]).map(
-          (kind) => (
-            <div className={`card dstat d-${kind.split('_')[0]}`} key={kind}>
-              <div className="dstat-head">
-                <Icon name={kind === 'missing_remote' ? 'alert' : kind === 'remote_only' ? 'cloud-check' : kind === 'size_mismatch' ? 'overwrite' : 'clock'} />
-                {KIND_META[kind].label}
-              </div>
-              <div className="dstat-val mono">{counts[kind] ?? 0}</div>
-              <div className="dstat-foot">{KIND_META[kind].desc}</div>
+        {(['missing_remote', 'remote_only', 'size_mismatch'] as DiffKind[]).map((kind) => (
+          <div className={`card dstat ${KIND_CARD_CLASS[kind]}`} key={kind}>
+            <div className="dstat-head">
+              <Icon
+                name={
+                  kind === 'missing_remote'
+                    ? 'alert'
+                    : kind === 'remote_only'
+                      ? 'cloud-check'
+                      : 'overwrite'
+                }
+              />
+              {KIND_META[kind].label}
             </div>
-          )
-        )}
+            <div className="dstat-val mono">{counts[kind] ?? 0}</div>
+            <div className="dstat-foot">{KIND_META[kind].desc}</div>
+          </div>
+        ))}
       </div>
 
       <div className="card toolbar">
         <div className="rail-search inline">
           <Icon name="search" />
-          <input placeholder="按路径搜索差异项" />
+          <input
+            placeholder="按路径搜索差异项"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
         </div>
         <div className="chips">
           <button
@@ -140,24 +222,46 @@ export function Reconcile(): React.JSX.Element {
         <table className="tbl">
           <thead>
             <tr>
-              <th style={{ width: '12%' }}>类型</th>
-              <th style={{ width: '28%' }}>路径</th>
-              <th style={{ width: '14%' }}>本地</th>
-              <th style={{ width: '14%' }}>远端</th>
-              <th style={{ width: '12%' }}>发现时间</th>
-              <th style={{ width: '20%' }}>处理</th>
+              <th style={{ width: '4%' }} />
+              <th style={{ width: '11%' }}>类型</th>
+              <th style={{ width: '25%' }}>路径</th>
+              <th style={{ width: '13%' }}>本地</th>
+              <th style={{ width: '13%' }}>远端</th>
+              <th style={{ width: '11%' }}>发现时间</th>
+              <th style={{ width: '23%' }}>处理</th>
             </tr>
           </thead>
           <tbody>
             {shown.length === 0 && (
               <tr>
-                <td colSpan={6} className="dim" style={{ textAlign: 'center', padding: '28px 12px' }}>
-                  暂无差异。运行一次对账以核对远端文件树。
+                <td
+                  colSpan={7}
+                  className="dim"
+                  style={{ textAlign: 'center', padding: '28px 12px' }}
+                >
+                  {diffs.length === 0
+                    ? '暂无差异。运行一次对账以核对远端文件树。'
+                    : '没有符合当前筛选条件的差异项。'}
                 </td>
               </tr>
             )}
             {shown.map((d) => (
               <tr key={d.id}>
+                <td>
+                  <label className="batch-check">
+                    <input
+                      type="checkbox"
+                      checked={selected.has(String(d.id))}
+                      onChange={() => {
+                        const key = String(d.id)
+                        const next = new Set(selected)
+                        if (next.has(key)) next.delete(key)
+                        else next.add(key)
+                        setSelected(next)
+                      }}
+                    />
+                  </label>
+                </td>
                 <td>
                   <span className={`pill ${KIND_META[d.kind].tone}`}>{KIND_META[d.kind].label}</span>
                 </td>
@@ -214,6 +318,43 @@ export function Reconcile(): React.JSX.Element {
           </tbody>
         </table>
       </div>
+
+      <BatchBar
+        allIds={shownIds}
+        selected={selected}
+        onSelectionChange={setSelected}
+        hint={`已选 ${selected.size} 项`}
+        actions={[
+          {
+            label: '删除远端文件',
+            danger: true,
+            confirmTitle: '删除远端文件',
+            confirmBody: '将把选中的远端文件移入远端回收站，并关闭对应差异。本地文件不受影响。',
+            onRun: async (ids) => {
+              const targets = diffs
+                .filter((d) => ids.includes(String(d.id)))
+                .map((d) => ({ remotePath: d.remotePath, diffId: d.id }))
+              if (targets.length === 0) return
+              await deleteRemoteFiles(targets)
+            }
+          },
+          {
+            label: '忽略',
+            danger: false,
+            confirmTitle: '忽略这些差异',
+            confirmBody: '仅标记为已忽略，不改动任何文件。',
+            onRun: async (ids) => {
+              for (const id of ids) {
+                const diffId = Number(id)
+                if (Number.isFinite(diffId)) {
+                  window.topensync?.resolveDiff(diffId, 'ignored')
+                }
+              }
+              setTimeout(() => void refreshDiffs(), 400)
+            }
+          }
+        ]}
+      />
 
       <p className="warn-note">
         <Icon name="shield" />
