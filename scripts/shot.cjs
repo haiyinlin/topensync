@@ -18,7 +18,18 @@ if (!fs.existsSync(MAIN)) {
 const outDir = process.argv[2] || fs.mkdtempSync(path.join(os.tmpdir(), 'topensync-shot-'))
 fs.mkdirSync(outDir, { recursive: true })
 
-const PAGES = ['overview', 'queue', 'manifest', 'reconcile', 'logs', 'connection', 'transfer']
+const PAGES = [
+  'overview',
+  'queue',
+  'manifest',
+  'reconcile',
+  'logs',
+  'connection',
+  'transfer',
+  'reconrule',
+  'advanced',
+  'help'
+]
 
 require(MAIN)
 const { app, BrowserWindow } = require('electron')
