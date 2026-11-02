@@ -30,7 +30,11 @@ const CONFIG: AppConfig = {
   retry: { maxAttempts: 3, baseDelayMs: 10 },
   exclude: ['**/node_modules/**'],
   verifyMode: 'size',
+  verifyHashMaxBytes: 64 * 1024 * 1024,
   quarkMaxFileBytes: 20 * 1024 * 1024 * 1024,
+  syncEmptyDirs: false,
+  detectRenames: false,
+  renameWindowMs: 5000,
   remoteScan: {
     enabled: true,
     intervalHours: 6,
@@ -40,7 +44,8 @@ const CONFIG: AppConfig = {
     timeoutMinutes: 30,
     conflictPolicy: 'local-wins',
     remoteOnlyPolicy: 'record-only',
-    autoFixLimit: 20
+    autoFixLimit: 20,
+    exclude: []
   }
 }
 
@@ -282,5 +287,304 @@ describe('Planner', () => {
 
     expect(upload).not.toHaveBeenCalled()
     manual.stop()
+  })
+})
+
+/**
+ * 队列的「重试」与「取消」按钮。
+ *
+ * 这两个按钮曾经完全不起作用，根因是**任务表与队列是两份数据**：
+ * 任务表是给界面看的快照，队列是真正在跑的数据流。
+ * 只改任务表不改队列 → 任务照样跑完并把状态覆盖回 done，
+ * 界面看着像「点了没反应」。
+ */
+describe('Planner 的重试与取消', () => {
+  let dir: string
+  let syncRoot: string
+  let manifest: Manifest
+  let upload: ReturnType<typeof vi.fn>
+  let planner: Planner
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'topensync-queue-'))
+    syncRoot = join(dir, 'sync')
+    rmSync(syncRoot, { recursive: true, force: true })
+    require('fs').mkdirSync(syncRoot, { recursive: true })
+
+    manifest = new Manifest(join(dir, 'manifest.db'))
+    upload = vi.fn().mockResolvedValue({ ok: true })
+
+    const transfer = { upload } as unknown as Transfer
+    const client = {
+      mkdir: vi.fn().mockResolvedValue(undefined),
+      move: vi.fn().mockResolvedValue(undefined),
+      remove: vi.fn().mockResolvedValue(undefined)
+    } as unknown as OpenListClient
+
+    planner = new Planner({
+      manifest,
+      transfer,
+      client,
+      getConfig: () => ({ ...CONFIG, syncRoot })
+    })
+    planner.start()
+  })
+
+  afterEach(() => {
+    planner.stop()
+    manifest.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('取消排队中的任务：不再上传，状态变为已取消', async () => {
+    const p = join(syncRoot, 'q.txt')
+    writeFileSync(p, 'data')
+
+    // 先让它失败，拿到一个 failed 任务
+    // 注意：失败会自动重试（retryable 默认 true），
+    // 所以要让它**持续**失败，直到耗尽 maxAttempts 才落到 failed。
+    upload.mockResolvedValue({ ok: false, error: 'boom' })
+    await planner.handleEvent('q.txt', true)
+    await settle(1200)
+
+    let task = planner.getTasks().find((t) => t.localPath === 'q.txt')
+    expect(task?.state).toBe('failed')
+
+    upload.mockResolvedValue({ ok: true })
+    planner.cancel(task!.id)
+    await settle(400)
+
+    task = planner.getTasks().find((t) => t.localPath === 'q.txt')
+    expect(task?.state).toBe('canceled')
+    // 取消后不应该再有新的上传
+    expect(upload).toHaveBeenCalledTimes(3)
+  })
+
+  it('取消正在上传的任务：上传结束后状态仍是已取消，不被覆盖成已完成', async () => {
+    const p = join(syncRoot, 'r.txt')
+    writeFileSync(p, 'data')
+
+    let release: (v: unknown) => void = () => undefined
+    upload.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve
+        })
+    )
+
+    await planner.handleEvent('r.txt', true)
+    await settle(300)
+
+    const task = planner.getTasks().find((t) => t.localPath === 'r.txt')
+    expect(task?.state).toBe('uploading')
+
+    planner.cancel(task!.id)
+    // 放行上传
+    release({ ok: true })
+    await settle(400)
+
+    const after = planner.getTasks().find((t) => t.localPath === 'r.txt')
+    expect(after?.state).toBe('canceled')
+  })
+
+  it('取消后状态不会被流水线的后续回报覆盖（不退回上传中）', async () => {
+    const p = join(syncRoot, 'r2.txt')
+    writeFileSync(p, 'data')
+
+    // 上传挂住：模拟「取消发生在哈希/上传阶段之间」
+    let release: (v: unknown) => void = () => undefined
+    upload.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve
+        })
+    )
+
+    await planner.handleEvent('r2.txt', true)
+    await settle(300)
+
+    const task = planner.getTasks().find((t) => t.localPath === 'r2.txt')
+    planner.cancel(task!.id)
+    release({ ok: true })
+    // 多等几轮，让流水线的每个阶段都有机会回报状态
+    await settle(1000)
+
+    const after = planner.getTasks().find((t) => t.localPath === 'r2.txt')
+    expect(after?.state).toBe('canceled')
+  })
+
+  it('重试失败的任务：会重新上传并最终成功', async () => {
+    const p = join(syncRoot, 's.txt')
+    writeFileSync(p, 'data')
+
+    upload.mockResolvedValue({ ok: false, error: 'boom', retryable: false })
+    await planner.handleEvent('s.txt', true)
+    await settle(600)
+
+    const failed = planner.getTasks().find((t) => t.localPath === 's.txt')
+    expect(failed?.state).toBe('failed')
+    expect(upload).toHaveBeenCalledTimes(1)
+
+    upload.mockResolvedValue({ ok: true })
+    planner.retry(failed!.id)
+    await settle(600)
+
+    expect(upload).toHaveBeenCalledTimes(2)
+    const done = planner.getTasks().find((t) => t.localPath === 's.txt')
+    expect(done?.state).toBe('done')
+  })
+
+  it('重试会重置尝试次数（否则一进队列就又判失败）', async () => {
+    const p = join(syncRoot, 't.txt')
+    writeFileSync(p, 'data')
+
+    upload.mockResolvedValue({ ok: false, error: 'boom', retryable: false })
+    await planner.handleEvent('t.txt', true)
+    await settle(600)
+
+    const failed = planner.getTasks().find((t) => t.localPath === 't.txt')
+    expect(failed?.attempts).toBeGreaterThan(0)
+
+    upload.mockResolvedValue({ ok: true })
+    planner.retry(failed!.id)
+    await settle(600)
+
+    const done = planner.getTasks().find((t) => t.localPath === 't.txt')
+    expect(done?.attempts).toBe(0)
+    expect(done?.state).toBe('done')
+  })
+})
+
+/**
+ * 换同步目录后，上一轮的清单记录不该被当成「本地待传文件」重传。
+ *
+ * 实测踩过：切到新目录启动后，上一轮的 readme.txt / docs/guide.md /
+ * sub/c.txt 全被重新上传，远端凭空多出 docs/、sub/ 目录。
+ */
+describe('Planner 的未完成任务恢复', () => {
+  it('本地已不存在的历史记录不会被重新上传', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'topensync-recover-'))
+    const syncRoot = join(dir, 'sync')
+    require('fs').mkdirSync(syncRoot, { recursive: true })
+    const manifest = new Manifest(join(dir, 'manifest.db'))
+    const upload = vi.fn().mockResolvedValue({ ok: true })
+
+    // 模拟上一轮遗留：三个记录对应的文件在新目录里都不存在
+    manifest.upsertFile({ localPath: 'readme.txt', localSize: 10, mtimeMs: 1, state: 'error' })
+    manifest.upsertFile({ localPath: 'docs/guide.md', localSize: 10, mtimeMs: 1, state: 'error' })
+    manifest.upsertFile({ localPath: 'sub/c.txt', localSize: 10, mtimeMs: 1, state: 'error' })
+
+    const planner = new Planner({
+      manifest,
+      transfer: { upload } as unknown as Transfer,
+      client: { mkdir: vi.fn(), move: vi.fn(), remove: vi.fn() } as unknown as OpenListClient,
+      getConfig: () => ({ ...CONFIG, syncRoot })
+    })
+    planner.start()
+
+    const recovered = planner.recoverPending()
+    await settle(400)
+
+    expect(recovered).toBe(0)
+    expect(upload).not.toHaveBeenCalled()
+
+    planner.stop()
+    manifest.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('本地确实存在的记录仍会被恢复上传', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'topensync-recover2-'))
+    const syncRoot = join(dir, 'sync')
+    require('fs').mkdirSync(syncRoot, { recursive: true })
+    writeFileSync(join(syncRoot, 'keep.txt'), 'data')
+    const manifest = new Manifest(join(dir, 'manifest.db'))
+    const upload = vi.fn().mockResolvedValue({ ok: true })
+
+    manifest.upsertFile({ localPath: 'keep.txt', localSize: 4, mtimeMs: 1, state: 'error' })
+
+    const planner = new Planner({
+      manifest,
+      transfer: { upload } as unknown as Transfer,
+      client: { mkdir: vi.fn(), move: vi.fn(), remove: vi.fn() } as unknown as OpenListClient,
+      getConfig: () => ({ ...CONFIG, syncRoot })
+    })
+    planner.start()
+
+    const recovered = planner.recoverPending()
+    await settle(400)
+
+    expect(recovered).toBe(1)
+    expect(upload).toHaveBeenCalledTimes(1)
+
+    planner.stop()
+    manifest.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+/**
+ * 取消的语义要能跨重启保持。
+ *
+ * 取消 = 「我现在不想传这个文件」。
+ * 如果清单状态写成 error，下次启动的恢复逻辑会把它捞起来重传，
+ * 用户明明取消了，程序又偷偷传一遍。
+ */
+describe('取消后的持久化语义', () => {
+  it('取消的文件不会被下次启动的恢复逻辑重新上传', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'topensync-cancel-persist-'))
+    const syncRoot = join(dir, 'sync')
+    require('fs').mkdirSync(syncRoot, { recursive: true })
+    writeFileSync(join(syncRoot, 'skip.txt'), 'data')
+
+    const manifest = new Manifest(join(dir, 'manifest.db'))
+    // 上传挂住不返回——模拟「正在上传时用户点了取消」
+    let release: (v: unknown) => void = () => undefined
+    const upload = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          release = resolve
+        })
+    )
+    const planner = new Planner({
+      manifest,
+      transfer: { upload } as unknown as Transfer,
+      client: { mkdir: vi.fn(), move: vi.fn(), remove: vi.fn() } as unknown as OpenListClient,
+      getConfig: () => ({ ...CONFIG, syncRoot })
+    })
+    planner.start()
+
+    await planner.handleEvent('skip.txt', true)
+    await settle(400)
+    const task = planner.getTasks().find((t) => t.localPath === 'skip.txt')!
+    expect(task.state).toBe('uploading')
+
+    planner.cancel(task.id)
+    // 放行上传：即便它返回成功，也不该被记成 synced
+    release({ ok: true })
+    await settle(400)
+
+    planner.stop()
+    manifest.close()
+
+    // 模拟重启：新 Planner 读同一份清单
+    const manifest2 = new Manifest(join(dir, 'manifest.db'))
+    const upload2 = vi.fn().mockResolvedValue({ ok: true })
+    const planner2 = new Planner({
+      manifest: manifest2,
+      transfer: { upload: upload2 } as unknown as Transfer,
+      client: { mkdir: vi.fn(), move: vi.fn(), remove: vi.fn() } as unknown as OpenListClient,
+      getConfig: () => ({ ...CONFIG, syncRoot })
+    })
+    planner2.start()
+    const recovered = planner2.recoverPending()
+    await settle(400)
+
+    expect(recovered).toBe(0)
+    expect(upload2).not.toHaveBeenCalled()
+
+    planner2.stop()
+    manifest2.close()
+    rmSync(dir, { recursive: true, force: true })
   })
 })
