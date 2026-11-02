@@ -90,21 +90,37 @@ export function Queue(): React.JSX.Element {
    * 之前 shown 每次渲染都新建，useMemo 的依赖每次都变，
    * 缓存永远不命中，全选也就永远选不全。
    *
-   * **倒序**（最新的排前面）：任务 id 是 UUID，没有时间字段，
-   * 而 Map 的插入序就是创建序——反转即可得到「最新在前」。
-   * 用户找刚出问题的任务时，不用从几千条里往上翻。
+   * 排序（「全部」与「进行中」两个视图）：
+   * 正在传输的排最上面，其中有速度的又排在没有速度的前面，
+   * 其余（已完成/失败/等待等）保持倒序（最新在前）。
+   *
+   * 为什么要置顶「有速率」的：用户在几千条队列里最关心的是
+   * 「现在正在传什么、传多快」——把它们沉在列表底部，
+   * 每次都得往下翻几百条才看得到，等于让最有用的信息最难找。
+   * 其它筛选（已完成/失败/等待）没有「进行中」这回事，保持纯倒序。
    */
-  const shown = useMemo(
-    () =>
-      tasks
-        .filter(
-          (t) =>
-            (filter === 'all' || matchesState(t.state, filter)) &&
-            (category === 'all' || t.category === category)
-        )
-        .reverse(),
-    [tasks, filter, category]
-  )
+  const shown = useMemo(() => {
+    const filtered = tasks.filter(
+      (t) =>
+        (filter === 'all' || matchesState(t.state, filter)) &&
+        (category === 'all' || t.category === category)
+    )
+    // 只有「全部」和「进行中」需要把在传的顶上去
+    const prioritizeActive = filter === 'all' || filter === 'uploading'
+    const list = filtered.reverse()
+    if (!prioritizeActive) return list
+
+    /*
+     * 稳定排序：在传的（speed>0 优先，其次 active）排前面，
+     * 其余保持原来的倒序相对顺序。
+     */
+    const rank = (t: TransferTask): number => {
+      if (t.speed > 0) return 0 // 有速度的正在传——最顶
+      if (isActiveState(t.state)) return 1 // 在传但还没测出速度（刚起步/哈希）
+      return 2 // 其它
+    }
+    return list.sort((a, b) => rank(a) - rank(b))
+  }, [tasks, filter, category])
 
   const shownIds = useMemo(() => shown.map((t) => t.id), [shown])
 
