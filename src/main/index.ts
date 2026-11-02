@@ -83,12 +83,12 @@ app.whenReady().then(() => {
 
   // 引擎先于窗口建立：IPC 通道要在渲染进程开始请求前注册好
   engine = new Engine({
-    onTransfer: (task) => emit('transfer:update', task),
+    onTransferBatch: (batch) => emit('transfer:batch', batch),
     onScan: (scan) => emit('scan:update', scan),
     onProgress: (progress) => emit('scan:progress', progress),
     onDiff: (diff) => emit('diff:update', diff),
     onConfig: (config) => emit('config:update', config),
-    onLog: (entry) => emit('log:append', entry),
+    onLogBatch: (entries) => emit('log:batch', entries),
     onConnection: (status) => emit('connection:update', status)
   })
   registerIpc(engine)
@@ -98,7 +98,23 @@ app.whenReady().then(() => {
   // 引擎启动失败不应让窗口打不开：连接问题由连接页展示并允许重试
   void engine.start().catch((err: unknown) => {
     const message = err instanceof Error ? err.message : String(err)
-    emit('log:append', { ts: Date.now(), level: 'error', message: `引擎启动失败：${message}` })
+    /*
+     * 走批量通道，且必须是**数组**。
+     *
+     * 日志改成批量推送后，渲染层只订阅 `log:batch`——
+     * 这里还发 `log:append` 的话，启动失败这条最关键的日志
+     * 会发到一个没人听的通道上，用户什么都看不到。
+     */
+    emit('log:batch', [
+      {
+        ts: Date.now(),
+        level: 'error',
+        message: `引擎启动失败：${message}`,
+        category: 'system',
+        filePath: null,
+        remotePath: null
+      }
+    ])
   })
 
   app.on('activate', () => {

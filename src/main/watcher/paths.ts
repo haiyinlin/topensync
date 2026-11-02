@@ -172,12 +172,26 @@ const IGNORED_SEGMENTS = new Set([
 ])
 
 export function hasIgnoredSegment(rel: string): boolean {
-  for (const seg of rel.split('/')) {
+  const segments = rel.split('/')
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i]
     if (seg === '') continue
     if (IGNORED_SEGMENTS.has(seg)) return true
     // 隐藏目录与以 ~ 开头的临时目录
     if (seg.startsWith('.')) return true
     if (seg.startsWith('~')) return true
+    /*
+     * 下载中间产物：`xxx.mp4.part`。
+     *
+     * downloadTo 会先写 `${本地路径}.part`，成功后才 rename 成正式名。
+     * 这个文件落在**同步根里**，而 watcher 的 awaitWriteFinish 只要求
+     * 2 秒内没有新写入——大文件下载遇上网络停顿超过 2 秒，
+     * 就会被当成「新文件」哈希并上传，远端多出一个半截的 .part。
+     *
+     * 只查最后一段：目录名里带 .part 的情况不存在，
+     * 而前面的路径段已经在循环里判过了。
+     */
+    if (i === segments.length - 1 && seg.endsWith('.part')) return true
   }
   return false
 }

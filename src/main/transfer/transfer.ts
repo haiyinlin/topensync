@@ -5,6 +5,7 @@ import type { OpenListClient } from '../openlist/client'
 import { describeError, isSameNameDownloading } from '../openlist/client'
 import type { Manifest } from '../db/manifest'
 import { hashFile, verifyUnchanged, type FileHashes } from '../hash/hashes'
+import { ioGovernor } from '../io/governor'
 import { verifyRemote } from '../verify/verifier'
 import type { AppConfig } from '@shared/types'
 
@@ -91,6 +92,13 @@ export interface UploadRequest {
   /** 预计算的双哈希；有则跳过重复读盘 */
   hashes?: FileHashes
   /**
+   * 入队时观测到的文件修改时间（毫秒）。
+   *
+   * 用来判断「哈希之后、上传之前文件是不是被改过」。
+   * 不传（或传 0）就只做大小校验——重试路径拿不到可靠值。
+   */
+  mtimeMs?: number
+  /**
    * 取消检查。
    *
    * 用户点「取消」时，Planner 会把对应队列项标记为 canceled。
@@ -153,8 +161,26 @@ export class Transfer {
       return { ok: false, error: '已取消', retryable: false }
     }
 
-    // 竞态复核：哈希期间文件可能已被改写
-    const unchanged = await verifyUnchanged(req.absPath, { size: st.size, mtimeMs })
+    /*
+     * 竞态复核：拿「哈希那一刻的字节数」跟现在要发的比。
+     *
+     * 以前这里传的是**刚取的** `st.size` —— 等于自己跟自己比，
+     * 恒为真，形同虚设。真正的风险窗口是「哈希阶段 → 上传阶段」：
+     * 这中间文件被改写的话，我们会带着旧 MD5/SHA1 发新内容。
+     * 夸克驱动的秒传判据就是 MD5+SHA1，服务端会直接链到**旧 blob**，
+     * 远端留下旧内容；而默认校验只比大小，一样大就通过 →
+     * `setState('synced')` 写上旧哈希 → 下一轮 L1 命中 → 永远不再传。
+     *
+     * 判据：
+     * - `hashes.size` 是哈希时**真正读到的**字节数，与现在的 size 不等
+     *   就说明内容换了（最可靠的一条）；
+     * - `mtimeMs` 兜同尺寸改写。入队时可能传 0（重试路径），不能用它判。
+     */
+    const hashedSize = hashes.size
+    const drifted =
+      (hashedSize > 0 && st.size !== hashedSize) ||
+      ((req.mtimeMs ?? 0) > 0 && Math.abs(st.mtimeMs - (req.mtimeMs ?? 0)) > 1)
+    const unchanged = drifted ? false : await verifyUnchanged(req.absPath, { size: st.size, mtimeMs })
     if (!unchanged) {
       manifest.setState(req.relPath, 'stale', { errorMsg: '哈希期间文件已变更' })
       return { ok: false, error: '哈希期间文件已变更，需重新计算' }
@@ -337,13 +363,31 @@ export class Transfer {
     size: number,
     mtimeMs: number
   ): Promise<void> {
-    const stream = createReadStream(req.absPath)
-    const body = Readable.toWeb(stream) as ReadableStream<Uint8Array>
-    await this.opts.client.putFile(req.remotePath, body, {
-      size,
-      md5,
-      sha1,
-      lastModifiedMs: Math.floor(mtimeMs)
+    /*
+     * 读流必须与请求同生共死。
+     *
+     * 这里以前没有 finally：`client.putFile` 抛出时（网络断开、HTTP 500、
+     * 服务端拒绝），读流还开着，没人 destroy 它。失败一次漏一个句柄，
+     * 而失败恰恰是常态——真实用户的一次扫描里 556 个文件失败，
+     * 句柄漏光之后连 `stat` 都开始报 EMFILE，
+     * 整块 Z: 盘被拖到需要重启才能恢复。
+     *
+     * fetch 失败时 undici 不保证会把 body 读完或销毁，
+     * 所以释放的责任在创建流的一方，不能指望下游。
+     */
+    await ioGovernor.run(async () => {
+      const stream = createReadStream(req.absPath)
+      try {
+        const body = Readable.toWeb(stream) as ReadableStream<Uint8Array>
+        await this.opts.client.putFile(req.remotePath, body, {
+          size,
+          md5,
+          sha1,
+          lastModifiedMs: Math.floor(mtimeMs)
+        })
+      } finally {
+        if (!stream.destroyed) stream.destroy()
+      }
     })
   }
 
@@ -474,9 +518,20 @@ export class Transfer {
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        const stream = createReadStream(localPath, { start: offset, end: offset + length - 1 })
-        const body = Readable.toWeb(stream) as ReadableStream<Uint8Array>
-        await client.multipartChunk(uploadId, index, body)
+        /*
+         * 每次尝试都新建读流，且必须保证这一次失败/取消时它被销毁。
+         * 分片上传的重试次数是「分片数 × 重试上限」量级，
+         * 漏一个就是漏几百个句柄。
+         */
+        await ioGovernor.run(async () => {
+          const stream = createReadStream(localPath, { start: offset, end: offset + length - 1 })
+          try {
+            const body = Readable.toWeb(stream) as ReadableStream<Uint8Array>
+            await client.multipartChunk(uploadId, index, body)
+          } finally {
+            if (!stream.destroyed) stream.destroy()
+          }
+        })
         return
       } catch (err) {
         const status = (err as { status?: number }).status

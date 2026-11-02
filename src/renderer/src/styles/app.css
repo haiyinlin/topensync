@@ -2048,3 +2048,33 @@ textarea {
   padding: 28px 12px !important;
   color: var(--tx3);
 }
+
+/* ── 顶栏速率胶囊 ─────────────────────────────────────
+ *
+ * 只在本次运行真的传过数据之后才渲染（见 TopBar）。
+ * 三个数排成一行：当前速率最醒目，峰值与平均压暗作参考。
+ */
+.speed-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  padding: 0 11px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line-soft);
+  font-size: 11.5px;
+  color: var(--tx2);
+  white-space: nowrap;
+}
+
+.speed-pill .ic {
+  width: 13px;
+  height: 13px;
+  color: var(--accent);
+}
+
+.speed-pill b {
+  font-weight: 500;
+  color: var(--tx1);
+}

@@ -6,6 +6,7 @@ import { Manifest } from '../src/main/db/manifest'
 import { Planner } from '../src/main/planner/planner'
 import type { Transfer } from '../src/main/transfer/transfer'
 import type { OpenListClient } from '../src/main/openlist/client'
+import { hashFile } from '../src/main/hash/hashes'
 import type { AppConfig } from '../src/shared/types'
 
 /**
@@ -181,6 +182,83 @@ describe('Planner', () => {
 
     expect(upload).toHaveBeenCalledTimes(1)
     expect(upload.mock.calls[0][0]).toMatchObject({ relPath: 'd.txt' })
+  })
+
+  /*
+   * 回归：远端被外部删除后，「对账重传」不能被哈希判重吞掉。
+   *
+   * 这条曾经是静默的数据缺口：清单里留着上次同步时的
+   * synced_md5/sha1，远端那份已经被人删了。对账发现 missing_remote
+   * 后入队，哈希阶段拿本地哈希跟 synced_md5 一比——本地没改过，
+   * 相等 → 判成「远端重复」→ 跳过上传。
+   *
+   * 于是每轮对账都发现差异、每轮都「重新上传」、每轮都被跳过，
+   * 远端那份永远补不回来，而清单里还写着 synced。
+   *
+   * 修法是入队前先 clearSyncBaseline()。这条测试锁住它。
+   */
+  it('远端被外部删除后，对账重传不会被哈希判重吞掉', async () => {
+    const p = join(syncRoot, 'gone.txt')
+    writeFileSync(p, 'important-data')
+    const st = statSync(p)
+    const hashes = await hashFile(p)
+
+    // 模拟「上次同步成功」：清单里留着远端那份内容的哈希
+    manifest.upsertFile({
+      localPath: 'gone.txt',
+      localSize: st.size,
+      mtimeMs: st.mtimeMs,
+      remotePath: '/quark-backup/gone.txt',
+      state: 'synced'
+    })
+    manifest.setState('gone.txt', 'synced', {
+      remoteSize: st.size,
+      syncedSize: st.size,
+      syncedMtimeMs: st.mtimeMs,
+      syncedMd5: hashes.md5,
+      syncedSha1: hashes.sha1
+    })
+
+    await planner.handleDiff({
+      kind: 'missing_remote',
+      localPath: 'gone.txt',
+      remotePath: '/quark-backup/gone.txt'
+    })
+    await settle(600)
+
+    // 修复前这里是 0：文件被判成「远端已有」而根本没上传
+    expect(upload).toHaveBeenCalledTimes(1)
+  })
+
+  it('内容不符时同样真正重传，不被判重挡住', async () => {
+    const p = join(syncRoot, 'mismatch.txt')
+    writeFileSync(p, 'version-A')
+    const st = statSync(p)
+    const hashes = await hashFile(p)
+
+    manifest.upsertFile({
+      localPath: 'mismatch.txt',
+      localSize: st.size,
+      mtimeMs: st.mtimeMs,
+      remotePath: '/quark-backup/mismatch.txt',
+      state: 'synced'
+    })
+    manifest.setState('mismatch.txt', 'synced', {
+      remoteSize: st.size,
+      syncedSize: st.size,
+      syncedMtimeMs: st.mtimeMs,
+      syncedMd5: hashes.md5,
+      syncedSha1: hashes.sha1
+    })
+
+    await planner.handleDiff({
+      kind: 'size_mismatch',
+      localPath: 'mismatch.txt',
+      remotePath: '/quark-backup/mismatch.txt'
+    })
+    await settle(600)
+
+    expect(upload).toHaveBeenCalledTimes(1)
   })
 
   it('对账发现仅远端存在时不动作', async () => {

@@ -2,6 +2,7 @@ import * as React from 'react'
 import { useState } from 'react'
 import { Icon } from '../components/Icon'
 import { useAppStore } from '../store'
+import { formatSize, formatSpeed } from '../format'
 import type { ScanProgress } from '@shared/types'
 
 /**
@@ -25,6 +26,7 @@ export function TopBar(): React.JSX.Element {
   const paused = useAppStore((s) => s.stats?.paused ?? false)
   const started = useAppStore((s) => s.stats?.started ?? false)
   const progress = useAppStore((s) => s.progress)
+  const speed = useAppStore((s) => s.stats?.speed ?? null)
   const lastError = useAppStore((s) => s.lastError)
   const clearError = useAppStore((s) => s.clearError)
   const togglePause = useAppStore((s) => s.togglePause)
@@ -185,6 +187,25 @@ export function TopBar(): React.JSX.Element {
           {remoteRoot}
         </span>
         {remoteScan?.running && <span className="pill amber">对账中</span>}
+        {/*
+         * 传输速率。
+         *
+         * 放在顶栏而不是只在概览页：用户看传输进度时多半在「传输队列」，
+         * 而「线路现在跑多快、峰值多少、整体平均多少」是那个页面上
+         * 最需要的信息。顶栏常驻，任何页面都看得到。
+         *
+         * 只在本次运行真的传过数据之后才显示——一直挂着几个 0 B/s
+         * 只会让人以为是坏掉的控件。
+         */}
+        {speed && speed.totalBytes > 0 && (
+          <span className="speed-pill" title={`本次运行已传输 ${formatSize(speed.totalBytes)}`}>
+            <Icon name="gauge" className="ic" />
+            <b className="mono">{formatSpeed(speed.current)}</b>
+            <span className="dim mono">
+              峰值 {formatSpeed(speed.max)} · 平均 {formatSpeed(speed.avg)}
+            </span>
+          </span>
+        )}
         {/*
          * 全局失败提示。
          *

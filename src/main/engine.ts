@@ -7,8 +7,10 @@ import { Transfer } from './transfer/transfer'
 import { Planner } from './planner/planner'
 import { Reconciler } from './reconcile/reconciler'
 import { Watcher, type WatchEvent } from './watcher/watcher'
+import { TaskBatcher } from './task-batcher'
 import { absolutize, relativizeRemote } from './watcher/paths'
 import { hashFile } from './hash/hashes'
+import { ioGovernor, isResourceExhausted } from './io/governor'
 import { loadConfig, normalizeConfig, saveConfig } from './config/store'
 import { exportDiagnostics } from './diagnostics/export'
 import type {
@@ -26,9 +28,49 @@ import type {
   ScanProgress,
   ScanRecord,
   ScanStatus,
+  TaskBatch,
   TransferSpeed,
   TransferTask
 } from '@shared/types'
+
+/**
+ * 任务推送的合并窗口。
+ *
+ * 80ms 约等于 12 帧推一次：进度条与状态切换看起来依旧跟手，
+ * 但六万个文件的推送次数从「六万次」降到「数千次」量级。
+ * 再长（比如 300ms）就会明显感觉按钮和进度条「慢半拍」。
+ */
+const TASK_FLUSH_MS = 80
+
+/**
+ * 扫描进度的节流窗口。
+ *
+ * 进度文字是「已扫描 N 个文件」，用户不需要看到每一跳。
+ * 120ms 跳一次数字，视觉上是连续滚动；而 IPC 次数下降两个数量级。
+ */
+const PROGRESS_THROTTLE_MS = 120
+
+/**
+ * 日志攒批的窗口。
+ *
+ * 日志比任务变化稀疏得多，但仍然可能一秒几千条（扫描时每个文件一条）。
+ * 150ms 推一次，视觉上就是「一秒钟冒出十来批新行」，够实时了。
+ */
+const LOG_FLUSH_MS = 150
+
+/** 攒到这么多条就不等窗口，立刻推 */
+const LOG_BATCH_MAX = 200
+
+/** 速率采样窗口：1 秒内的字节数折算成每秒字节数 */
+const SPEED_WINDOW_MS = 1000
+/** 超过这么久没有新字节，当前速率归零（传输已经停了） */
+const SPEED_IDLE_MS = 1500
+/** 峰值只认可这个长度以上的窗口，避免几毫秒的突发刷出假峰值 */
+const SPEED_MAX_MIN_WINDOW_MS = 250
+/** 平均速率的时长兜底，防止首个文件几毫秒就跑完时算出天文数字 */
+const SPEED_AVG_MIN_MS = 250
+/** 实时速率的分母兜底：窗口太短会算出不可信的瞬时值 */
+const SPEED_MIN_WINDOW_MS = 100
 
 /**
  * 应用引擎：把四个进程内模块装配成一台能跑的机器。
@@ -41,11 +83,19 @@ import type {
  */
 
 export interface EngineEvents {
-  onTransfer?: (task: TransferTask) => void
+  /**
+   * 任务批量变更。
+   *
+   * 注意是**一批**，不是一条。六万个文件逐个推就是六万次 IPC，
+   * 渲染层每条还要遍历整个任务数组做替换——实测单条 31ms，
+   * 累计三十多分钟，界面全程无响应。
+   */
+  onTransferBatch?: (batch: TaskBatch) => void
   onScan?: (scan: ScanRecord) => void
   onDiff?: (diff: DiffEntry) => void
   onConfig?: (config: AppConfig) => void
-  onLog?: (entry: LogEntry) => void
+  /** 日志批量追加（不是逐条——一次扫描会给每个文件写一条） */
+  onLogBatch?: (entries: LogEntry[]) => void
   /** 连接自检结果变化时推送，渲染进程据此刷新顶栏与连接页 */
   onConnection?: (status: ConnectionStatus) => void
   /** 扫描/对账进度变化时推送 */
@@ -116,9 +166,17 @@ export class Engine {
   private speedCurrent = 0
   private speedMax = 0
   private speedTotalBytes = 0
-  private speedStartedAt = Date.now()
-  /** 速率采样的时间窗：太密会抖，太疏会迟钝 */
-  private speedSampledAt = Date.now()
+  /**
+   * 第一个字节到达的时刻（0 = 本次运行还没传过任何数据）。
+   *
+   * 不能用引擎构造时刻做平均速率的起点：程序可能开着挂机两小时
+   * 才开始同步，那样算出来的「平均」会被两小时的空闲摊薄成 0。
+   */
+  private speedStartedAt = 0
+  /** 最近一次收到字节的时刻（用于判断是否已空闲） */
+  private speedLastAt = 0
+  /** 当前采样窗口的起点 */
+  private speedWindowAt = 0
   private speedWindowBytes = 0
   /**
    * 当前扫描/对账进度。
@@ -129,6 +187,31 @@ export class Engine {
    */
   private localProgress: ScanProgress | null = null
   private remoteProgress: ScanProgress | null = null
+  /**
+   * 任务推送攒批器。
+   *
+   * 所有任务变化先落这里（同 id 覆盖，天然取最新），
+   * 攒够一个短窗口再整批推出去。六万个文件时，
+   * 逐条推会让渲染层做六万次全表遍历，界面完全失去响应。
+   */
+  private readonly taskBatcher: TaskBatcher
+  /**
+   * 扫描进度的节流计时器，按通道各一个。
+   *
+   * 进度是**每个文件**报一次（`已扫描 N 个文件`）。
+   * 不节流的话六万个文件就是六万次 IPC，而且渲染层每次收到都要
+   * 刷一次统计（又一次往返），比任务推送还贵。
+   */
+  private readonly progressTimers = new Map<ScanKind, NodeJS.Timeout>()
+  private readonly pendingProgress = new Map<ScanKind, ScanProgress>()
+  /**
+   * 日志攒批。
+   *
+   * 与任务推送同理：扫描时每个文件都会写一条日志，逐条推 IPC
+   * 就是几万次跨进程调用 + 几万次渲染层数组重建。
+   */
+  private readonly pendingLogs: LogEntry[] = []
+  private logFlushTimer: NodeJS.Timeout | null = null
   /**
    * 是否已经开始同步。
    *
@@ -148,13 +231,32 @@ export class Engine {
 
   constructor(private readonly events: EngineEvents = {}) {
     this.config = loadConfig()
+    this.applyIoLimit()
     this.manifest = new Manifest(join(app.getPath('userData'), 'manifest.db'))
+    this.taskBatcher = new TaskBatcher(
+      (batch) => this.events.onTransferBatch?.(batch),
+      TASK_FLUSH_MS
+    )
     const { openlist } = this.config
     this.client = new OpenListClient({
       baseUrl: openlist.baseUrl,
       username: openlist.username,
       password: openlist.password
     })
+  }
+
+  /**
+   * 把文件句柄额度跟并发配置对齐。
+   *
+   * 公式 = 哈希并发 + 上传并发 + 2 的余量（事件处理与下载用）。
+   * 上限 16：再多也不会更快——瓶颈在磁盘/网络的延迟，
+   * 不在同时开了几个读流；但开多了会直接把驱动器句柄打光
+   * （实测 5.8 万文件时整块盘 EMFILE，连 fs.watch 都建不起来）。
+   */
+  private applyIoLimit(): void {
+    const cfg = this.config
+    const want = Math.max(6, Math.min(16, cfg.hashConcurrency + cfg.uploadConcurrency + 2))
+    ioGovernor.setLimit(want)
   }
 
   // ── 生命周期 ──────────────────────────────────────────
@@ -174,6 +276,18 @@ export class Engine {
 
     // 回读上次的扫描结果：重启后概览页不该显示「已扫描 0 个文件」
     this.restoreScanHistory()
+
+    /*
+     * 裁剪历史日志。
+     *
+     * 每次扫描每个文件写一条，六万个文件就是六万行。不裁剪的话
+     * 日志表会一直涨，最终拖慢查询、撑大数据库文件。
+     * 放在启动时做（而不是每次扫描后）：一次性收尾，不干扰同步过程。
+     */
+    const pruned = this.manifest.pruneLogs()
+    if (pruned > 0) {
+      this.pushLog('info', `已清理 ${pruned} 条历史日志（仅保留最近 10 万条）`)
+    }
 
     /*
      * 每一段各自兜住异常。
@@ -202,6 +316,9 @@ export class Engine {
     if (this.started && !this.paused) return
     this.started = true
     this.paused = false
+
+    // 速率统计的口径是「本次运行」：重新开始时把上一轮的清零
+    this.resetSpeedStats()
 
     // 本地监控不依赖 OpenList 连接，先起来
     this.startWatcher()
@@ -287,6 +404,14 @@ export class Engine {
   }
 
   stop(): void {
+    // 先把缓冲区里的任务推完再收摊：退出前那批状态是用户
+    // 下次打开时最想看到的（哪些传完了、哪些还挂着）
+    this.taskBatcher.flushNow()
+    this.taskBatcher.dispose()
+    // 日志同理：退出前最后几行往往是「为什么没传」的关键线索
+    this.flushLogs()
+    for (const kind of [...this.progressTimers.keys()]) this.clearProgressTimer(kind)
+
     this.watcher?.stop()
     this.watcher = null
     this.reconciler?.stop()
@@ -418,7 +543,7 @@ export class Engine {
         this.recordSpeed(info.delta)
         const task = this.planner?.getTaskByPath(info.relPath)
         if (!task) return
-        this.events.onTransfer?.({
+        this.queueTask({
           ...task,
           state: 'uploading',
           chunksDone: info.chunksDone,
@@ -434,7 +559,9 @@ export class Engine {
       transfer,
       client: this.client,
       getConfig: () => this.config,
-      onTask: (t) => this.events.onTransfer?.(t),
+      onTask: (t) => this.queueTask(t),
+      /** 任务表因容量上限淘汰了旧记录 → 渲染层要同步删掉 */
+      onTasksEvicted: (ids) => this.queueTaskRemoval(ids),
       onLog: (level, message) => this.pushLog(level, message),
       /*
        * 带类别的日志：上传/下载/跳过这三类都涉及具体文件，
@@ -490,6 +617,25 @@ export class Engine {
       this.pushLog('error', `本地同步目录不可用：${this.watcherError}`, { category: 'system' })
       return
     }
+
+    /*
+     * 直接同步整块盘时要提醒一句。
+     *
+     * 这不是限制用户，而是把代价说清楚：监听整块盘意味着
+     * 每个目录都要占一个 watch 句柄，几千个目录之后句柄会紧张；
+     * 网络映射盘尤其脆——实测整块盘同步时连 `fs.watch` 都会报
+     * `EMFILE: too many open files, watch ...`。
+     * 挑一个具体目录（哪怕是个大目录）比整块盘稳得多。
+     */
+    if (/^[A-Za-z]:[\\/]?$/.test(root)) {
+      this.pushLog(
+        'warn',
+        `同步根是整块盘的根目录（${root.toUpperCase()}）。` +
+          '整盘监控会占用大量文件句柄，网络盘/挂载盘上容易失败；' +
+          '建议改成具体的子目录（例如 Z:\\download）。',
+        { category: 'system' }
+      )
+    }
     this.watcher?.stop()
     this.watcher = null
 
@@ -499,20 +645,27 @@ export class Engine {
         exclude: this.config.exclude,
         onEvent: (e: WatchEvent) => {
           /*
-           * 必须挂 catch。
+           * 返回 promise，而不是 void。
            *
-           * handleEvent 内部有多处可能抛：重命名窗口里把文件改完就删
-           * → hashFile 读文件时 ENOENT；清单写入失败 → DB 错误。
+           * 初始扫描要拿它做背压：一次只推进若干条事件，上层消化完了
+           * 再继续。以前这里 `void` 掉，五万个事件瞬间全推上来，
+           * 每个事件又各开一个 stat —— 句柄当场打光（EMFILE）。
            *
-           * 异常从 async 函数里逃出变成未处理的 Promise 拒绝，
-           * Node 的默认行为是**终止进程**——用户的应用就这么崩了，
-           * 而且界面上什么都看不到。
+           * 同时必须挂 catch：handleEvent 内部有多处可能抛（重命名窗口里
+           * 文件被删 → hashFile 报 ENOENT；清单写入失败 → DB 错误）。
+           * 异常从 async 函数逃出会变成未处理的 Promise 拒绝，
+           * Node 的默认行为是**终止主进程**。
            */
-          void this.planner
-            ?.handleEvent(e.relPath, e.type === 'upsert', e.isDir === true)
+          const planner = this.planner
+          if (!planner) return Promise.resolve()
+          return planner
+            .handleEvent(e.relPath, e.type === 'upsert', e.isDir === true)
             .catch((err: unknown) => {
               const message = err instanceof Error ? err.message : String(err)
-              this.pushLog('error', `处理本地变更失败 ${e.relPath}：${message}`)
+              // 句柄耗尽会成批出现，逐条写日志只是把噪声放大几百倍
+              if (!isResourceExhausted(err)) {
+                this.pushLog('error', `处理本地变更失败 ${e.relPath}：${message}`)
+              }
             })
         },
         onReady: (count) => {
@@ -706,6 +859,8 @@ export class Engine {
     this.config = normalizeConfig(next)
     saveConfig(this.config)
     this.events.onConfig?.(this.config)
+    // 并发度可能被改过，句柄额度要跟着走
+    this.applyIoLimit()
 
     /*
      * 远端根变了 → 清单里已存的 remote_path 要跟着改前缀。
@@ -1317,9 +1472,24 @@ export class Engine {
     const tasks = this.planner?.getTasks() ?? []
     const diffs = this.manifest.listUnresolvedDiffs()
 
-    const active = tasks.filter((t) => t.state === 'uploading' || t.state === 'hashing').length
-    const queued = tasks.filter((t) => t.state === 'queued').length
-    const failed = tasks.filter((t) => t.state === 'failed').length
+    /*
+     * 一次遍历算完三个计数。
+     *
+     * 以前是三次 `filter(...).length`——任务表满时（三千条）
+     * 每次 getStats 就要多扫两遍。而 getStats 会被界面
+     * 高频调用（每次任务变更多少都会刷一次统计），
+     * 三遍和一遍的差别在高频下会被放大。
+     */
+    let active = 0
+    let queued = 0
+    let failed = 0
+    for (const t of tasks) {
+      if (t.state === 'failed') failed++
+      else if (t.state === 'queued') queued++
+      else if (t.state === 'uploading' || t.state === 'hashing' || t.state === 'downloading') {
+        active++
+      }
+    }
 
     return {
       synced: counts['synced'] ?? 0,
@@ -1352,6 +1522,7 @@ export class Engine {
           : null
       },
       speed: this.getSpeedStats(),
+      tasksTruncated: this.planner?.truncated ?? false,
       progress: {
         local: this.localProgress,
         remote: this.remoteProgress
@@ -1372,7 +1543,7 @@ export class Engine {
     }
   }
 
-  listFiles(opts: { limit?: number } = {}): FileEntry[] {
+  listFiles(opts: { limit?: number; offset?: number } = {}): FileEntry[] {
     return this.manifest.listFiles(opts)
   }
 
@@ -1502,7 +1673,37 @@ export class Engine {
       remotePath: meta?.remotePath ?? null
     }
     this.manifest.log(level, message, meta?.fileId ?? null, meta?.remotePath ?? null, meta)
-    this.events.onLog?.(entry)
+
+    /*
+     * 攒批推送，不逐条推。
+     *
+     * 扫描六万个文件就给每个文件写一条日志（上传/跳过都有），
+     * 逐条推就是六万次 IPC，渲染层每次还要重建日志数组。
+     * 攒批后推送次数与「批」成正比。
+     *
+     * 攒到一定条数立刻推，避免一次扫描的日志全攒到结束才出现——
+     * 用户盯着日志页时应该能持续看到新行。
+     */
+    this.pendingLogs.push(entry)
+    if (this.pendingLogs.length >= LOG_BATCH_MAX) {
+      this.flushLogs()
+      return
+    }
+    if (this.logFlushTimer) return
+    const timer = setTimeout(() => this.flushLogs(), LOG_FLUSH_MS)
+    timer.unref?.()
+    this.logFlushTimer = timer
+  }
+
+  /** 把攒下的日志整批推给渲染进程 */
+  private flushLogs(): void {
+    if (this.logFlushTimer) {
+      clearTimeout(this.logFlushTimer)
+      this.logFlushTimer = null
+    }
+    if (this.pendingLogs.length === 0) return
+    const batch = this.pendingLogs.splice(0)
+    this.events.onLogBatch?.(batch)
   }
 
   /**
@@ -1515,7 +1716,55 @@ export class Engine {
     // 按通道分流：两条通道各存各的，互不覆盖
     if (progress.kind === 'local') this.localProgress = progress
     else this.remoteProgress = progress
-    this.events.onProgress?.(progress)
+
+    /*
+     * 终态**立刻推**，不等节流窗口。
+     *
+     * 终态决定界面上的按钮能不能恢复可点。晚 120ms 推出去，
+     * 用户就会看到「扫描中…」多挂一会儿；更糟的是如果紧接着
+     * 又起了下一轮扫描，节流器会把终态和新的运行态合并，
+     * 终态直接丢失——进度条永远收不掉。
+     */
+    if (!progress.running) {
+      this.clearProgressTimer(progress.kind)
+      this.events.onProgress?.(progress)
+      return
+    }
+
+    this.pendingProgress.set(progress.kind, progress)
+    if (this.progressTimers.has(progress.kind)) return
+    const timer = setTimeout(() => {
+      this.progressTimers.delete(progress.kind)
+      const pending = this.pendingProgress.get(progress.kind)
+      this.pendingProgress.delete(progress.kind)
+      if (pending) this.events.onProgress?.(pending)
+    }, PROGRESS_THROTTLE_MS)
+    // 定时器不该拖住进程退出
+    timer.unref?.()
+    this.progressTimers.set(progress.kind, timer)
+  }
+
+  private clearProgressTimer(kind: ScanKind): void {
+    const timer = this.progressTimers.get(kind)
+    if (timer) {
+      clearTimeout(timer)
+      this.progressTimers.delete(kind)
+    }
+    this.pendingProgress.delete(kind)
+  }
+
+  /**
+   * 收下一个任务变化，攒批推送。
+   *
+   * 同一 id 在缓冲里天然合并——一个文件从 pending 走到 skipped，
+   * 界面只需要看到最后那个状态，中间态推出去也是白推。
+   */
+  private queueTask(task: TransferTask): void {
+    this.taskBatcher.push(task)
+  }
+
+  private queueTaskRemoval(ids: string[]): void {
+    this.taskBatcher.remove(ids)
   }
 
   /** 某条通道当前是否正在跑 */
@@ -1563,31 +1812,96 @@ export class Engine {
   private recordSpeed(bytes: number): void {
     if (bytes <= 0) return
     const now = Date.now()
+
+    if (this.speedStartedAt === 0) {
+      this.speedStartedAt = now
+      this.speedWindowAt = now
+    }
+    this.speedLastAt = now
     this.speedTotalBytes += bytes
     this.speedWindowBytes += bytes
 
-    const windowMs = now - this.speedSampledAt
-    if (windowMs < 1000) {
-      // 窗口未满：保留当前速率的衰减估计，让数字不至于完全不动
-      return
+    /*
+     * 窗口攒够 1 秒就结算一次瞬时速率。
+     *
+     * 注意这里**只是采样**：`speedCurrent` 的实时值在 `getSpeedStats()`
+     * 里用「还没结算的窗口」估算。只靠结算点更新的话，
+     * 一个几百 KB 的文件几秒钟就传完，窗口永远等不到关闭的时刻，
+     * 界面上的当前速率与峰值会一直是 0——用户看到的就是「速率没生效」。
+     */
+    const windowMs = now - this.speedWindowAt
+    if (windowMs >= SPEED_WINDOW_MS) {
+      const instant = (this.speedWindowBytes * 1000) / windowMs
+      this.speedCurrent = instant
+      if (instant > this.speedMax) this.speedMax = instant
+      this.speedWindowBytes = 0
+      this.speedWindowAt = now
     }
-    const instant = (this.speedWindowBytes * 1000) / windowMs
-    this.speedCurrent = instant
-    if (instant > this.speedMax) this.speedMax = instant
-    this.speedWindowBytes = 0
-    this.speedSampledAt = now
   }
 
-  /** 当前速率统计快照 */
+  /**
+   * 速率快照。
+   *
+   * 三个数的口径：
+   * - `current`：未结算窗口的即时估算，空闲超过 1.5 秒归零
+   * - `max`：最长的那个 1 秒窗口的峰值（不足 250ms 的窗口不计，
+   *   否则一个小文件从页缓存里瞬间读完就能刷出几百 MB/s 的假峰值）
+   * - `avg`：累计字节 ÷ **有流量的那段时长**，不含空闲
+   */
   private getSpeedStats(): TransferSpeed {
-    const elapsedMs = Math.max(1, Date.now() - this.speedStartedAt)
-    return {
-      current: Math.round(this.speedCurrent),
-      max: Math.round(this.speedMax),
-      avg: Math.round((this.speedTotalBytes * 1000) / elapsedMs),
-      totalBytes: this.speedTotalBytes,
-      elapsedMs
+    const now = Date.now()
+    const active = this.speedStartedAt > 0 && this.speedLastAt > 0
+    const activeMs = active ? Math.max(1, this.speedLastAt - this.speedStartedAt) : 0
+    const idleMs = active ? now - this.speedLastAt : Number.POSITIVE_INFINITY
+
+    const rawWindowMs = this.speedWindowAt > 0 ? Math.max(1, now - this.speedWindowAt) : 0
+    /*
+     * 分母兜底 100ms。
+     *
+     * 单次 PUT 只会在传完之后报一次进度，那时窗口可能才开了几十毫秒。
+     * 一个 10 KB 的文件除以 3ms 会算出 3 MB/s——数字本身没错，
+     * 但那是「从页缓存读出来」的速度，不是线路速度。
+     * 兜底后这类极短窗口给出的是保守估计，不会跳出一个不可信的数。
+     */
+    const windowMs = rawWindowMs > 0 ? Math.max(SPEED_MIN_WINDOW_MS, rawWindowMs) : 0
+    const live =
+      this.speedWindowBytes > 0 && windowMs > 0 ? (this.speedWindowBytes * 1000) / windowMs : 0
+
+    let current = 0
+    if (idleMs <= SPEED_IDLE_MS) {
+      // 取结算值与实时估算里较大的那个：结算值不会被窗口重置瞬间打回 0
+      current = Math.max(this.speedCurrent, live)
     }
+
+    let max = this.speedMax
+    if (this.speedWindowBytes > 0 && rawWindowMs >= SPEED_MAX_MIN_WINDOW_MS) {
+      max = Math.max(max, live)
+    }
+
+    return {
+      current: Math.round(current),
+      max: Math.round(max),
+      // 分母兜底 250ms：首个文件只有几毫秒时，除法会算出天文数字
+      avg: active ? Math.round((this.speedTotalBytes * 1000) / Math.max(SPEED_AVG_MIN_MS, activeMs)) : 0,
+      totalBytes: this.speedTotalBytes,
+      elapsedMs: activeMs
+    }
+  }
+
+  /**
+   * 清零速率统计。
+   *
+   * 口径是「本次同步运行」：用户重新点「开始同步」时，
+   * 上一次运行的平均速率不该还在里面。
+   */
+  private resetSpeedStats(): void {
+    this.speedCurrent = 0
+    this.speedMax = 0
+    this.speedTotalBytes = 0
+    this.speedStartedAt = 0
+    this.speedLastAt = 0
+    this.speedWindowAt = 0
+    this.speedWindowBytes = 0
   }
 }
 

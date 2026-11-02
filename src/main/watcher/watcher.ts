@@ -42,7 +42,7 @@ export interface WatcherOptions {
   exclude: string[]
   /** 同一路径的事件合并窗口（毫秒），默认 500 */
   debounceMs?: number
-  onEvent: (event: WatchEvent) => void
+  onEvent: (event: WatchEvent) => void | Promise<void>
   /** 首次全量扫描完成 */
   onReady?: (count: number) => void
   onError?: (err: Error) => void
@@ -66,6 +66,8 @@ export class Watcher {
   private readonly discovered = new Set<string>()
   /** watcher 已停止；挡住 close() 完成前残余的事件 */
   private stopped = false
+  /** 进行中的扫描（同一时刻只允许一轮） */
+  private scanPromise: Promise<number> | null = null
   private lastReadyAt: number | null = null
 
   constructor(private readonly opts: WatcherOptions) {}
@@ -87,8 +89,21 @@ export class Watcher {
       // 自行判定忽略项：chokidar 的 glob 匹配对 Windows 路径分隔符不友好
       ignored: (p: string) => this.shouldIgnore(p),
       persistent: true,
-      // 首次全量扫描交给 Planner 与清单比对，不靠事件本身
-      ignoreInitial: false,
+      /*
+       * 初始全量扫描**不交给 chokidar**，交给下面的 rescan()。
+       *
+       * 这是这一版最重要的一处改动。chokidar 在 `ignoreInitial: false` 时
+       * 会为每个既有文件各起一个 awaitWriteFinish 轮询（每 100ms 一次 stat，
+       * 直到文件连续 2 秒不再变化）。真实用户把整块盘（5.8 万个文件）
+       * 设为同步根，于是同一时刻有 5.8 万个轮询在跑——每秒几十万次 stat，
+       * 直接把驱动器的句柄吃光，连 `fs.watch` 都建不起来：
+       * `EMFILE: too many open files, watch 'Z:\...\IMG_8278.JPG'`。
+       *
+       * 既有文件不需要「等写完」——它们早就写完了。真正的写入检测
+       * 只对增量事件有意义，所以 ignoreInitial 之后 awaitWriteFinish
+       * 只作用于 live 事件，既保住正确性，也把初始开销降为一次目录遍历。
+       */
+      ignoreInitial: true,
       // 编辑器「删除+重建」合并为单次 change
       atomic: true,
       // 写完成判定：文件停止变化 2 秒才算写完
@@ -114,11 +129,28 @@ export class Watcher {
       .on('ready', () => {
         this.initialDone = true
         this.lastReadyAt = Date.now()
-        // ready 这一刻防抖窗口还没走完，用「已发现数」而不是「已处理数」
-        const found = this.discovered.size
-        this.opts.onReady?.(found)
-        this.opts.onLog?.('info', `本地扫描就绪，发现 ${found} 个文件`)
+        /*
+         * 初始扫描自己走一遍目录树（见上方 ignoreInitial 的说明）。
+         *
+         * 不 await：ready 的回调一旦被长时间占住，chokidar 内部队列会跟着堵，
+         * 增量事件全都不派发了。这里只负责发起，进度与就绪由 rescan 自己报。
+         */
+        void this.initialScan().catch((err: unknown) => {
+          const e = err instanceof Error ? err : new Error(String(err))
+          this.opts.onError?.(e)
+        })
       })
+  }
+
+  /**
+   * 首次全量扫描：走一遍目录树，把每个文件作为 upsert 事件喂给上层。
+   *
+   * 与 rescan() 完全同一条路径——区别只是触发时机（chokidar ready）。
+   * 两者共用一份实现，避免「初始扫描」和「手动重扫」行为漂移。
+   */
+  private async initialScan(): Promise<void> {
+    if (this.stopped) return
+    await this.rescan()
   }
 
   stop(): void {
@@ -169,14 +201,62 @@ export class Watcher {
    *   但有反馈比没反馈好，界面不会看着像卡死。
    */
   async rescan(onProgress?: (done: number) => void): Promise<number> {
+    /*
+     * 同一时刻只允许一轮扫描。
+     *
+     * 启动后 chokidar ready 会自动跑一轮；用户紧接着点「扫描本地」
+     * 会再发起一轮——两轮并行只是把同样的事件发两遍，
+     * 白白多读两遍盘、多耗一倍句柄。这里直接复用进行中的那一轮。
+     */
+    if (this.scanPromise) return this.scanPromise
+    this.scanPromise = this.doRescan(onProgress).finally(() => {
+      this.scanPromise = null
+    })
+    return this.scanPromise
+  }
+
+  private async doRescan(onProgress?: (done: number) => void): Promise<number> {
     const root = this.opts.root
-    if (!root) return 0
+    // -1 表示「没扫描」而不是「扫到 0 个文件」，两者在界面上是两件事
+    if (!root) return -1
 
     const found = new Set<string>()
     let fileCount = 0
 
+    /*
+     * 事件窗口。
+     *
+     * 上层处理一个文件要 stat、查清单、可能写库——都是异步的。
+     * 以前这里**发完就走**，不 await：一次重扫立刻把 5.8 万个事件
+     * 同时推进 Planner，于是同一时刻有 5.8 万个 stat 在飞，
+     * 句柄当场被吃光（EMFILE），主进程的事件循环也被微任务淹没，
+     * 界面上表现就是「点暂停没反应」。
+     *
+     * 改成滑动窗口后，上层没消化完就不再往下堆：
+     * 并发被钉在 RESCAN_WINDOW，事件循环始终有喘息机会。
+     */
+    const RESCAN_WINDOW = 32
+    const inflight: Array<Promise<void>> = []
+
+    const emit = async (event: WatchEvent): Promise<void> => {
+      const ret = this.opts.onEvent(event)
+      if (ret && typeof ret.then === 'function') {
+        inflight.push(
+          ret.catch((err: unknown) => {
+            const e = err instanceof Error ? err : new Error(String(err))
+            this.opts.onError?.(e)
+          })
+        )
+      }
+      if (inflight.length >= RESCAN_WINDOW) {
+        const oldest = inflight.shift()
+        if (oldest) await oldest
+      }
+    }
+
     const walk = async (dir: string, depth: number): Promise<void> => {
-      if (depth > MAX_DEPTH) return
+      // 暂停/停止后立刻收摊，别把剩下的几万个文件继续灌上去
+      if (this.stopped || depth > MAX_DEPTH) return
       let entries: import('fs').Dirent[]
       try {
         entries = await readdir(toLongPath(dir), { withFileTypes: true })
@@ -186,6 +266,7 @@ export class Watcher {
       }
 
       for (const entry of entries) {
+        if (this.stopped) return
         const abs = join(dir, entry.name)
         const rel = relativize(root, abs)
         if (rel === null || rel === '') continue
@@ -203,7 +284,7 @@ export class Watcher {
         fileCount++
         this.discovered.add(abs.toLowerCase())
         onProgress?.(fileCount)
-        this.opts.onEvent({
+        await emit({
           type: 'upsert',
           relPath: rel,
           absPath: abs,
@@ -214,10 +295,14 @@ export class Watcher {
     }
 
     await walk(root, 0)
+    // 把窗口里剩下的收干净，否则上层还在处理时我们就报了「就绪」
+    await Promise.all(inflight)
+
+    if (this.stopped) return fileCount
 
     this.lastReadyAt = Date.now()
     this.opts.onReady?.(fileCount)
-    this.opts.onLog?.('info', `本地重扫完成，共 ${fileCount} 个文件`)
+    this.opts.onLog?.('info', `本地扫描完成，共 ${fileCount} 个文件`)
     return fileCount
   }
 

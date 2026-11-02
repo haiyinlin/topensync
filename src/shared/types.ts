@@ -164,8 +164,14 @@ export type TransferCategory =
  * - remote_duplicate：远端已有同样内容（按哈希判定），无需再传一遍
  * - remote_size_match：远端已有同名同大小的文件（未校验内容），
  *   按「文件名 + 大小」两个条件弱认定，不再上行
+ * - file_gone：轮到它上传时本地文件已经不在了（扫描后被删/被移走）。
+ *   不算失败——文件本来就不该传，但要让用户看见「这个文件我跳过了、为什么」
  */
-export type SkipReason = 'local_duplicate' | 'remote_duplicate' | 'remote_size_match'
+export type SkipReason =
+  | 'local_duplicate'
+  | 'remote_duplicate'
+  | 'remote_size_match'
+  | 'file_gone'
 
 export type TransferMode = 'single' // 单次 PUT /api/fs/put
 export type TransferState =
@@ -203,6 +209,31 @@ export interface TransferTask {
   sha1Prefix: string
   errorMsg: string | null
   attempts: number
+}
+
+/**
+ * 一批任务的变更。
+ *
+ * 为什么不逐条推送：一次本地扫描会把**每个**文件都变成一条任务
+ * （六万个文件 = 六万条），逐条推就是六万次 IPC。
+ * 而渲染层每收到一条都要遍历整个任务数组去替换同 id 项——
+ * 六万条 × 六万次遍历 = 三十多亿次操作，界面直接失去响应。
+ *
+ * 改成「攒一小段时间、一次推一批」：
+ * 同一 id 的多条更新在缓冲区里天然合并成最新的一条，
+ * 推送次数从「文件数」降到「批数」，通常小两个数量级。
+ */
+export interface TaskBatch {
+  /** 新增或状态有变化的任务；同 id 只保留最新一条 */
+  upserts: TransferTask[]
+  /**
+   * 被淘汰的任务 id。
+   *
+   * 任务表有容量上限（见 Planner.MAX_TASKS）。淘汰发生在主进程，
+   * 但渲染层那份数组不会自动缩小——不显式告诉它，两边的表格
+   * 会越差越远，用户看到一堆主进程已经不认的任务。
+   */
+  removed: string[]
 }
 
 // ── 传输速率────────────────────────────────────────
@@ -419,13 +450,29 @@ export interface ScanProgressPair {
 }
 
 export interface MainToRendererEvents {
-  'transfer:update': (task: TransferTask) => void
+  /**
+   * 任务批量变更。
+   *
+   * 以前是 `'transfer:update': (task) => void` 逐条推。
+   * 六万个文件时每条都要一次 IPC + 渲染层一次全量遍历，
+   * 界面会卡到没法用。改成批量后，推送次数与「批」成正比，
+   * 与文件数无关。
+   */
+  'transfer:batch': (batch: TaskBatch) => void
   'scan:update': (scan: ScanRecord) => void
   /** 扫描/对账进度；扫描过程中持续推送 */
   'scan:progress': (progress: ScanProgress) => void
   'diff:update': (diff: DiffEntry) => void
   'config:update': (config: AppConfig) => void
-  'log:append': (entry: LogEntry) => void
+  /**
+   * 日志批量追加。
+   *
+   * 以前是逐条 `'log:append': (entry) => void`。一次扫描会给
+   * **每个**文件写一条日志（上传/跳过都有），六万个文件就是六万次
+   * IPC，渲染层每收到一条还要重建一次日志数组（截断到 500 条）——
+   * 六万次 × 500 元素拷贝，光这一项就是几千万次操作。
+   */
+  'log:batch': (entries: LogEntry[]) => void
   /**
    * 连接自检结果变化。
    *
@@ -499,6 +546,17 @@ export interface AppStats {
   }
   /** 传输速率统计（上传 + 下载合计） */
   speed: TransferSpeed
+  /**
+   * 任务表是否因为超出容量上限而丢掉了旧记录。
+   *
+   * 六万个文件全被跳过时，任务表里堆六万条「本地未变」毫无意义——
+   * 既占内存，也让所有遍历操作变慢。所以任务表有上限，
+   * 超出后按「跳过 → 完成」的优先级淘汰最旧的。
+   *
+   * 但**必须让用户知道**：表格里看不到某条记录，
+   * 可能是它被淘汰了，而不是它没发生过。
+   */
+  tasksTruncated: boolean
   /**
    * 当前正在跑的扫描进度（本地扫描与远端对账各自独立）。
    *
@@ -616,6 +674,20 @@ export interface DiagnosticBundle {
   connection: ConnectionStatus
   /** 统计概览 */
   stats: AppStats
+  /**
+   * 文件句柄闸门的瞬时状态。
+   *
+   * 排查 `EMFILE: too many open files` 靠它：能看出当时同时开了几个句柄、
+   * 上限是多少、有没有进冷却、累计撞上多少次。
+   */
+  io: {
+    active: number
+    peak: number
+    limit: number
+    waiting: number
+    coolingDown: boolean
+    exhausted: number
+  }
   /** 各状态的文件计数 */
   fileStates: Record<string, number>
   /** 最近的传输任务 */

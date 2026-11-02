@@ -3,6 +3,7 @@ import { Icon } from '../components/Icon'
 import type { PageKey } from '../App'
 import type { TransferTask } from '@shared/types'
 import { useAppStore } from '../store'
+import { formatSpeed } from '../format'
 
 /**
  * 概览页。
@@ -270,20 +271,3 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
   )
 }
 
-/**
- * 把字节/秒格式化成人类看得懂的速率。
- *
- * 单位用 B/s、KB/s、MB/s、GB/s——不是 bit。
- * 用户看的是「每秒传了多少」，位速率会让人对不上文件大小。
- */
-export function formatSpeed(bytesPerSecond: number): string {
-  if (!bytesPerSecond || bytesPerSecond <= 0) return '0 B/s'
-  const units = ['B/s', 'KB/s', 'MB/s', 'GB/s']
-  let v = bytesPerSecond
-  let i = 0
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024
-    i++
-  }
-  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
-}

@@ -3,9 +3,9 @@ import { useMemo, useState } from 'react'
 import { Icon } from '../components/Icon'
 import { BatchBar } from '../components/BatchBar'
 import { VirtualTable } from '../components/VirtualTable'
-import type { TransferCategory, TransferTask } from '@shared/types'
+import type { SkipReason, TransferCategory, TransferTask } from '@shared/types'
 import { useAppStore } from '../store'
-import { formatSpeed } from './Overview'
+import { formatSize, formatSpeed } from '../format'
 
 /**
  * 传输队列：进行中 / 等待 / 失败任务，分片进度与逐项重试。
@@ -43,27 +43,47 @@ function isSkipped(task: TransferTask): boolean {
 
 export function Queue(): React.JSX.Element {
   const tasks = useAppStore((s) => s.tasks)
+  const truncated = useAppStore((s) => s.stats?.tasksTruncated ?? false)
   const removeTasks = useAppStore((s) => s.removeTasks)
   const [filter, setFilter] = useState<StateFilter>('all')
   const [category, setCategory] = useState<CategoryFilter>('all')
   const [selected, setSelected] = useState<Set<string>>(new Set())
 
-  const stateCounts = {
-    all: tasks.length,
-    uploading: tasks.filter((t) => isActiveState(t.state)).length,
-    queued: tasks.filter((t) => t.state === 'queued').length,
-    done: tasks.filter((t) => t.state === 'done').length,
-    failed: tasks.filter((t) => t.state === 'failed').length,
-    canceled: tasks.filter((t) => t.state === 'canceled').length,
-    skipped: tasks.filter((t) => t.state === 'skipped').length
-  }
+  /*
+   * 计数一次遍历算完。
+   *
+   * 以前是 11 次 `tasks.filter(...).length`（状态 7 次 + 类别 4 次）。
+   * 六万条任务时，**每次渲染**都要扫 66 万次——实测 25ms，
+   * 而这个页面每收到一批任务推送就会重渲染一次，
+   * 于是「滚动时一顿一顿」「点筛选要等一下」全是它。
+   *
+   * 遍历一次的代价与筛选条件无关，只跟任务数有关。
+   */
+  const { stateCounts, categoryCounts } = useMemo(() => {
+    const sc = {
+      all: tasks.length,
+      uploading: 0,
+      queued: 0,
+      done: 0,
+      failed: 0,
+      canceled: 0,
+      skipped: 0
+    }
+    const cc = { all: tasks.length, upload: 0, download: 0, skip: 0 }
+    for (const t of tasks) {
+      if (isActiveState(t.state)) sc.uploading++
+      else if (t.state === 'queued') sc.queued++
+      else if (t.state === 'done') sc.done++
+      else if (t.state === 'failed') sc.failed++
+      else if (t.state === 'canceled') sc.canceled++
+      else if (t.state === 'skipped') sc.skipped++
 
-  const categoryCounts = {
-    all: tasks.length,
-    upload: tasks.filter((t) => t.category === 'upload').length,
-    download: tasks.filter((t) => t.category === 'download').length,
-    skip: tasks.filter((t) => t.category === 'skip').length
-  }
+      if (t.category === 'upload') cc.upload++
+      else if (t.category === 'download') cc.download++
+      else if (t.category === 'skip') cc.skip++
+    }
+    return { stateCounts: sc, categoryCounts: cc }
+  }, [tasks])
 
   /*
    * 筛选结果先记忆化，再基于它派生 ID 列表：
@@ -161,9 +181,14 @@ export function Queue(): React.JSX.Element {
                 <i style={{ width: `${Math.round(t.progress * 100)}%` }} />
               </div>
               <span className="tiny mono">
-                {t.mode === 'multipart'
-                  ? `分片 ${t.chunksDone}/${t.chunksTotal}`
-                  : `${Math.round(t.progress * 100)}%`}
+                {/*
+                 * 只给百分比，不显示「分片 3/10」。
+                 *
+                 * 分片数是实现细节：用户关心的是「还要多久」，
+                 * 而 3/10 和 30% 说的是同一件事，多一个数字只是噪声。
+                 * 真正有用的附加信息是速度，所以留在后面。
+                 */}
+                {Math.round(t.progress * 100)}%
                 {t.speed > 0 && <span className="dim"> · {formatSpeed(t.speed)}</span>}
               </span>
             </>
@@ -222,7 +247,15 @@ export function Queue(): React.JSX.Element {
       <div className="page-head">
         <div>
           <h1>传输队列</h1>
-          <p className="sub">上传、下载与跳过记录，逐项重试。</p>
+          <p className="sub">
+            上传、下载与跳过记录，逐项重试。
+            {/*
+             * 任务表有容量上限（三千条）。丢掉记录必须说出来——
+             * 否则用户会以为「刚才明明跳过了一堆，怎么找不到了」，
+             * 转而怀疑程序漏记了文件。完整的明细在日志页。
+             */}
+            {truncated && ' 记录过多，较早的已完成/已跳过条目已自动清理，完整明细见运行日志。'}
+          </p>
         </div>
       </div>
 
@@ -352,10 +385,11 @@ const CATEGORY_LABELS: Record<CategoryFilter, string> = {
   skip: '跳过'
 }
 
-const SKIP_LABELS: Record<'local_duplicate' | 'remote_duplicate' | 'remote_size_match', string> = {
+const SKIP_LABELS: Record<SkipReason, string> = {
   local_duplicate: '本地未变',
   remote_duplicate: '远端已有',
-  remote_size_match: '远端同名同大小'
+  remote_size_match: '远端同名同大小',
+  file_gone: '本地文件已不存在'
 }
 
 const STATE_LABELS: Record<StateFilter, string> = {
@@ -431,13 +465,3 @@ function stateLabel(state: TransferTask['state']): string {
   }
 }
 
-export function formatSize(bytes: number): string {
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  let v = bytes
-  let i = 0
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024
-    i++
-  }
-  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
-}

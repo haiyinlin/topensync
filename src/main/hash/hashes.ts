@@ -1,6 +1,7 @@
 import { createHash } from 'crypto'
 import { createReadStream } from 'fs'
 import { stat } from 'fs/promises'
+import { ioGovernor } from '../io/governor'
 
 /**
  * 双哈希计算。
@@ -22,25 +23,49 @@ export interface FileHashes {
 /**
  * 流式计算双哈希。读完顺带拿到真实字节数，
  * 用于校验读取期间文件是否被改动。
+ *
+ * 走 IO 闸门：几万个文件同时算哈希会把句柄耗尽（见 io/governor.ts），
+ * 闸门保证同一时刻只有固定数量的读流存在。
  */
 export async function hashFile(path: string): Promise<FileHashes> {
-  const md5 = createHash('md5')
-  const sha1 = createHash('sha1')
-  let bytes = 0
+  return ioGovernor.run(async () => {
+    const md5 = createHash('md5')
+    const sha1 = createHash('sha1')
+    let bytes = 0
 
-  await new Promise<void>((resolve, reject) => {
     const stream = createReadStream(path)
-    stream.on('data', (chunk: string | Buffer) => {
-      const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk
-      bytes += buf.length
-      md5.update(buf)
-      sha1.update(buf)
-    })
-    stream.on('end', resolve)
-    stream.on('error', reject)
+    try {
+      await new Promise<void>((resolve, reject) => {
+        /*
+         * 三个监听都必须能收尾。
+         *
+         * 以前只在 end / error 上收尾：`md5.update()` 抛异常时
+         * （内存不足、chunk 类型异常）promise 永远不 settle，
+         * 而读流还开着——一次泄漏一个句柄，几万次之后就 EMFILE。
+         */
+        stream.on('data', (chunk: string | Buffer) => {
+          try {
+            const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk
+            bytes += buf.length
+            md5.update(buf)
+            sha1.update(buf)
+          } catch (err) {
+            stream.destroy(err as Error)
+          }
+        })
+        stream.on('end', () => resolve())
+        stream.on('error', reject)
+        stream.on('close', () => {
+          // closed 先于 end 到达 = 读取被中途切断，外层不能一直 await 下去
+          if (!stream.readableEnded) reject(new Error(`读取中断：${path}`))
+        })
+      })
+      return { md5: md5.digest('hex'), sha1: sha1.digest('hex'), size: bytes }
+    } finally {
+      // 成功路径上流已自然结束；这里兜住异常与提前取消两种情况
+      if (!stream.destroyed) stream.destroy()
+    }
   })
-
-  return { md5: md5.digest('hex'), sha1: sha1.digest('hex'), size: bytes }
 }
 
 /**

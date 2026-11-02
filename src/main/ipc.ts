@@ -32,7 +32,8 @@ export function registerIpc(engine: Engine): void {
   })
   ipcMain.handle('app:stats', () => engine.getStats())
   ipcMain.handle('config:get', () => engine.getConfig())
-  ipcMain.handle('files:list', (_e, opts: { limit?: number }) => engine.listFiles(opts ?? {}))
+  ipcMain.handle('files:list', (_e, opts: { limit?: number; offset?: number }) =>
+    engine.listFiles(opts ?? {}))
   ipcMain.handle('diffs:list', () => engine.listDiffs())
   ipcMain.handle('logs:list', (_e, limit: number) => engine.recentLogs(limit ?? 200))
   ipcMain.handle('tasks:list', () => engine.listTasks())

@@ -222,6 +222,40 @@ interface ScanProgressPair {
 
 ---
 
+## 五之五、文件句柄：全进程共用一把闸门
+
+`src/main/io/governor.ts`。
+
+真实故障：用户把**整块盘**（`Z:\`，5.8 万个文件）设为同步根，运行时出现
+
+```
+EMFILE: too many open files, open 'Z:\download\...\20110514074.jpg'
+EMFILE: too many open files, watch 'Z:\...\IMG_8278.JPG'
+```
+
+并且**点暂停没反应**。三个原因叠加：
+
+| 原因 | 机制 | 修法 |
+|---|---|---|
+| 事件处理不限并发 | Watcher 每条事件 `void handleEvent()`，几万条同时进 → 几万个 `stat` 同时在飞 | Planner 入口排队，`EVENT_CONCURRENCY = 8`；Watcher 初始扫描按窗口 32 做背压 |
+| 上传读流不销毁 | `createReadStream` 交给 fetch，请求失败时没人 `destroy()` → 每失败一次漏一个句柄 | `putOnce` / `sendChunkWithRetry` 全部 `try/finally` 释放 |
+| 初始扫描交给 chokidar | `ignoreInitial: false` + `awaitWriteFinish` = 每个既有文件一个 stat 轮询，5.8 万个轮询 | `ignoreInitial: true`，初始全量改由 `rescan()` 自己走目录树 |
+
+闸门本身做两件事：
+
+- **限流**：全进程共用，`limit = hashConcurrency + uploadConcurrency + 2`（上限 16）。事件 `stat`、哈希读流、上传读流都从这里取额度，所以任何一个子系统调大并发都不会突破句柄上限。
+- **冷却**：撞上 EMFILE 就全进程停止开新句柄，0.8s 起指数退避到 30s。**空转重试只会让盘更缓不过来**——实测这块盘被打爆后，连全新进程的 `stat` 都会失败（200 次里 158 次 EMFILE）。
+
+错误也按「是不是这个文件的错」分流：
+
+- `EMFILE` → **不判失败、不消耗重试次数**，冷却后重新排队（上限 40 次）
+- `ENOENT` → 文件在扫描之后被删/移走，记成「跳过（本地文件已不存在）」，不是红叉
+- 其余 → 正常失败
+
+诊断包的 `io` 字段会输出闸门的实时状态（`active` / `peak` / `limit` / `coolingDown` / `exhausted`），下次再报同类问题能直接看出限流有没有生效。
+
+---
+
 ## 六、配置
 
 - 存在 `userData/config.json`

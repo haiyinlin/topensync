@@ -34,14 +34,16 @@ function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
 
 const api = {
   // ── 主进程 → 渲染进程（订阅）──────────────────────────
-  onTransferUpdate: (cb: MainToRendererEvents['transfer:update']) =>
-    subscribe('transfer:update', cb),
+  /** 订阅任务的批量变更（不是单条——六万文件时单条推送会卡死界面） */
+  onTransferBatch: (cb: MainToRendererEvents['transfer:batch']) =>
+    subscribe('transfer:batch', cb),
   onScanUpdate: (cb: MainToRendererEvents['scan:update']) => subscribe('scan:update', cb),
   /** 订阅扫描/对账进度 */
   onScanProgress: (cb: MainToRendererEvents['scan:progress']) => subscribe('scan:progress', cb),
   onDiffUpdate: (cb: MainToRendererEvents['diff:update']) => subscribe('diff:update', cb),
   onConfigUpdate: (cb: MainToRendererEvents['config:update']) => subscribe('config:update', cb),
-  onLogAppend: (cb: MainToRendererEvents['log:append']) => subscribe('log:append', cb),
+  /** 订阅日志批量追加 */
+  onLogBatch: (cb: MainToRendererEvents['log:batch']) => subscribe('log:batch', cb),
   onConnectionUpdate: (cb: MainToRendererEvents['connection:update']) =>
     subscribe('connection:update', cb),
 
@@ -50,7 +52,7 @@ const api = {
   getSnapshot: (): Promise<AppSnapshot> => ipcRenderer.invoke('app:snapshot'),
   getStats: (): Promise<AppStats> => ipcRenderer.invoke('app:stats'),
   getConfig: (): Promise<AppConfig> => ipcRenderer.invoke('config:get'),
-  listFiles: (opts?: { limit?: number }): Promise<FileEntry[]> =>
+  listFiles: (opts?: { limit?: number; offset?: number }): Promise<FileEntry[]> =>
     ipcRenderer.invoke('files:list', opts ?? {}),
   listDiffs: (): Promise<DiffEntry[]> => ipcRenderer.invoke('diffs:list'),
   listLogs: (limit?: number): Promise<LogEntry[]> =>

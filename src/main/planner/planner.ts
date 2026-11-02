@@ -7,12 +7,21 @@ import type { Transfer } from '../transfer/transfer'
 import type { FileHashes } from '../hash/hashes'
 import { hashFile } from '../hash/hashes'
 import type { OpenListClient } from '../openlist/client'
-import { absolutize, isExcluded, joinRemote, remoteBasename, remoteDirname, relativizeRemote } from '../watcher/paths'
+import { ioGovernor, isResourceExhausted, isResourceExhaustedMessage } from '../io/governor'
+import {
+  absolutize,
+  isExcluded,
+  joinRemote,
+  remoteBasename,
+  remoteDirname,
+  relativizeRemote
+} from '../watcher/paths'
 import { RenameDetector, type RenameCandidate } from './rename'
 import type {
   AppConfig,
   DiffKind,
   LogCategory,
+  SkipReason,
   TransferTask
 } from '@shared/types'
 
@@ -34,6 +43,72 @@ import type {
 
 export type EnqueueReason = 'watch' | 'diff' | 'recovery' | 'retry'
 
+/**
+ * 任务表容量上限。
+ *
+ * 为什么要有上限：一次本地扫描会把**每个**文件都变成一条任务——
+ * 六万个文件就是六万条。这个表原本无界增长，而它上面的每一个
+ * 操作（按 id 查、按路径查、渲染层替换）都是线性或更好，
+ * 但**渲染层每次收到一条更新都要遍历全表**，
+ * 六万条 × 六万次 = 三十多亿次操作，界面必然失去响应。
+ *
+ * 三千条足够回答「刚才在传什么、哪个失败了」——
+ * 再往前的记录用户根本不会翻，翻也翻不过来。
+ * 完整的跳过明细由日志页承载（日志按类别可筛，且落库）。
+ */
+export const MAX_TASKS = 3000
+
+/**
+ * 淘汰的滞后量。
+ *
+ * 不写成「一超上限就淘汰一条」：那会让每次插入都触发一次表扫描，
+ * 又变成 O(n²)。攒够一批再一次性淘汰到位，均摊下来接近 O(1)。
+ */
+const TASK_EVICT_SLACK = 600
+
+/**
+ * 任务表的实际容量上限。
+ *
+ * 表的大小在 `MAX_TASKS` 与这个值之间浮动：超过上限 + 滞后量才动手，
+ * 一次清回 `MAX_TASKS`。对外说明「上限」时用这个数更准确。
+ */
+export const TASK_TABLE_LIMIT = MAX_TASKS + TASK_EVICT_SLACK
+
+/**
+ * 本地事件处理的并发度。
+ *
+ * 这里定 8，但**真正同时打开的文件句柄由 IO 闸门兜底**（见 io/governor.ts）：
+ * 事件处理、哈希、上传三条路都从同一把闸门取额度，
+ * 所以这里调大只影响「排队等闸门的人有多少」，不会突破句柄上限。
+ *
+ * 为什么需要大于 1：同步根常在网络盘 / 挂载盘上，单次 stat 的
+ * 往返延迟可以到几十毫秒；串行处理 5 万个文件要几十分钟，
+ * 用户会以为程序卡住了。
+ */
+const EVENT_CONCURRENCY = 8
+
+/**
+ * 句柄不足时的重试上限。
+ *
+ * 40 次 × 最长 30 秒冷却 ≈ 20 分钟——足够覆盖「盘临时掉线又被重连」
+ * 这类现实情况，又不至于让盘真坏掉时无限空转。
+ */
+const MAX_FD_RETRIES = 40
+
+/** 闸门没在冷却（说明是别处抛的 EMFILE）时的兜底等待 */
+const FD_RETRY_FALLBACK_MS = 1000
+
+/**
+ * 这个状态的任务能否被淘汰。
+ *
+ * 只有三种终态可以：取消、完成、跳过。
+ * 进行中的（queued/hashing/uploading/downloading）正在跑，
+ * 失败的（failed）是用户要处理的——丢掉等于把问题藏起来。
+ */
+function isEvictable(state: TransferTask['state']): boolean {
+  return state === 'canceled' || state === 'done' || state === 'skipped'
+}
+
 export interface PlannerOptions {
   manifest: Manifest
   transfer: Transfer
@@ -42,6 +117,13 @@ export interface PlannerOptions {
   /** 读当前配置（配置可在运行时改，故用函数而非快照） */
   getConfig: () => AppConfig
   onTask?: (task: TransferTask) => void
+  /**
+   * 任务表因容量上限淘汰了一批记录。
+   *
+   * 渲染层必须同步删掉这些 id，否则它的数组会一直涨，
+   * 而主进程早就不认这些任务了。
+   */
+  onTasksEvicted?: (ids: string[]) => void
   onLog?: (level: 'info' | 'warn' | 'error', message: string) => void
   /**
    * 带结构化信息的日志回调。
@@ -83,6 +165,8 @@ interface QueueItem {
   mtimeMs: number
   reason: EnqueueReason
   attempts: number
+  /** 因本地盘句柄不足而重试的次数（与 attempts 分开计） */
+  fdRetries?: number
   hashes?: FileHashes
   /**
    * 本次入队的身份令牌。
@@ -125,10 +209,37 @@ export class Planner {
   private readonly uploadQueue: QueueItem[] = []
   private readonly downloadQueue: DownloadItem[] = []
   private readonly deleteQueue: DeleteItem[] = []
+  /**
+   * 本地事件队列（进 planner 的入口闸门）。
+   *
+   * 每条事件是一次「stat + 查清单 + 可能写库」，本身不重，
+   * 但数量级是「一次扫描几万条」。不限并发的话，
+   * 几万个 stat 同时开着 → 驱动器句柄耗尽（EMFILE）。
+   */
+  private readonly eventQueue: Array<{ run: () => Promise<void>; cancel: () => void }> = []
+  private eventsActive = 0
+  private drainingEvents = false
+  /**
+   * 「因为句柄不足而探不到」的路径 → 已重试次数。
+   *
+   * 这类失败与文件本身无关，重放事件是对的；但要有个上限，
+   * 否则盘彻底断开时会永远重试下去。
+   */
+  private readonly fdEventRetries = new Map<string, number>()
   /** 任务表：key 是任务 id */
   private readonly tasks = new Map<string, TransferTask>()
   /** 相对路径 → 任务 id */
   private readonly taskIdByPath = new Map<string, string>()
+  /** 任务表是否因上限淘汰过记录（供界面提示） */
+  private tasksTruncated = false
+  /**
+   * 上一次整表扫描没找到任何可淘汰的任务。
+   *
+   * 极端情况：表里全是失败或进行中的任务（都不可淘汰）。
+   * 没有这个标记的话，此后**每一次**插入都要把整个表扫一遍却一无所获——
+   * 又是一种 O(n²)。标记住，等表再长大一个滞后量才重试。
+   */
+  private evictBlockedAt = -1
   /** 已在远端创建过的目录，避免每个文件都重复 mkdir */
   private readonly knownRemoteDirs = new Set<string>()
   /**
@@ -202,6 +313,8 @@ export class Planner {
 
   stop(): void {
     this.running = false
+    // 排队中的事件直接放行，别让初始扫描的 await 悬着
+    this.abortEvents()
     this.hashQueue.length = 0
     this.uploadQueue.length = 0
     this.downloadQueue.length = 0
@@ -301,6 +414,8 @@ export class Planner {
       }
       removed++
     }
+    // 用户手动清掉了一批记录 → 表里有了空位，解除「无处可淘汰」的锁定
+    if (removed > 0) this.evictBlockedAt = -1
     return removed
   }
 
@@ -419,6 +534,23 @@ export class Planner {
    * 非空目录由其下文件上传时自动创建。
    */
   async handleEvent(relPath: string, exists: boolean, isDir = false): Promise<void> {
+    /*
+     * 所有本地事件先排队，再有上限地并发处理。
+     *
+     * 为什么必须排队：Watcher 的增量事件是「一批到达」的——用户把
+     * 一个文件夹拷进同步根，或者 chokidar 在初始扫描后一次性吐出几千条，
+     * 每条都会被立刻 `void handleEvent()` 掉。每个事件里要 stat、
+     * 查清单、写库，几万条并发就是几万个同时打开的句柄，
+     * 于是 EMFILE，而主进程的事件循环也被这些微任务堵住——
+     * 用户看到的就是「点暂停没反应」。
+     *
+     * 队列保序（FIFO），所以同一路径的连续事件不会乱序，
+     * 重命名识别依赖的先后关系也还在。
+     */
+    return this.scheduleEvent(() => this.processEvent(relPath, exists, isDir))
+  }
+
+  private async processEvent(relPath: string, exists: boolean, isDir: boolean): Promise<void> {
     if (!this.running) return
     const config = this.opts.getConfig()
     if (!config.syncRoot) return
@@ -451,9 +583,23 @@ export class Planner {
     // 跳过占位文件与占用中的文件：读它们会触发云盘客户端拉取正文
     const probe = await this.probe(absPath)
     if (!probe.ok) {
+      /*
+       * 句柄耗尽不是「这个文件不能同步」。
+       *
+       * probe 失败以前一律记一句「跳过」就完了——文件既没进队列，
+       * 也不在清单里留痕，用户只会看到一大片「跳过」，
+       * 而那些文件其实一个都没传。盘缓过来之后也不会自动补上，
+       * 除非再手动扫一遍。这里改成冷却后重新排队。
+       */
+      if (probe.code && isResourceExhausted({ code: probe.code })) {
+        this.retryEventAfterCooldown(relPath)
+        return
+      }
       if (probe.reason) this.opts.onLog?.('warn', `跳过 ${relPath}：${probe.reason}`)
       return
     }
+    // 探到了：把这个路径的重试计数清掉
+    this.fdEventRetries.delete(relPath)
 
     // ── L1 快筛 ──
     // 基准是「上次成功同步时的 size + mtime」。命中即完全不上传。
@@ -513,13 +659,17 @@ export class Planner {
    * 同时写一条带类别的日志：跳过是**同步做了什么**的一部分，
    * 不记的话日志页只剩上传记录，用户会以为文件漏传了。
    */
-  private recordSkip(
-    relPath: string,
-    reason: 'local_duplicate' | 'remote_duplicate' | 'remote_size_match',
-    size: number
-  ): void {
+  private recordSkip(relPath: string, reason: SkipReason, size: number): void {
+    /*
+     * 计数口径。
+     *
+     * 只有「内容判定」类的跳过才进「已跳过」统计——
+     * 那是省下来的上行。`file_gone` 是文件自己没了，
+     * 记进跳过数会让用户以为「同步跳过了 1165 个文件，省了带宽」，
+     * 而实际原因是文件不在了。
+     */
     if (reason === 'local_duplicate') this.skippedLocal++
-    else this.skippedRemote++
+    else if (reason !== 'file_gone') this.skippedRemote++
 
     const detail = this.skipDetail
     this.opts.onSkip?.(detail.total)
@@ -535,16 +685,19 @@ export class Planner {
       errorMsg: null
     })
 
-    // 跳过原因要说清楚：三种跳过的含义完全不同，
-    // 用户需要知道「没传」是因为内容一样，还是因为远端已有同名同大小。
+    // 跳过原因要说清楚：四种跳过的含义完全不同，
+    // 用户需要知道「没传」是因为内容一样，还是因为远端已有同名同大小，
+    // 还是因为文件在他眼皮底下消失了。
     // 第三种要额外点明「未校验内容」——那是弱认定，风险点在此。
     const reasonText =
       reason === 'local_duplicate'
         ? '内容与上次同步一致，未变化'
         : reason === 'remote_duplicate'
           ? '远端已有相同内容（按哈希判定）'
-          : '远端已有同名同大小文件，已认领为已同步（未校验内容）'
-    this.opts.onLogDetail?.('info', `跳过 ${relPath}：${reasonText}`, {
+          : reason === 'file_gone'
+            ? '本地文件已不存在（扫描后被删除或移走）'
+            : '远端已有同名同大小文件，已认领为已同步（未校验内容）'
+    this.opts.onLogDetail?.(reason === 'file_gone' ? 'warn' : 'info', `跳过 ${relPath}：${reasonText}`, {
       category: 'skip',
       filePath: relPath
     })
@@ -844,6 +997,24 @@ export class Planner {
       `对账发现${diff.kind === 'missing_remote' ? '远端缺失' : '内容不符'}，重新上传 ${diff.localPath}`
     )
 
+    /*
+     * **必须先清掉同步基准，再入队。**
+     *
+     * 这是「对账说远端丢了、上传却说重复」的根因：
+     * 入队后哈希阶段会走 L2 判重（`isRemoteDuplicate`），
+     * 它比的是 `synced_md5/sha1` —— 而那是**上次成功同步时**
+     * 远端那份内容的哈希。远端被外部删掉后，这些字段还在，
+     * 本地文件又没改过 → 两边哈希相等 → 判成「远端重复」→ 跳过上传。
+     *
+     * 于是每轮对账都发现差异、每轮都「重新上传」、每轮都被跳过，
+     * 远端那份永远补不回来，而清单里还写着 synced。
+     * 用户看到的是「对账说修好了，其实什么都没发生」。
+     *
+     * 清掉之后 L1、L2 都不再命中，文件会真正走一次上传。
+     * 「强制重传」(`reupload`) 用的是同一条路。
+     */
+    this.opts.manifest.clearSyncBaseline(diff.localPath)
+
     this.enqueue({
       relPath: diff.localPath,
       absPath,
@@ -1014,6 +1185,78 @@ export class Planner {
 
   // ── 内部：入队与流水线 ─────────────────────────────────
 
+  /**
+   * 把一次事件处理排进队列，返回「处理完」的 promise。
+   *
+   * 返回 promise 而不是 void，是为了让 Watcher 的初始扫描能做背压——
+   * 它可以一次只推进若干个，而不是把五万个事件全推上来。
+   */
+  private scheduleEvent(task: () => Promise<void>): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      /*
+       * 已停止（暂停）时立刻放行。
+       *
+       * 不能只是「不处理」——调用方正 await 着这个 promise，
+       * 不 resolve 的话暂停中的初始扫描会永远卡在这里，
+       * 而界面上那个「暂停」按钮看起来就是没反应。
+       */
+      if (!this.running) {
+        resolve()
+        return
+      }
+      this.eventQueue.push({
+        run: async () => {
+          try {
+            await task()
+            resolve()
+          } catch (err) {
+            reject(err)
+          }
+        },
+        // 停止时直接放行：调用方（初始扫描）正 await 着它，
+        // 不 resolve 就会一直挂着，暂停按钮永远不返回
+        cancel: () => resolve()
+      })
+      this.drainEvents()
+    })
+  }
+
+  /** 丢弃排队中的事件（不处理，但让等待方继续） */
+  private abortEvents(): void {
+    for (const queued of this.eventQueue.splice(0)) queued.cancel()
+  }
+
+  private drainEvents(): void {
+    if (!this.running) {
+      this.abortEvents()
+      return
+    }
+    if (this.drainingEvents) return
+    this.drainingEvents = true
+    try {
+      while (
+        this.running &&
+        this.eventsActive < EVENT_CONCURRENCY &&
+        this.eventQueue.length > 0
+      ) {
+        const next = this.eventQueue.shift()
+        if (!next) break
+        this.eventsActive++
+        void next
+          .run()
+          .catch(() => {
+            // 事件级错误由 engine 的 onEvent 收起并写日志，这里只负责计数
+          })
+          .finally(() => {
+            this.eventsActive--
+            this.drainEvents()
+          })
+      }
+    } finally {
+      this.drainingEvents = false
+    }
+  }
+
   private enqueue(item: QueueItem): void {
     // 同一路径已在队列中就不重复排。
     // 但**在途**的那一项也必须算上：它已经从队列 shift 出来了，
@@ -1179,6 +1422,8 @@ export class Planner {
       absPath: item.absPath,
       remotePath,
       hashes: item.hashes,
+      // 入队时观测到的 mtime：Transfer 拿它判断哈希期间文件有没有被改写
+      mtimeMs: item.mtimeMs,
       // 让 Transfer 在写终态之前问一句「用户是不是已经取消了」
       isCanceled: () => item.canceled === true
     })
@@ -1211,6 +1456,18 @@ export class Planner {
         filePath: item.relPath,
         remotePath
       })
+      return
+    }
+
+    /*
+     * 句柄耗尽（发生在**上传**阶段）。
+     *
+     * 与哈希阶段同一个道理：这不是文件的问题，也不是网络的问题，
+     * 是同一时刻打开的文件太多，整块盘的句柄被吃光了。
+     * 走冷却重排队，不消耗重试次数——否则三次重试全撞在同一段
+     * 句柄枯竭期里，文件就被判死了，而盘其实几秒后就恢复了。
+     */
+    if (isResourceExhaustedMessage(result.error) && this.requeueAfterFdCooldown(item)) {
       return
     }
 
@@ -1252,12 +1509,83 @@ export class Planner {
 
   private handleFatal(item: QueueItem, err: unknown): void {
     const message = err instanceof Error ? err.message : String(err)
+    const code = (err as NodeJS.ErrnoException | undefined)?.code
+
+    /*
+     * ① 句柄耗尽：不是这个文件的问题。
+     *
+     * 真实场景（诊断包实测）：同步根是一整块盘，5.8 万个文件。
+     * 一次扫描里 118 次 EMFILE，把文件一个个标成「失败」——
+     * 用户看到 556 个红叉，以为是文件坏了，实际上整块盘
+     * 只是被打开的文件句柄压垮了，歇一会儿、少开几个就全好了。
+     */
+    if (isResourceExhausted(err) && this.requeueAfterFdCooldown(item)) return
+
+    /*
+     * ② 文件已经不在：扫描之后被删掉/移走了。
+     *
+     * 这不是失败——文件本来就不该上传。按「跳过」记录，
+     * 让用户在队列里能看见它、并且知道原因；判成失败会让
+     * 几百个红叉把真正需要处理的错误淹掉。
+     */
+    if (code === 'ENOENT') {
+      this.opts.manifest.setState(item.relPath, 'deleted')
+      this.recordSkip(item.relPath, 'file_gone', item.size)
+      return
+    }
+
     this.opts.manifest.setState(item.relPath, 'error', { errorMsg: message })
     this.touch(item.relPath, { state: 'failed', errorMsg: message })
     this.opts.onLogDetail?.('error', `处理 ${item.relPath} 失败：${message}`, {
       category: 'upload',
       filePath: item.relPath
     })
+  }
+
+  /**
+   * 句柄耗尽后的冷却重排队。
+   *
+   * 返回 true 表示「已安排重试，调用方不要继续按失败处理」。
+   * 超过上限返回 false，让调用方走正常失败路径——盘真坏了的时候
+   * 需要一个明确的终点，无限重试只会刷屏。
+   *
+   * 注意这里**不动 attempts**：重试次数是给「文件/网络有问题」用的，
+   * 句柄不足跟这个文件毫无关系，记进去只会让它在盘恢复前就被判死。
+   */
+  private requeueAfterFdCooldown(item: QueueItem): boolean {
+    item.fdRetries = (item.fdRetries ?? 0) + 1
+
+    if (item.fdRetries > MAX_FD_RETRIES || !this.running) {
+      const hint =
+        '本机文件句柄持续不足，已停止重试。若同步根是网络盘/挂载盘，' +
+        '请在盘恢复后点「开始同步」重试，或先把该盘重新连接。'
+      this.opts.manifest.setState(item.relPath, 'error', { errorMsg: hint })
+      this.touch(item.relPath, { state: 'failed', errorMsg: hint })
+      this.opts.onLogDetail?.('error', `文件句柄持续不足，已停止重试：${item.relPath}`, {
+        category: 'system',
+        filePath: item.relPath
+      })
+      return true
+    }
+
+    const waitMs = Math.max(ioGovernor.remainingCooldownMs, FD_RETRY_FALLBACK_MS)
+    this.touch(item.relPath, {
+      state: 'queued',
+      errorMsg: `本地盘句柄不足，${Math.max(1, Math.round(waitMs / 1000))} 秒后重试`
+    })
+    this.opts.manifest.setState(item.relPath, 'pending')
+    this.opts.onLogDetail?.(
+      'warn',
+      `本机文件句柄已用尽，暂停 ${Math.max(1, Math.round(waitMs / 1000))} 秒后重试：${item.relPath}`,
+      { category: 'system', filePath: item.relPath }
+    )
+    setTimeout(() => {
+      if (this.running && !item.canceled) {
+        this.hashQueue.push(item)
+        void this.pump()
+      }
+    }, waitMs).unref?.()
+    return true
   }
 
   // ── 下载 ──────────────────────────────────────────────
@@ -1792,6 +2120,8 @@ export class Planner {
   private async probe(absPath: string): Promise<{
     ok: boolean
     reason?: string
+    /** 失败时的 errno 码，供上层区分「句柄不足」与「文件真的没了」 */
+    code?: string
     size: number
     mtimeMs: number
     /** 文件索引号（字符串） */
@@ -1803,7 +2133,10 @@ export class Planner {
       // 存进 SQLite 再读出来更是直接抛
       // "Value is too large to be represented as a JavaScript number"。
       // 所以 inode 一律以字符串形态流转。
-      const st = await stat(absPath, { bigint: true })
+      //
+      // 走闸门：这是全流程里**调用最密**的文件操作（每个事件一次），
+      // 不纳入限流的话，前面几处限得再严也白搭。
+      const st = await ioGovernor.run(() => stat(absPath, { bigint: true }))
       return {
         ok: true,
         size: Number(st.size),
@@ -1813,13 +2146,43 @@ export class Planner {
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code
       if (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES') {
-        return { ok: false, reason: `文件被占用（${code}）`, size: 0, mtimeMs: 0, inode: null }
+        return { ok: false, reason: `文件被占用（${code}）`, code, size: 0, mtimeMs: 0, inode: null }
       }
       if (code === 'ENOENT') {
-        return { ok: false, reason: '文件已不存在', size: 0, mtimeMs: 0, inode: null }
+        return { ok: false, reason: '文件已不存在', code, size: 0, mtimeMs: 0, inode: null }
       }
-      return { ok: false, reason: (err as Error).message, size: 0, mtimeMs: 0, inode: null }
+      return { ok: false, reason: (err as Error).message, code, size: 0, mtimeMs: 0, inode: null }
     }
+  }
+
+  /**
+   * 句柄耗尽导致探不到文件时，冷却后把这条事件重放一次。
+   *
+   * 为什么要重放而不是等下一轮扫描：下一轮可能是几小时后，
+   * 期间这个文件既不在队列里、也不在清单里留痕，
+   * 用户永远不会知道它没传上去。
+   */
+  private retryEventAfterCooldown(relPath: string): void {
+    const tries = (this.fdEventRetries.get(relPath) ?? 0) + 1
+    this.fdEventRetries.set(relPath, tries)
+
+    if (tries > MAX_FD_RETRIES) {
+      this.fdEventRetries.delete(relPath)
+      this.opts.onLogDetail?.(
+        'error',
+        `文件句柄持续不足，暂时无法同步：${relPath}（盘的连接恢复后会重新扫描）`,
+        { category: 'system', filePath: relPath }
+      )
+      return
+    }
+
+    const waitMs = Math.min(
+      Math.max(ioGovernor.remainingCooldownMs, FD_RETRY_FALLBACK_MS) * tries,
+      30_000
+    )
+    setTimeout(() => {
+      if (this.running) void this.handleEvent(relPath, true)
+    }, waitMs).unref?.()
   }
 
   // ── 任务表 ────────────────────────────────────────────
@@ -1886,6 +2249,68 @@ export class Planner {
 
     this.tasks.set(id, task)
     this.opts.onTask?.(task)
+    this.evictIfOverflow()
+  }
+
+  /**
+   * 任务表超过上限时淘汰旧记录。
+   *
+   * 三个要点：
+   *
+   * 1. **攒一批再淘汰**。一次只踢一条的话，每次插入都要扫一遍表，
+   *    六万个文件就是六万次全表扫描。这里等到超出滞后量才动手，
+   *    一次清回上限，均摊成本接近常数。
+   *
+   * 2. **只淘汰终态，且从最老的开始**。Map 的迭代序就是创建序，
+   *    从头扫、遇到可淘汰的就删即可。失败与进行中的任务通过
+   *    `evictRank` 排除在外，永远不会被踢——丢掉失败的记录
+   *    等于把用户要处理的问题藏起来。
+   *
+   * 3. **必须回报被删的 id**。渲染层那份数组不会自己缩，
+   *    不同步的话两边表格会越差越远。
+   */
+  private evictIfOverflow(): void {
+    if (this.tasks.size <= TASK_TABLE_LIMIT) return
+
+    /*
+     * 上一轮整表扫过、一个可淘汰的都没有 → 这次跳过。
+     *
+     * 表里全是失败/进行中的任务时会出现这种情况：它们都不能丢。
+     * 不记住这个结论，往后每次插入都要白扫一遍整表。
+     * 等表再长大一个滞后量，说明情况可能变了（有新任务进入了终态），
+     * 那时再重试一次。
+     */
+    if (this.evictBlockedAt >= 0 && this.tasks.size < this.evictBlockedAt + TASK_EVICT_SLACK) {
+      return
+    }
+
+    let over = this.tasks.size - MAX_TASKS
+    const evicted: string[] = []
+    for (const [id, task] of this.tasks) {
+      if (over <= 0) break
+      if (!isEvictable(task.state)) continue
+      this.tasks.delete(id)
+      // 路径索引必须一起清：留着它，同一路径再变更时会去找一个已删的 id
+      if (this.taskIdByPath.get(task.localPath) === id) {
+        this.taskIdByPath.delete(task.localPath)
+      }
+      evicted.push(id)
+      over--
+    }
+
+    if (evicted.length === 0) {
+      this.evictBlockedAt = this.tasks.size
+      return
+    }
+
+    this.evictBlockedAt = -1
+    this.tasksTruncated = true
+    this.opts.onTasksEvicted?.(evicted)
+  }
+
+  /** 任务表是否因上限丢过记录 */
+  get truncated(): boolean {
+    return this.tasksTruncated
   }
 }
 

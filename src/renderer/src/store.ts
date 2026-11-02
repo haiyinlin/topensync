@@ -9,6 +9,7 @@ import type {
   FileEntry,
   LogEntry,
   ScanProgressPair,
+  TaskBatch,
   TransferTask
 } from '@shared/types'
 
@@ -105,6 +106,29 @@ function noop(): void {}
  */
 const FILE_PAGE_SIZE = 5000
 
+/**
+ * 后台刷新时最多重载的行数。
+ *
+ * 为什么刷新要记住当前的加载进度：用户点了三次「加载更多」
+ * 已经看到两万条，这时后台因为某个文件传完而刷新一次清单，
+ * 列表「唰」地缩回五千条——用户会以为程序把他的数据弄丢了，
+ * 还得再点三次。这在大目录下几乎无法正常浏览。
+ *
+ * 但也不能无限重载：真按六万条重载，每次刷新就是几 MB 的
+ * JSON 序列化 + 跨进程传输，比不刷新更卡。所以给个上限，
+ * 超出部分由用户按需再点「加载更多」。
+ */
+const FILE_REFRESH_MAX = 20000
+
+/**
+ * 渲染层保留的日志条数。
+ *
+ * 日志页要能翻一段时间的历史，但不可能全量——六万条日志光是
+ * 渲染就要命。五百条足够看清刚才发生了什么，更早的请用日志页
+ * 的类别筛选去查（完整记录都落在数据库里）。
+ */
+const LOG_KEEP = 500
+
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
   config: null,
@@ -176,23 +200,39 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     track(
-      window.topensync?.onTransferUpdate((task) => {
-        set((s) => ({
-          tasks: [...s.tasks.filter((x) => x.id !== task.id), task],
-          // 任务状态变了，统计数字跟着变
-          stats: s.stats
-            ? { ...s.stats, queued: countBy(s.tasks, task, 'queued'), failed: countBy(s.tasks, task, 'failed') }
-            : s.stats
-        }))
-        // 后台刷新没有调用方接 promise：失败必须在这里收口，否则是 unhandled rejection
-        void safe(() => get().refreshStats(), undefined, '刷新统计')
+      window.topensync?.onTransferBatch((batch) => {
+        set((s) => {
+          const next = mergeTaskBatch(s.tasks, batch)
+          /*
+           * 计数就地算，跟着合并那一次遍历走。
+           *
+           * 以前这里调两次 `countBy(...)`，每次内部都 `filter` 一遍
+           * 整个任务数组——加上合并自己的 filter，一条推送要扫三遍。
+           * 六万条时单次推送 31ms，累计三十多分钟。
+           *
+           * 现在合并与计数都在这一批里完成：批次多大就扫多大，
+           * 与任务总量无关。
+           */
+          let queued = 0
+          let failed = 0
+          for (const t of next) {
+            if (t.state === 'queued') queued++
+            else if (t.state === 'failed') failed++
+          }
+          return {
+            tasks: next,
+            stats: s.stats ? { ...s.stats, queued, failed } : s.stats
+          }
+        })
+        // 统计走节流：每条推送都拉一次统计会把主进程和 IPC 一起压垮
+        scheduleStatsRefresh(get)
         /*
          * 任务走到终态 = 清单里那条记录的状态也定了
          * （uploading → synced / failed / 已取消）。
          * 这里必须刷，否则清单页会停在「上传中」——
          * 甚至在扫描事件抢跑的空表上永远停着。
          */
-        if (task.state === 'done' || task.state === 'failed' || task.state === 'skipped' || task.state === 'canceled') {
+        if (batch.upserts.some((t) => isTerminalState(t.state))) {
           scheduleFilesRefresh(get)
         }
       })
@@ -281,13 +321,22 @@ export const useAppStore = create<AppState>((set, get) => ({
               ? { ...s.progress, local: progress }
               : { ...s.progress, remote: progress }
         }))
-        void safe(() => get().refreshStats(), undefined, '刷新统计')
+        // 进度是高频事件（每个文件一跳），统计必须走节流
+        scheduleStatsRefresh(get)
       })
     )
 
     track(
-      window.topensync?.onLogAppend((entry) => {
-        set((s) => ({ logs: [entry, ...s.logs].slice(0, 500) }))
+      window.topensync?.onLogBatch((entries) => {
+        if (entries.length === 0) return
+        /*
+         * 整批一次性拼进去。
+         *
+         * 以前每条日志都 `[entry, ...s.logs].slice(0, 500)`——
+         * 六万条日志就是六万次 500 元素数组重建。
+         * 现在一批只重建一次，批次内的顺序反转成「最新在前」。
+         */
+        set((s) => ({ logs: [...entries.slice().reverse(), ...s.logs].slice(0, LOG_KEEP) }))
       })
     )
 
@@ -310,6 +359,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         window.clearTimeout(filesRefreshTimer)
         filesRefreshTimer = null
       }
+      filesRefreshAt = 0
+      if (statsRefreshTimer !== null) {
+        window.clearTimeout(statsRefreshTimer)
+        statsRefreshTimer = null
+      }
       initialized = false
       initCleanup = null
     }
@@ -325,23 +379,37 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   refreshFiles: async () => {
+    /*
+     * 保住用户已经「加载更多」出来的行数。
+     *
+     * 以前这里固定按 FILE_PAGE_SIZE 拉——后台一刷新，列表就缩回五千条，
+     * 用户刚翻到的位置全没了。现在按当前已加载量重拉（有上限）。
+     */
+    const limit = Math.max(FILE_PAGE_SIZE, Math.min(get().filesLimit, FILE_REFRESH_MAX))
     const files = await safe(
-      () => ipc(() => window.topensync?.listFiles({ limit: FILE_PAGE_SIZE })),
+      () => ipc(() => window.topensync?.listFiles({ limit })),
       null,
       '刷新文件清单'
     )
-    if (files) set({ files, filesLimit: FILE_PAGE_SIZE })
+    if (files) set({ files, filesLimit: limit })
   },
 
   loadMoreFiles: async () => {
-    const current = get().files.length
-    const nextLimit = current + FILE_PAGE_SIZE
-    const files = await safe(
-      () => ipc(() => window.topensync?.listFiles({ limit: nextLimit })),
+    /*
+     * 真正的分页追加：只取**接下来**那一段，拼到已有列表后面。
+     *
+     * 以前是「把 limit 加大再重拉一遍」——点第一次拉五千行，
+     * 第二次拉一万行（其中五千行已经拿过了），第三次一万五……
+     * 点到第六万行总共要传三十九万行，平方级浪费。
+     */
+    const offset = get().files.length
+    const more = await safe(
+      () => ipc(() => window.topensync?.listFiles({ limit: FILE_PAGE_SIZE, offset })),
       null,
       '加载更多文件'
     )
-    if (files) set({ files, filesLimit: nextLimit })
+    if (!more || more.length === 0) return
+    set((s) => ({ files: s.files.concat(more), filesLimit: s.files.length + more.length }))
   },
 
   refreshDiffs: async () => {
@@ -500,33 +568,99 @@ function ipc<T>(fn: (() => Promise<T> | undefined) | undefined): Promise<T | nul
 /**
  * 清单刷新的节流器。
  *
- * 为什么要节流：扫描结束、上传完成都是**高频事件**——
- * 一批 500 个文件传完就是 500 条 transfer:update。
- * 每条都去拉一次 2000 行的清单，渲染进程会被自己压死。
+ * 两个目的：
  *
- * 为什么需要它（不只是性能）：
- * `scan:update` 是在**扫描结束的瞬间**推的，那时文件往往还在上传队列里
- * 排队，files 表里一行都还没有。这时候去拉清单必然拉回空表——
- * 而扫描事件之后不会再有第二次，于是清单页就一直空着。
- * 上传完成才是 files 表真正有内容的时刻，所以那才是该刷新的时机。
+ * 1. **性能**：上传完成是高频事件，一批几百个文件就是几百条任务推送。
+ *    每条都拉一次几千行的清单，渲染进程会被自己压死。
+ *
+ * 2. **别把刷新饿死**。这里原来是防抖（每次事件都重置计时器）——
+ *    扫描六万个文件时事件每 80ms 就来一批，计时器**永远等不到**
+ *    那 400ms 的静默期，于是扫描全程清单页一次都不刷新。
+ *    用户看到的是一直不动的旧列表，以为程序没在干活。
+ *    改成节流：最多 1 秒刷一次，首次立刻刷，最后一次补刷。
+ *
+ * 首次立刻刷的意义：`scan:update` 是在扫描结束的瞬间推的，
+ * 那时文件往往还在上传队列里排队，files 表里一行都没有。
+ * 立刻刷会拿到空表，但 1 秒后的补刷会拿到真实数据——
+ * 两条一起才既有反馈又不会停在空表上。
  */
+const FILES_REFRESH_MIN_MS = 1000
 let filesRefreshTimer: number | null = null
+let filesRefreshAt = 0
 
 function scheduleFilesRefresh(get: () => AppState): void {
-  if (filesRefreshTimer !== null) window.clearTimeout(filesRefreshTimer)
-  filesRefreshTimer = window.setTimeout(() => {
+  const run = (): void => {
     filesRefreshTimer = null
+    filesRefreshAt = Date.now()
     // 后台刷新没有调用方接 promise，失败必须在这里收口
     void safe(() => get().refreshFiles(), undefined, '刷新文件清单')
+  }
+
+  const since = Date.now() - filesRefreshAt
+  if (since >= FILES_REFRESH_MIN_MS) {
+    run()
+    return
+  }
+  // 冷却期内：只挂一个补刷，不重置（重置就又变成防抖了）
+  if (filesRefreshTimer !== null) return
+  filesRefreshTimer = window.setTimeout(run, FILES_REFRESH_MIN_MS - since)
+}
+
+/**
+ * 统计刷新的节流器。
+ *
+ * 为什么需要：主进程的 `transfer:batch` 与 `scan:progress` 都是高频事件。
+ * 每收到一条就 `refreshStats()` 意味着一次 IPC 往返 + 主进程
+ * 一次 `countByState()` 全表聚合 + 一次差异列表查询。
+ *
+ * 扫描六万个文件时，即使任务推送已经攒批（80ms 一次），
+ * 进度推送仍在以 120ms 的频率触发统计刷新——
+ * 不节流的话这条链路会持续占用主进程。
+ *
+ * 数字晚 400ms 更新，用户完全感知不到；但主进程的负载降一个量级。
+ */
+let statsRefreshTimer: number | null = null
+
+function scheduleStatsRefresh(get: () => AppState): void {
+  if (statsRefreshTimer !== null) return
+  statsRefreshTimer = window.setTimeout(() => {
+    statsRefreshTimer = null
+    // 后台刷新没有调用方接 promise，失败必须在这里收口
+    void safe(() => get().refreshStats(), undefined, '刷新统计')
   }, 400)
 }
 
-/** 单个任务状态变化后，重算该状态的任务数 */
-function countBy(
-  tasks: TransferTask[],
-  changed: TransferTask,
-  state: TransferTask['state']
-): number {
-  const others = tasks.filter((t) => t.id !== changed.id)
-  return [...others, changed].filter((t) => t.state === state).length
+/** 任务的终态：这些状态一出现，清单里的那条记录也定了 */
+function isTerminalState(state: TransferTask['state']): boolean {
+  return state === 'done' || state === 'failed' || state === 'skipped' || state === 'canceled'
+}
+
+/**
+ * 把一批任务变更合进现有数组。
+ *
+ * 一次遍历建索引、一次遍历合并，整批只扫两遍——
+ * 而不是「每个任务都 filter 一遍全表」。
+ *
+ * 顺序说明：新任务追加到末尾（与主进程的创建序一致），
+ * 已有任务就地替换（保持它在列表里的位置）。
+ */
+function mergeTaskBatch(tasks: TransferTask[], batch: TaskBatch): TransferTask[] {
+  let base = tasks
+  if (batch.removed.length > 0) {
+    const drop = new Set(batch.removed)
+    base = tasks.filter((t) => !drop.has(t.id))
+  }
+  if (batch.upserts.length === 0) return base
+
+  const index = new Map<string, number>()
+  for (let i = 0; i < base.length; i++) index.set(base[i].id, i)
+
+  const out = base.slice()
+  const added: TransferTask[] = []
+  for (const t of batch.upserts) {
+    const at = index.get(t.id)
+    if (at === undefined) added.push(t)
+    else out[at] = t
+  }
+  return added.length > 0 ? out.concat(added) : out
 }

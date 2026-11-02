@@ -5,7 +5,7 @@ import { BatchBar } from '../components/BatchBar'
 import { VirtualTable } from '../components/VirtualTable'
 import type { PageKey } from '../App'
 import type { DeepVerifyResult, DiffKind, DiffResolution } from '@shared/types'
-import { formatSize } from './Queue'
+import { formatSize } from '../format'
 import { useAppStore } from '../store'
 
 /**
@@ -72,6 +72,8 @@ function RemotePath({
 export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void }): React.JSX.Element {
   const files = useAppStore((s) => s.files)
   const filesLimit = useAppStore((s) => s.filesLimit)
+  /** 还有没加载出来的行（分页未到底） */
+  const truncated = filesLimit > 0 && files.length >= filesLimit
   const loadMoreFiles = useAppStore((s) => s.loadMoreFiles)
   const diffs = useAppStore((s) => s.diffs)
   const config = useAppStore((s) => s.config)
@@ -98,6 +100,26 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
   const [verifyFilter, setVerifyFilter] = useState<VerifyFilter>('all')
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [verifyResult, setVerifyResult] = useState<DeepVerifyResult | null>(null)
+
+  /*
+   * 换筛选条件就清空勾选。
+   *
+   * 不清的话会出这种事故：在「仅大小」下筛出 3 个文件 → 全选 →
+   * 切到「已同步」（几千行）→ 点表头全选 → 删除。
+   * 此时勾选集合里同时有那 3 个弱认定文件与几千个已同步文件，
+   * 而**屏幕上只看得到后者**——一删就把看不见的文件也删了。
+   *
+   * 清单页是数据删除的入口，宁可让用户重新勾一次，
+   * 也不能让「我看得见的这些」与「实际会被删的那些」不一致。
+   */
+  const firstFilterRun = React.useRef(true)
+  React.useEffect(() => {
+    if (firstFilterRun.current) {
+      firstFilterRun.current = false
+      return
+    }
+    setSelected(new Set())
+  }, [statusFilter, diffFilter, verifyFilter])
 
   // 本地路径 → 对账差异类型。一个文件可能同时「已同步」且「远端缺失」，
   // 两个维度必须分开呈现，绿色不能掩盖琥珀色。
@@ -175,13 +197,25 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
    * 本地表的行会被远端表的勾选误勾上，然后被「删除本地文件」批量删掉。
    * 加前缀后两种 ID 永不相撞。
    */
+  /**
+   * 当前**可见**（筛选后）行的本地路径集合。
+   *
+   * 用它来收窄勾选集合与删除目标，而不是 `files`（全部已加载行）。
+   * 差别就是「删我看到的这些」还是「删我曾经勾过的那些」——
+   * 后者在切换筛选后会把屏幕上看不见的文件一起删掉。
+   *
+   * 同时它替代了原来的 `files.some(...)` 写法：后者是
+   * 「对每个已选项扫一遍整个清单」，选中一万个文件时是平方级。
+   */
+  const localPathSet = useMemo(() => new Set(shown.map((f) => f.localPath)), [shown])
+
   const selectedPaths = useMemo(
     () =>
       [...selected]
         .filter((id) => id.startsWith(LOCAL_ID_PREFIX))
         .map((id) => id.slice(LOCAL_ID_PREFIX.length))
-        .filter((p) => files.some((f) => f.localPath === p)),
-    [selected, files]
+        .filter((p) => localPathSet.has(p)),
+    [selected, localPathSet]
   )
 
   /** 远端根目录：用来把远端绝对路径拆成「根 + 相对路径」 */
@@ -203,10 +237,51 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
     [remoteOnly]
   )
 
-  const allLocalSelected = localIds.length > 0 && localIds.every((id) => selected.has(id))
-  const someLocalSelected = localIds.some((id) => selected.has(id))
-  const allRemoteSelected = remoteIds.length > 0 && remoteIds.every((id) => selected.has(id))
-  const someRemoteSelected = remoteIds.some((id) => selected.has(id))
+  /** 当前可见的全部候选 id（本地 + 远端独有） */
+  const visibleIds = useMemo(() => [...localIds, ...remoteIds], [localIds, remoteIds])
+
+  /**
+   * 收窄到「可见」的勾选集合。
+   *
+   * 勾选集合里可能残留已不在当前筛选里的 id（后台刷新让某行换了状态、
+   * 或刚被删掉）。批量操作的按钮文案与实际目标必须一致，
+   * 所以这里先求交再交给批量条。
+   */
+  const visibleSelected = useMemo(() => {
+    const allowed = new Set(visibleIds)
+    const out = new Set<string>()
+    for (const id of selected) if (allowed.has(id)) out.add(id)
+    return out
+  }, [selected, visibleIds])
+
+  /*
+   * 全选/半选状态。
+   *
+   * 必须记忆化：六万条时 `every` + `some` 各扫一遍，
+   * 每次渲染（含滚动、悬停、任何 setState）都要重算两遍，白白卡帧。
+   */
+  const { allLocalSelected, someLocalSelected } = useMemo(() => {
+    let all = localIds.length > 0
+    let some = false
+    for (const id of localIds) {
+      if (selected.has(id)) some = true
+      else all = false
+      // 两个结论都定了就不用再扫
+      if (some && !all) break
+    }
+    return { allLocalSelected: all, someLocalSelected: some }
+  }, [localIds, selected])
+
+  const { allRemoteSelected, someRemoteSelected } = useMemo(() => {
+    let all = remoteIds.length > 0
+    let some = false
+    for (const id of remoteIds) {
+      if (selected.has(id)) some = true
+      else all = false
+      if (some && !all) break
+    }
+    return { allRemoteSelected: all, someRemoteSelected: some }
+  }, [remoteIds, selected])
 
   const toggleSelectAllLocal = (): void => {
     const next = new Set(selected)
@@ -455,11 +530,15 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
             本地文件
           </h2>
           <span className="muted">
-            同步目录内受管的文件，共 {shown.length} 个
-            {files.length >= filesLimit && filesLimit > 0 && (
-              <>（已加载前 {files.length} 条）</>
-            )}
-             —— 路径均相对本地同步目录
+            {/*
+             * 分页加载时不能说「共 N 个」——那个数只是**已加载**的行数，
+             * 用户会以为清单里就这么多文件。说清是「当前显示」，
+             * 并指出还能继续加载。
+             */}
+            {truncated
+              ? `当前显示 ${shown.length} 条（已加载 ${files.length} 条，还有更多）`
+              : `同步目录内受管的文件，共 ${shown.length} 个`}
+            {' —— '}路径均相对本地同步目录
           </span>
         </div>
         <VirtualTable
@@ -619,18 +698,19 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
         </div>
       )}
 
+      {/*
+       * 候选全集 = 当前筛选后可见的本地文件 + 全部远端独有文件。
+       *
+       * 勾选集合也按这个全集收窄后传下去：
+       * 界面上的「已选 N 项」和实际会被操作的必须一致。
+       * 否则会出现「只看得见 3 行，提示却说选了 5000 项」——
+       * 用户点删除，删掉的是自己根本看不见的文件。
+       */}
       <BatchBar
-        allIds={[
-          // 候选全集 = 当前筛选后可见的本地文件 + 全部远端独有文件。
-          // 以前这里传的是「已选的本地路径 + 全部远端项」——
-          // 也就是说点「全选」时本地文件一个都没被选中，
-          // 因为 selectedPaths 是从已选集合反推出来的。
-          ...shown.map((f) => `${LOCAL_ID_PREFIX}${f.localPath}`),
-          ...remoteOnly.map((d) => `${REMOTE_ID_PREFIX}${d.remotePath}`)
-        ]}
-        selected={selected}
+        allIds={visibleIds}
+        selected={visibleSelected}
         onSelectionChange={setSelected}
-        hint={`已选 ${selected.size} 项`}
+        hint={`已选 ${visibleSelected.size} 项`}
         actions={[
           {
             label: '删除本地文件',
@@ -643,7 +723,9 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
               const paths = ids
                 .filter((id) => id.startsWith(LOCAL_ID_PREFIX))
                 .map((id) => id.slice(LOCAL_ID_PREFIX.length))
-                .filter((p) => files.some((f) => f.localPath === p))
+                // 用 Set 而不是 files.some(...)：后者对每个选中项
+                // 都要扫一遍整个清单，六万条时是平方级开销
+                .filter((p) => localPathSet.has(p))
               if (paths.length === 0) return
               await deleteLocalFiles(paths)
             }
@@ -656,8 +738,12 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
             onRun: async (ids) => {
               // 用传进来的 ids（本次实际选中的）而不是 selectedRemotePaths，
               // 这样用户在确认弹窗期间改了勾选也不会删错。
+              //
+              // ids 先转成 Set：原来用 `ids.includes(...)` 是「对每个远端项
+              // 扫一遍选中数组」，选中几千个时就是平方级。
+              const idSet = new Set(ids)
               const targets = remoteOnly
-                .filter((d) => ids.includes(`${REMOTE_ID_PREFIX}${d.remotePath}`))
+                .filter((d) => idSet.has(`${REMOTE_ID_PREFIX}${d.remotePath}`))
                 .map((d) => ({ remotePath: d.remotePath, diffId: d.id }))
               if (targets.length === 0) return
               await deleteRemoteFiles(targets)
@@ -681,7 +767,9 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
               const paths = ids
                 .filter((id) => id.startsWith(LOCAL_ID_PREFIX))
                 .map((id) => id.slice(LOCAL_ID_PREFIX.length))
-                .filter((p) => files.some((f) => f.localPath === p))
+                // 用 Set 而不是 files.some(...)：后者对每个选中项
+                // 都要扫一遍整个清单，六万条时是平方级开销
+                .filter((p) => localPathSet.has(p))
               if (paths.length === 0) return
               setVerifyResult(await verifyRemoteFiles(paths))
             }
