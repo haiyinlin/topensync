@@ -77,8 +77,12 @@ const DIFF_BATCH_MAX = 200
  * 「开始同步」后本地首轮遍历可能要几十秒（整块盘六万文件），
  * 对账要等它跑完再起，但**不能无限等**：盘卡住时对账永远不跑，
  * 用户根本不知道发生了什么。超时就照常开跑，靠 isBusy 让路。
+ *
+ * 整块盘 / 网络盘上首轮遍历本身就可能要五到十分钟（SMB 上 stat
+ * 约 200 文件/秒），所以上限给到 15 分钟——低于这个数，
+ * 「等本地扫完再对账」这条规则在整盘场景里会直接失效。
  */
-const WARMUP_MAX_WAIT_MS = 5 * 60_000
+const WARMUP_MAX_WAIT_MS = 15 * 60_000
 /** 首轮扫描完成后，再等上传队列安静多久（超出就照常对账） */
 const WARMUP_SETTLE_MS = 30_000
 
@@ -266,7 +270,7 @@ export class Engine {
    * 整盘 / 网络盘上 fs.watch 建不起来时会降级（见 watcher 的 WatchMode）。
    * 必须让界面知道：否则用户改完文件等不到同步，会以为同步坏了。
    */
-  private watchMode: 'watch' | 'poll' = 'watch'
+  private watchMode: 'watch' | 'native' | 'poll' = 'watch'
   /**
    * 是否已经开始同步。
    *
@@ -776,26 +780,25 @@ export class Engine {
      * 挑一个具体目录（哪怕是个大目录）比整块盘稳得多。
      */
     /*
-     * 整盘根目录**直接**用定时比对，不去试实时监听。
+     * 整块盘根目录：用**整树单句柄监听**，不再退化成定时比对。
      *
-     * 不是保守，是实测结论：`fs.watch` 是每个目录一个句柄，
-     * 整块盘上万个目录，chokidar 在遍历阶段就成片报
-     * `EMFILE: too many open files, watch 'Z:\...'` 与 `scandir 'Z:\...'`——
-     * 连一个 watch 都没建成，等于完全没有监控，而界面上显示「正在监控」。
-     * 用户改了文件永远同步不上去，日志里只有几百条看不懂的 EMFILE。
+     * 以前的结论是「整盘实时监听做不到」——那个结论只对 chokidar 成立：
+     * 它给每个目录各开一个 ReadDirectoryChangesW，上万个目录必然
+     * `EMFILE`。但 Win32 的同一个 API 支持 `bWatchSubtree = TRUE`：
+     * **一个句柄看整棵树**，新建的子目录自动包含。
+     * Node 把它暴露成 `fs.watch(root, { recursive: true })`，
+     * 实测对整块 SMB 映射盘：建监听 14 ms，普通改动 100% 收到事件。
      *
-     * 直接走定时比对：不稳定但**确实在工作**，最多延迟一轮比对时间。
-     * 子目录（哪怕很大）仍然走实时监听——那里句柄通常够用。
+     * 代价是突发变更会丢事件（系统缓冲溢出，静默丢弃），
+     * 所以 native 模式自带「突发后局部/全树比对」兜底，见 Watcher 的说明。
      */
     const isDriveRoot = /^[A-Za-z]:[\\/]?$/.test(root)
     if (isDriveRoot) {
       this.pushLog(
-        'warn',
+        'info',
         `同步根是整块盘的根目录（${root.toUpperCase()}）：` +
-          '实时监听需要为每个目录占一个文件句柄，整盘规模下建不起来，' +
-          '已改用定时比对（文件改动最多延迟一轮比对被发现）。' +
-          '想要秒级同步，请把同步目录改成具体的子目录（例如 Z:\\download）。',
-        { category: 'system' }
+          '已启用整树单句柄监听（实时）。' +
+          `大批量拷贝时系统会丢一部分变更事件，最多 ${this.config.watchSafetyScanMinutes} 分钟后由兜底比对补齐。`
       )
     }
     this.watcher?.stop()
@@ -805,7 +808,36 @@ export class Engine {
       this.watcher = new Watcher({
         root,
         exclude: this.config.exclude,
-        forcePolling: isDriveRoot,
+        safetyScanMs: Math.max(0, this.config.watchSafetyScanMinutes) * 60_000,
+        /*
+         * 首轮全树遍历的进度。
+         *
+         * 整块盘要五到十分钟，期间必须让界面看到「已扫描 N 个文件」，
+         * 否则用户面对的是一个十分钟不动的界面。
+         */
+        onProgress: (done) => {
+          this.localScannedCount = done
+          this.pushProgress({
+            kind: 'local',
+            running: true,
+            done,
+            total: null,
+            detail: `正在遍历本地目录 · 已扫描 ${done} 个文件`
+          })
+        },
+        /* 一轮遍历结束 → 必须推终态，否则进度条永远挂着 */
+        onScanEnd: (count, initial) => {
+          this.localScannedCount = count
+          this.pushProgress({
+            kind: 'local',
+            running: false,
+            done: count,
+            total: null,
+            detail: initial
+              ? `本地扫描完成，共 ${count} 个文件`
+              : `本地比对完成，共 ${count} 个文件`
+          })
+        },
         onEvent: (e: WatchEvent) => {
           /*
            * 返回 promise，而不是 void。
@@ -862,16 +894,29 @@ export class Engine {
          * fs.watch 根本建不起来，以前的表现是界面显示「正在监控」，
          * 实际一条事件都收不到，文件改了永远同步不上去。
          */
-        onModeChange: (mode) => {
+        onModeChange: (mode, reason) => {
           this.watchMode = mode
           if (mode === 'poll') {
             // 降级后不是错误状态：监控在工作，只是粒度不同
             this.watcherError = null
             this.pushLog(
               'warn',
-              '实时监听不可用，已切换为定时比对：文件改动会在下一轮比对时被发现（默认 5 分钟一次）',
+              `实时监听不可用（${reason}），已切换为定时比对：` +
+                '文件改动会在下一轮比对时被发现。如需要秒级同步，请把同步目录改成一个子目录（例如 Z:////download）。',
               { category: 'system' }
             )
+            return
+          }
+          if (mode === 'native') {
+            this.pushLog('info', '已启用整树单句柄监听（实时）：整块盘也只需要一个文件句柄', {
+              category: 'system'
+            })
+            return
+          }
+          if (mode === 'watch') {
+            this.pushLog('warn', `原生整树监听不可用（${reason}），已退回逐目录监听`, {
+              category: 'system'
+            })
           }
         }
       })

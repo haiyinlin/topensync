@@ -212,8 +212,21 @@ export function isOpenListTempMarker(name: string): boolean {
  */
 const IGNORED_SEGMENTS = new Set([
   'node_modules',
+  // Windows 的回收站与系统目录
   '$RECYCLE.BIN',
-  'System Volume Information'
+  'System Volume Information',
+  /*
+   * NAS 的系统目录。
+   *
+   * 整盘同步（用户真的会这么配）时不排除这几个，程序会去备份
+   * 回收站和缩略图索引——群晖的 `#recycle` 常常比用户数据还大，
+   * 而且每天在变，等于永远同步不完。
+   */
+  '#recycle',
+  '#snapshot',
+  '#@Recycle',
+  '@eaDir',
+  'lost+found'
 ])
 
 export function hasIgnoredSegment(rel: string): boolean {

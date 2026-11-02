@@ -21,6 +21,22 @@ import type { AppConfig } from '../src/shared/types'
  *   3. 差异**批量推送**，且统计不再读整张差异表（单次数量太多）
  */
 
+/** 轮询等待一个条件成立（真实监听只能这样等，不能靠固定 sleep） */
+function waitFor(fn: () => boolean, ms: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const t0 = Date.now()
+    const timer = setInterval(() => {
+      if (fn()) {
+        clearInterval(timer)
+        resolve(true)
+      } else if (Date.now() - t0 > ms) {
+        clearInterval(timer)
+        resolve(false)
+      }
+    }, 100)
+  })
+}
+
 // ── Watcher：轮询模式 ──────────────────────────────────
 
 describe('Watcher 的定时比对模式（实时监听不可用时的降级）', () => {
@@ -118,6 +134,8 @@ describe('Watcher 的定时比对模式（实时监听不可用时的降级）',
     watcher = new Watcher({
       root,
       exclude: [],
+      // chokidar 的句柄错误只在这个模式出现（native 是单句柄）
+      mode: 'watch',
       onEvent: () => undefined,
       onModeChange: (mode) => modes.push(mode),
       onLog: (_level, msg) => logs.push(msg)
@@ -145,6 +163,92 @@ describe('Watcher 的定时比对模式（实时监听不可用时的降级）',
     expect(logs.some((m) => m.includes('已切换为定时比对'))).toBe(true)
     // 前置的报错不刷屏：同一类错误最多记几条
     expect(logs.filter((m) => m.startsWith('监控出错')).length).toBeLessThanOrEqual(3)
+  })
+})
+
+// ── Watcher：原生整树单句柄监听（native）────────────────
+
+describe('整树单句柄监听（native）', () => {
+  let dir: string
+  let root: string
+  let events: WatchEvent[]
+  let watcher: Watcher | null
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'topensync-native-'))
+    root = join(dir, 'sync')
+    mkdirSync(root, { recursive: true })
+    events = []
+    watcher = null
+  })
+
+  afterEach(() => {
+    watcher?.stop()
+    watcher = null
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('Windows 上默认走 native，而不是逐目录监听', () => {
+    watcher = new Watcher({ root, exclude: [], onEvent: () => undefined })
+    expect(watcher.watchMode).toBe(process.platform === 'win32' ? 'native' : 'watch')
+  })
+
+  it('初始扫描 + 改动 / 新建 / 删除都能收到事件', async () => {
+    mkdirSync(join(root, 'sub'), { recursive: true })
+    writeFileSync(join(root, 'a.txt'), 'a')
+    writeFileSync(join(root, 'sub', 'c.txt'), 'c')
+
+    let readyCount = -1
+    watcher = new Watcher({
+      root,
+      exclude: [],
+      mode: 'native',
+      onEvent: (e) => events.push(e),
+      onReady: (n) => {
+        readyCount = n
+      }
+    })
+    watcher.start()
+
+    expect(await waitFor(() => readyCount >= 0, 20_000)).toBe(true)
+    expect(readyCount).toBe(2)
+    expect(watcher.isWatching).toBe(true)
+
+    // 改动
+    events.length = 0
+    writeFileSync(join(root, 'a.txt'), 'changed-content')
+    expect(await waitFor(() => events.some((e) => e.relPath === 'a.txt'), 15_000)).toBe(true)
+
+    // 新建目录 + 文件（递归监听要能自动覆盖新目录）
+    events.length = 0
+    mkdirSync(join(root, 'new', 'deep'), { recursive: true })
+    writeFileSync(join(root, 'new', 'deep', 'n.txt'), 'n')
+    expect(
+      await waitFor(() => events.some((e) => e.relPath === 'new/deep/n.txt'), 15_000)
+    ).toBe(true)
+
+    // 删除
+    events.length = 0
+    rmSync(join(root, 'sub', 'c.txt'))
+    expect(
+      await waitFor(
+        () => events.some((e) => e.relPath === 'sub/c.txt' && e.type === 'remove'),
+        15_000
+      )
+    ).toBe(true)
+  }, 120_000)
+
+  it('突发计数超过阈值时，记下涉及的顶层目录并安排一次补扫', () => {
+    watcher = new Watcher({ root, exclude: [], mode: 'native', onEvent: () => undefined })
+    const w = watcher as unknown as {
+      trackBurst: (rel: string) => void
+      burstDirs: Set<string>
+      burstTimer: unknown
+    }
+    // 阈值 120 条/秒：拷一个大目录进来就会跨过
+    for (let i = 0; i < 150; i++) w.trackBurst(`新目录/子目录/f${i}.jpg`)
+    expect([...w.burstDirs]).toEqual(['新目录'])
+    expect(w.burstTimer).not.toBeNull()
   })
 })
 

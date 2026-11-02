@@ -357,6 +357,20 @@ export interface AppConfig {
    * 因此只对不超过此值的文件做深度校验，其余退化为大小校验。
    */
   verifyHashMaxBytes: number
+  /**
+   * 本地兜底比对的间隔（分钟），`0` 表示关闭。
+   *
+   * 为什么需要它：整块盘 / 网络盘上只能用「一个句柄监听整棵树」
+   * （Windows 的 ReadDirectoryChangesW 递归通知）。这种监听在**突发写入**
+   * 时会被系统丢事件（缓冲溢出，不报错、不重发）——实测拷 1500 个文件
+   * 只收到 1 条事件。所以必须有一轮「遍历磁盘、按 size+mtime 比对」的
+   * 兜底扫描把漏掉的变更补回来。
+   *
+   * 默认 30 分钟：实测这块 SMB 盘全树 stat 约 200 文件/秒
+   * （6 万文件 ≈ 5 分钟），跑太密会长期占着网络与主线程。
+   * 改成 0 就只依赖实时监听（大量拷贝后可能漏文件）。
+   */
+  watchSafetyScanMinutes: number
 }
 
 // ── 主进程 → 渲染进程 的 IPC 通道 ───────────────────────────────
@@ -550,7 +564,7 @@ export interface AppStats {
      *
      * 界面必须把这两种说清楚：模式不同，用户对「多久同步」的预期完全不同。
      */
-    mode?: 'watch' | 'poll'
+    mode?: 'watch' | 'native' | 'poll'
   }
   /** 远端对账通道状态 */
   remoteScan: {

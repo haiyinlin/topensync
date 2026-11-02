@@ -105,7 +105,10 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
                      * 定时比对：整盘 / 网络盘上实时监听建不起来时的模式。
                      * 必须说清楚，否则用户改完文件等不到同步会以为坏了。
                      */
-                    <span className="ch-state" title="实时监听需要为每个目录占一个文件句柄，整盘规模下建不起来">
+                    <span
+                      className="ch-state"
+                      title="实时监听在此盘上不可用（句柄不足），已改为定时遍历比对"
+                    >
                       <i className="pulse" />
                       定时比对中
                     </span>

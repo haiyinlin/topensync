@@ -33,6 +33,8 @@ export const DEFAULT_CONFIG: AppConfig = {
   exclude: ['**/node_modules/**', '**/.git/**', '**/*.tmp', '~$*'],
   verifyMode: 'size',
   verifyHashMaxBytes: 64 * 1024 * 1024,
+  // 整盘 / 网络盘上实时监听会丢事件，靠这一轮全树比对补回来（0 表示关闭）
+  watchSafetyScanMinutes: 30,
   quarkMaxFileBytes: 20 * 1024 * 1024 * 1024,
   syncEmptyDirs: false,
   detectRenames: true,
