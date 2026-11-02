@@ -2,6 +2,8 @@
   "name": "topensync",
   "version": "0.1.0",
   "description": "Windows 桌面同步程序：本地目录 → OpenList → 夸克网盘",
+  "author": "haiyinlin",
+  "license": "MIT",
   "private": true,
   "main": "./out/main/index.js",
   "engines": {
@@ -16,13 +18,16 @@
     "format": "prettier --write \"src/**/*.{ts,tsx}\"",
     "test": "vitest run",
     "test:watch": "vitest",
-    "package": "npm run build && electron-builder"
+    "package": "npm run build && electron-builder --win --x64",
+    "icon": "electron scripts/make-ico.cjs",
+    "verify:package": "electron scripts/verify-package.cjs"
   },
   "dependencies": {
     "chokidar": "^4.0.3",
     "minimatch": "^10.2.6",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "undici": "^6.29.1",
     "zustand": "^5.0.3"
   },
   "devDependencies": {
@@ -53,7 +58,8 @@
     "win": {
       "target": [
         "nsis"
-      ]
+      ],
+      "icon": "resources/icon.ico"
     },
     "nsis": {
       "oneClick": false,
