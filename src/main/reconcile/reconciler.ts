@@ -7,6 +7,7 @@ import {
   joinRemote as joinRemotePath
 } from '../watcher/paths'
 import { join } from 'path'
+import { tick } from '../io/tick'
 import type { AppConfig, DiffEntry, DiffKind, ScanKind, ScanTrigger } from '@shared/types'
 
 /**
@@ -105,7 +106,24 @@ export interface ReconcilerOptions {
    * @returns 本地不存在时返回 null；存在时返回 { size, mtimeMs }
    */
   probeLocal?: (relPath: string) => { size: number; mtimeMs: number } | null
+  /**
+   * 「现在忙不忙」的探针。
+   *
+   * 对账和同步会同时跑（用户点完「开始同步」再点「对账远端」）。
+   * 对账本身是**纯 CPU + SQLite** 的循环，一旦它把主线程占满，
+   * 同步那边的事件处理、上传进度回报、界面点击全都被排到后面——
+   * 用户看到的就是「一开对账整个程序就卡住」。
+   *
+   * 返回 true 时对账会在分片之间多睡一会儿，把主线程让给同步。
+   * 这是「后台任务」应有的礼貌，而不是限速。
+   */
+  isBusy?: () => boolean
 }
+
+/** 一个目录里最多连续写多少条快照就让出一次事件循环 */
+const ENTRY_CHUNK = 200
+/** 忙时的额外让路时长 */
+const BUSY_YIELD_MS = 40
 
 export interface ReconcileResult {
   scanId: number
@@ -136,12 +154,28 @@ export class Reconciler {
 
   constructor(private readonly opts: ReconcilerOptions) {}
 
-  /** 按配置的周期启动定时对账 */
-  start(): void {
+  /**
+   * 按配置的周期启动定时对账。
+   *
+   * @param opts.deferStartup 为 true 时**不**立刻跑「启动即对账」那一轮，
+   *   只排定时器。调用方（Engine）会在本地首轮扫描与上传队列都安静下来
+   *   之后自己调 `runStartup()`。
+   *
+   *   为什么必须能延后：点「开始同步」的瞬间，本地正在遍历整棵目录树
+   *   （几万次 stat + 事件处理 + 写库），对账同时挂着整套远端遍历与
+   *   差异比对——两边抢同一个主线程和同一个 SQLite 连接，
+   *   结果就是界面完全失去响应。分开跑，总耗时几乎不变，但界面一直是活的。
+   */
+  start(opts: { deferStartup?: boolean } = {}): void {
     const { enabled, intervalHours, onStartup } = this.currentConfig().remoteScan
     if (!enabled) return
+    // 重复调用（改配置后重建实例之外的情况）不该排出两个定时器
+    if (this.timer) {
+      clearInterval(this.timer)
+      this.timer = null
+    }
 
-    if (onStartup) {
+    if (onStartup && !opts.deferStartup) {
       // 异步执行，不阻塞启动
       void this.run('startup').catch(() => undefined)
     }
@@ -151,6 +185,19 @@ export class Reconciler {
       void this.run('timer').catch(() => undefined)
     }, ms)
     this.timer.unref?.()
+  }
+
+  /**
+   * 跑一轮「启动即对账」。
+   *
+   * 由 Engine 在预热结束后调用（见 start 的 deferStartup）。
+   * 已在跑时直接复用，不抛「对账已在进行中」——这条路径是内部触发的，
+   * 抛错只会在日志里留下一句没人能处理的异常。
+   */
+  async runStartup(): Promise<ReconcileResult | null> {
+    if (this.running) return null
+    if (!this.currentConfig().remoteScan.onStartup) return null
+    return this.run('startup')
   }
 
   stop(): void {
@@ -229,7 +276,7 @@ export class Reconciler {
           inFlight.add(dir)
 
           void this.listDir(dir, config.remoteScan.refresh)
-            .then((entries) => {
+            .then(async (entries) => {
               scannedDirs++
 
               // 空列表但本地清单说这里有文件 → 结果不可信
@@ -243,38 +290,60 @@ export class Reconciler {
                 return
               }
 
-              for (const entry of entries) {
+              /*
+               * 一个目录里可能有几千个条目（用户把整个盘根设成远端根时尤其常见）。
+               *
+               * 以前这里是一个纯同步的 for 循环，每个文件一次
+               * `upsertRemoteSnapshot`（同步 SQLite 写）。三千个条目就是
+               * 三千次同步写，期间主线程**完全不动**——所有点击、
+               * 上传进度回报、哈希回调都排在后面。
+               *
+               * 现在按 ENTRY_CHUNK 分片，每片之后让出一次事件循环。
+               * 总耗时不变，但界面全程可交互。
+               */
+              const ingestStart = scannedFiles
+              for (let i = 0; i < entries.length; i++) {
+                const entry = entries[i]
                 const full = joinRemote(root, dir, entry.name)
                 if (entry.isDir) {
                   // 跳过排除目录（回收站等）——不进队列，其下内容也不会被遍历
                   if (isExcluded(full, config)) continue
                   queue.push(full)
-                } else {
-                  // 文件也要过排除规则：形如 `**/.DS_Store` 的规则匹配的是文件
-                  if (isExcluded(full, config)) continue
-                  /*
-                   * OpenList 覆盖上传的内部标记文件。
-                   *
-                   * `xxx.openlist_to_delete` 是服务端覆盖过程中的中间态，
-                   * 不是用户的文件。留着它会凭空多出一条「仅远端存在」差异，
-                   * 路径还带个怪后缀——用户点「下载到本地」会下载出
-                   * 一个叫 `数据.csv.openlist_to_delete` 的文件。
-                   */
-                  if (isOpenListTempMarker(entry.name)) {
-                    manifest.log('warn', `忽略 OpenList 临时标记文件：${full}`)
-                    continue
-                  }
-                  scannedFiles++
-                  remoteFiles.set(full, entry)
-                  seen.add(full)
-                  manifest.upsertRemoteSnapshot({
-                    remotePath: full,
-                    remoteSize: entry.size,
-                    remoteMtime: parseModified(entry.modified),
-                    isDir: false,
-                    scanId
-                  })
+                  continue
                 }
+                // 文件也要过排除规则：形如 `**/.DS_Store` 的规则匹配的是文件
+                if (isExcluded(full, config)) continue
+                /*
+                 * OpenList 覆盖上传的内部标记文件。
+                 *
+                 * `xxx.openlist_to_delete` 是服务端覆盖过程中的中间态，
+                 * 不是用户的文件。留着它会凭空多出一条「仅远端存在」差异，
+                 * 路径还带个怪后缀——用户点「下载到本地」会下载出
+                 * 一个叫 `数据.csv.openlist_to_delete` 的文件。
+                 */
+                if (isOpenListTempMarker(entry.name)) {
+                  manifest.log('warn', `忽略 OpenList 临时标记文件：${full}`)
+                  continue
+                }
+                scannedFiles++
+                remoteFiles.set(full, entry)
+                seen.add(full)
+                manifest.upsertRemoteSnapshot({
+                  remotePath: full,
+                  remoteSize: entry.size,
+                  remoteMtime: parseModified(entry.modified),
+                  isDir: false,
+                  scanId
+                })
+
+                if ((i + 1) % ENTRY_CHUNK === 0) {
+                  this.opts.onProgress?.({ dirs: scannedDirs, files: scannedFiles })
+                  await this.yieldIfBusy()
+                }
+              }
+              if (scannedFiles === ingestStart) {
+                // 全是目录 / 全被排除：也该让出一次，避免连续几个大目录把主线程连着占住
+                await this.yieldIfBusy()
               }
 
               /*
@@ -312,7 +381,14 @@ export class Reconciler {
       this.opts.onProgress?.({ dirs: scannedDirs, files: scannedFiles })
 
       // 远端有、本地无 → remote_only
-      for (const [remotePath, obj] of remoteFiles) {
+      /*
+       * 比对阶段同样是纯 CPU 循环（几万条 × 查表 + 写差异表），
+       * 全同步跑完会独占主线程十几秒。按片让出，界面保持可交互。
+       */
+      const remoteEntries = [...remoteFiles]
+      for (let i = 0; i < remoteEntries.length; i++) {
+        if (i > 0 && i % ENTRY_CHUNK === 0) await this.yieldIfBusy()
+        const [remotePath, obj] = remoteEntries[i]
         const local = localByRemote.get(remotePath)
         if (!local) {
           /*
@@ -421,7 +497,11 @@ export class Reconciler {
       }
 
       // 本地有、远端无 → missing_remote（最危险的一类）
-      for (const local of localFiles) {
+      for (let i = 0; i < localFiles.length; i++) {
+        // 这一步每条都可能要发一个远端请求（confirmMissing），
+        // 让出的间隔取小一点，别让界面在复核阶段长时间停顿
+        if (i > 0 && i % 50 === 0) await this.yieldIfBusy()
+        const local = localFiles[i]
         if (!local.remotePath) continue
         if (local.state === 'deleted') continue
         if (seen.has(local.remotePath)) continue
@@ -502,6 +582,18 @@ export class Reconciler {
   private async listDir(path: string, refresh: boolean): Promise<RemoteObject[]> {
     const res = await this.opts.client.list(path, { refresh })
     return res.content ?? []
+  }
+
+  /**
+   * 让出主线程一次；同步正在忙时多让一会儿。
+   *
+   * 对账是后台任务，它跑多久不重要，重要的是别把前台卡住。
+   */
+  private async yieldIfBusy(): Promise<void> {
+    await tick()
+    if (this.opts.isBusy?.()) {
+      await new Promise<void>((resolve) => setTimeout(resolve, BUSY_YIELD_MS))
+    }
   }
 
   /**

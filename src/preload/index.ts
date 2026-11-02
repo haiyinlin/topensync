@@ -41,6 +41,8 @@ const api = {
   /** 订阅扫描/对账进度 */
   onScanProgress: (cb: MainToRendererEvents['scan:progress']) => subscribe('scan:progress', cb),
   onDiffUpdate: (cb: MainToRendererEvents['diff:update']) => subscribe('diff:update', cb),
+  /** 订阅差异的批量变更（对账时一批可能上百条，逐条推会卡死界面） */
+  onDiffBatch: (cb: MainToRendererEvents['diff:batch']) => subscribe('diff:batch', cb),
   onConfigUpdate: (cb: MainToRendererEvents['config:update']) => subscribe('config:update', cb),
   /** 订阅日志批量追加 */
   onLogBatch: (cb: MainToRendererEvents['log:batch']) => subscribe('log:batch', cb),

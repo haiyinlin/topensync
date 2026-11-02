@@ -100,10 +100,21 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
               <div className="ch-title">
                 本地扫描
                 {localScan?.watching ? (
-                  <span className="ch-state live">
-                    <i className="pulse" />
-                    实时监控中
-                  </span>
+                  localScan.mode === 'poll' ? (
+                    /*
+                     * 定时比对：整盘 / 网络盘上实时监听建不起来时的模式。
+                     * 必须说清楚，否则用户改完文件等不到同步会以为坏了。
+                     */
+                    <span className="ch-state" title="实时监听需要为每个目录占一个文件句柄，整盘规模下建不起来">
+                      <i className="pulse" />
+                      定时比对中
+                    </span>
+                  ) : (
+                    <span className="ch-state live">
+                      <i className="pulse" />
+                      实时监控中
+                    </span>
+                  )
                 ) : stats?.started ? (
                   <span className="ch-state">未在监控</span>
                 ) : (
@@ -119,7 +130,9 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
                 {localScanning
                   ? progress.local?.detail ?? '正在扫描…'
                   : localScan?.watching
-                    ? `监听本地同步目录 · 已扫描 ${localScan.scannedCount} 个文件`
+                    ? localScan.mode === 'poll'
+                      ? `定时比对本地同步目录（每轮遍历一次）· 已扫描 ${localScan.scannedCount} 个文件`
+                      : `监听本地同步目录 · 已扫描 ${localScan.scannedCount} 个文件`
                     : localScan?.error
                       ? localScan.error
                       : localScan?.root

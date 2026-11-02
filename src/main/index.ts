@@ -87,6 +87,7 @@ app.whenReady().then(() => {
     onScan: (scan) => emit('scan:update', scan),
     onProgress: (progress) => emit('scan:progress', progress),
     onDiff: (diff) => emit('diff:update', diff),
+    onDiffBatch: (diffs) => emit('diff:batch', diffs),
     onConfig: (config) => emit('config:update', config),
     onLogBatch: (entries) => emit('log:batch', entries),
     onConnection: (status) => emit('connection:update', status)

@@ -1093,6 +1093,35 @@ export class Manifest {
   }
 
   /**
+   * 未处置差异的**数量**。
+   *
+   * 为什么不直接用 `listUnresolvedDiffs().length`：那个方法会把整张差异表
+   * 读成对象数组。对账一轮可能产生上万条差异，而 getStats() 是界面
+   * 高频调用的方法（每次任务变更、每次进度跳变都会问一次），
+   * 每次都读一遍全表等于把差异条数变成平方级的开销——
+   * 实测对账跑完后界面整个卡住，原因就在这里。
+   *
+   * COUNT(*) 走索引，代价与条数无关。
+   */
+  countUnresolvedDiffs(): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM diffs
+          WHERE resolved_at IS NULL AND kind != 'mtime_mismatch'`
+      )
+      .get() as { n: number } | undefined
+    return row?.n ?? 0
+  }
+
+  /** 按 id 取一条差异（处置时用，避免为了找一条而读整张表） */
+  getDiff(diffId: number): DiffEntry | null {
+    const row = this.db.prepare('SELECT * FROM diffs WHERE id = ?').get(diffId) as
+      | Record<string, unknown>
+      | undefined
+    return row ? (mapDiffRow(row) as unknown as DiffEntry) : null
+  }
+
+  /**
    * 标记差异为已处置。
    *
    * 返回处置后的完整条目（含 resolvedAt / resolution），

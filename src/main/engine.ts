@@ -61,6 +61,27 @@ const LOG_FLUSH_MS = 150
 /** 攒到这么多条就不等窗口，立刻推 */
 const LOG_BATCH_MAX = 200
 
+/**
+ * 差异推送的攒批窗口与单批上限。
+ *
+ * 150ms 一批：对账时用户看到的是「一片一片冒出来」，视觉上是连续的；
+ * 单批 200 条是为了别让一次 IPC 的序列化把主线程占住——
+ * 一万条差异一次性序列化要几百毫秒，正好卡在界面刷新之前。
+ */
+const DIFF_FLUSH_MS = 150
+const DIFF_BATCH_MAX = 200
+
+/**
+ * 启动预热等待上限。
+ *
+ * 「开始同步」后本地首轮遍历可能要几十秒（整块盘六万文件），
+ * 对账要等它跑完再起，但**不能无限等**：盘卡住时对账永远不跑，
+ * 用户根本不知道发生了什么。超时就照常开跑，靠 isBusy 让路。
+ */
+const WARMUP_MAX_WAIT_MS = 5 * 60_000
+/** 首轮扫描完成后，再等上传队列安静多久（超出就照常对账） */
+const WARMUP_SETTLE_MS = 30_000
+
 /** 速率采样窗口：1 秒内的字节数折算成每秒字节数 */
 const SPEED_WINDOW_MS = 1000
 /** 超过这么久没有新字节，当前速率归零（传输已经停了） */
@@ -100,6 +121,16 @@ export interface EngineEvents {
   onConnection?: (status: ConnectionStatus) => void
   /** 扫描/对账进度变化时推送 */
   onProgress?: (progress: ScanProgress) => void
+  /**
+   * 差异**批量**推送。
+   *
+   * 一轮对账可能一次产生上万条差异。逐条推（以前的做法）意味着
+   * 上万次 IPC + 渲染层上万次数组重建 + 上万次 getStats 往返，
+   * 实测对账跑完界面直接卡死几十秒——用户以为程序挂了。
+   *
+   * 攒批之后推送次数与「批」成正比，与差异条数无关。
+   */
+  onDiffBatch?: (diffs: DiffEntry[]) => void
 }
 
 export class Engine {
@@ -212,6 +243,30 @@ export class Engine {
    */
   private readonly pendingLogs: LogEntry[] = []
   private logFlushTimer: NodeJS.Timeout | null = null
+  /**
+   * 差异攒批缓冲。
+   *
+   * 与日志同理：对账一轮能产出上万条差异，逐条推 IPC 会把渲染层压死。
+   */
+  private readonly pendingDiffs: DiffEntry[] = []
+  private diffFlushTimer: NodeJS.Timeout | null = null
+  /**
+   * 本地首轮扫描完成的通知口。
+   *
+   * 「开始同步」之后，整棵目录树正在被遍历（几万次 stat + 写库）。
+   * 对账要是同时挂上去，两边抢同一个主线程，界面就完全没响应了。
+   * 用一个 promise 让对账「等首轮扫描完再开跑」。
+   *
+   * null 表示当前没有等待者（未开始同步）。
+   */
+  private resolveLocalReady: (() => void) | null = null
+  /**
+   * 实时监听是否已降级为定时比对。
+   *
+   * 整盘 / 网络盘上 fs.watch 建不起来时会降级（见 watcher 的 WatchMode）。
+   * 必须让界面知道：否则用户改完文件等不到同步，会以为同步坏了。
+   */
+  private watchMode: 'watch' | 'poll' = 'watch'
   /**
    * 是否已经开始同步。
    *
@@ -335,6 +390,15 @@ export class Engine {
     // 速率统计的口径是「本次运行」：重新开始时把上一轮的清零
     this.resetSpeedStats()
 
+    /*
+     * 先把「本地首轮扫描完成」的承诺挂上，再起 watcher。
+     *
+     * 对账要等这个承诺才开跑（见 startReconciler）。顺序不能反——
+     * 先起 watcher 的话，onReady 可能在承诺建立之前就触发了，
+     * 对账会一直等下去。
+     */
+    const localReady = this.armLocalReady()
+
     // 本地监控不依赖 OpenList 连接，先起来
     this.startWatcher()
 
@@ -359,7 +423,71 @@ export class Engine {
       this.pushLog('error', `远端对账启动失败：${message}`, { category: 'system' })
     }
 
+    // 预热结束后再跑「启动即对账」
+    void this.runStartupReconcileAfterWarmup(localReady)
+
     this.pushLog('info', '已开始同步', { category: 'system' })
+  }
+
+  /** 挂一个「本地首轮扫描完成」的通知口，返回等待它的 promise */
+  private armLocalReady(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      this.resolveLocalReady = resolve
+    })
+  }
+
+  /** 本地首轮扫描完成（= 可以开始对账了） */
+  private markLocalReady(): void {
+    const resolve = this.resolveLocalReady
+    this.resolveLocalReady = null
+    resolve?.()
+  }
+
+  /**
+   * 预热结束后跑一轮「启动即对账」。
+   *
+   * 为什么不能跟「开始同步」同时开：这两个动作都会把主线程占满——
+   * 本地首轮遍历是几万次 stat + 清单写入，对账是远端遍历 +
+   * 逐条比对 + 差异落库。同时跑，界面在整个预热期都没有任何响应，
+   * 用户点「暂停」都点不动（点击事件排在几千个微任务后面）。
+   *
+   * 串起来之后总耗时几乎不变（瓶颈本来就在 IO），
+   * 但界面一直是活的，用户能随时暂停 / 看进度。
+   */
+  private async runStartupReconcileAfterWarmup(
+    localReady: Promise<void> | null
+  ): Promise<void> {
+    const deadline = Date.now() + WARMUP_MAX_WAIT_MS
+    try {
+      // 1) 等本地首轮扫描跑完（没有可用的监控时等满上限就走）
+      //    localReady 为 null 表示当前没有预热中的扫描（改配置触发的路径）
+      if (localReady) {
+        await Promise.race([
+          localReady,
+          new Promise<void>((resolve) => setTimeout(resolve, WARMUP_MAX_WAIT_MS))
+        ])
+      }
+      if (!this.started || this.paused) return
+
+      // 2) 再等上传队列安静一会儿：清单还在写的时候对账会读出假差异
+      const settleDeadline = Math.min(deadline, Date.now() + WARMUP_SETTLE_MS)
+      while (this.planner && !this.planner.isIdle && Date.now() < settleDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 500))
+      }
+      if (!this.started || this.paused) return
+
+      const res = await this.reconciler?.runStartup()
+      if (res) {
+        this.pushLog(
+          'info',
+          `启动对账完成：扫描 ${res.scannedFiles} 个文件，发现 ${res.diffCount} 处差异`,
+          { category: 'reconcile' }
+        )
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.pushLog('warn', `启动对账失败：${message}`, { category: 'reconcile' })
+    }
   }
 
   /**
@@ -410,7 +538,7 @@ export class Engine {
         this.remoteLastScanAt = remote.finishedAt ?? remote.startedAt
         this.remoteLastStatus = remote.status
         // 差异数以数据库里的未处置差异为准（那才是当前真实待办）
-        this.remoteDiffCount = this.manifest.listUnresolvedDiffs().length
+        this.remoteDiffCount = this.manifest.countUnresolvedDiffs()
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
@@ -425,6 +553,8 @@ export class Engine {
     this.taskBatcher.dispose()
     // 日志同理：退出前最后几行往往是「为什么没传」的关键线索
     this.flushLogs()
+    // 差异也是：这一批往往是「对账刚发现的」，丢了界面上就少几条
+    this.flushDiffs()
     for (const kind of [...this.progressTimers.keys()]) this.clearProgressTimer(kind)
 
     this.watcher?.stop()
@@ -622,6 +752,8 @@ export class Engine {
     const root = this.config.syncRoot
     if (!root) {
       this.watcher = null
+      // 没有可监控的目录 → 不存在「等首轮扫描」，直接放行对账
+      this.markLocalReady()
       return
     }
 
@@ -630,6 +762,7 @@ export class Engine {
       this.watcher = null
       this.watcherError = describeInaccessibleRoot(root)
       this.pushLog('error', `本地同步目录不可用：${this.watcherError}`, { category: 'system' })
+      this.markLocalReady()
       return
     }
 
@@ -642,12 +775,26 @@ export class Engine {
      * `EMFILE: too many open files, watch ...`。
      * 挑一个具体目录（哪怕是个大目录）比整块盘稳得多。
      */
-    if (/^[A-Za-z]:[\\/]?$/.test(root)) {
+    /*
+     * 整盘根目录**直接**用定时比对，不去试实时监听。
+     *
+     * 不是保守，是实测结论：`fs.watch` 是每个目录一个句柄，
+     * 整块盘上万个目录，chokidar 在遍历阶段就成片报
+     * `EMFILE: too many open files, watch 'Z:\...'` 与 `scandir 'Z:\...'`——
+     * 连一个 watch 都没建成，等于完全没有监控，而界面上显示「正在监控」。
+     * 用户改了文件永远同步不上去，日志里只有几百条看不懂的 EMFILE。
+     *
+     * 直接走定时比对：不稳定但**确实在工作**，最多延迟一轮比对时间。
+     * 子目录（哪怕很大）仍然走实时监听——那里句柄通常够用。
+     */
+    const isDriveRoot = /^[A-Za-z]:[\\/]?$/.test(root)
+    if (isDriveRoot) {
       this.pushLog(
         'warn',
-        `同步根是整块盘的根目录（${root.toUpperCase()}）。` +
-          '整盘监控会占用大量文件句柄，网络盘/挂载盘上容易失败；' +
-          '建议改成具体的子目录（例如 Z:\\download）。',
+        `同步根是整块盘的根目录（${root.toUpperCase()}）：` +
+          '实时监听需要为每个目录占一个文件句柄，整盘规模下建不起来，' +
+          '已改用定时比对（文件改动最多延迟一轮比对被发现）。' +
+          '想要秒级同步，请把同步目录改成具体的子目录（例如 Z:\\download）。',
         { category: 'system' }
       )
     }
@@ -658,6 +805,7 @@ export class Engine {
       this.watcher = new Watcher({
         root,
         exclude: this.config.exclude,
+        forcePolling: isDriveRoot,
         onEvent: (e: WatchEvent) => {
           /*
            * 返回 promise，而不是 void。
@@ -688,6 +836,8 @@ export class Engine {
           this.lastLocalScanAt = Date.now()
           // 落库：重启后概览页还能显示上次的真实数量，而不是 0
           this.recordLocalScan(count)
+          // 首轮扫描完成 → 放行等待中的对账
+          this.markLocalReady()
           this.events.onScan?.({
             id: 0,
             kind: 'local',
@@ -704,13 +854,34 @@ export class Engine {
         onError: (err) => {
           this.watcherError = err.message
           this.pushLog('error', `监控出错：${err.message}`)
+        },
+        /*
+         * 实时监听建不起来时自动降级为定时比对（见 watcher 的 WatchMode）。
+         *
+         * 这不是「功能退化」而是「从不可用变成可用」：整块盘 / 网络盘上
+         * fs.watch 根本建不起来，以前的表现是界面显示「正在监控」，
+         * 实际一条事件都收不到，文件改了永远同步不上去。
+         */
+        onModeChange: (mode) => {
+          this.watchMode = mode
+          if (mode === 'poll') {
+            // 降级后不是错误状态：监控在工作，只是粒度不同
+            this.watcherError = null
+            this.pushLog(
+              'warn',
+              '实时监听不可用，已切换为定时比对：文件改动会在下一轮比对时被发现（默认 5 分钟一次）',
+              { category: 'system' }
+            )
+          }
         }
       })
+      this.watchMode = this.watcher.watchMode
       this.watcher.start()
     } catch (err) {
       this.watcher = null
       this.watcherError = err instanceof Error ? err.message : String(err)
       this.pushLog('error', `本地监控启动失败：${this.watcherError}`, { category: 'system' })
+      this.markLocalReady()
     }
   }
 
@@ -740,7 +911,8 @@ export class Engine {
        * 对账页拿到的差异列表始终是空的。
        */
       onDiffRecorded: (diff) => {
-        this.events.onDiff?.(diff)
+        // 攒批：一轮对账可能上万条，逐条推会把渲染层压死
+        this.queueDiff(diff)
       },
       onPull: (params) => {
         this.planner?.enqueueDownload(params)
@@ -826,7 +998,14 @@ export class Engine {
           total: null,
           detail: `已扫描 ${p.dirs} 个目录 · ${p.files} 个文件`
         })
-      }
+      },
+      /*
+       * 同步正在忙时对账主动让路。
+       *
+       * 两个后台任务抢同一个主线程，谁都不让的结果就是界面完全不响应。
+       * 对账是「可以慢慢跑」的那一方，所以让它在分片之间多睡一会儿。
+       */
+      isBusy: () => this.isForegroundBusy()
     })
 
     /*
@@ -835,13 +1014,29 @@ export class Engine {
      * 建：随时都建。改完地址/账号后必须马上有对账器，
      * 否则用户点「立即对账」会静默失败（这是修过的 P0）。
      *
-     * 排期（定时器 + 启动即对账）：只在**已开始同步**时排。
+     * 排期（定时器）：只在**已开始同步**时排。
      * 用户还没点「开始同步」，远端对账就自己跑起来了——
      * 那正是「启动默认关闭对账」要避免的事。
+     *
+     * 「启动即对账」那一轮交给 startSync 里的预热流程（deferStartup），
+     * 不在这里立刻跑：点「开始同步」的瞬间本地正在遍历整棵目录树，
+     * 两边同时跑会把主线程占满，界面卡到点不动按钮。
      */
     if (this.started) {
-      this.reconciler.start()
+      this.reconciler.start({ deferStartup: true })
     }
+  }
+
+  /**
+   * 前台是否正忙（本地扫描 / 事件处理 / 上传队列有积压）。
+   *
+   * 对账拿它决定要不要让路。只看「队列长度」不看「进度百分比」：
+   * 队列短的时候让路没有意义，让了也省不出什么。
+   */
+  private isForegroundBusy(): boolean {
+    const backlog = this.planner?.backlog ?? 0
+    if (backlog > 0) return true
+    return this.localProgress?.running === true
   }
 
   // ── 对外能力 ──────────────────────────────────────────
@@ -920,6 +1115,16 @@ export class Engine {
     // 连接信息变了也要重建：刚连上时之前建的（没建的）对账器还不存在
     if (patch.remoteScan || patch.remoteRoot !== undefined || patch.openlist) {
       this.startReconciler()
+      /*
+       * 改完远端相关配置后补跑一轮对账（以前 start() 里会立刻跑）。
+       *
+       * 现在 start() 只排定时器，启动那一轮由这里发起——
+       * localReady 传 null：当前没有预热中的本地扫描，
+       * 不能挂一个永远等不到通知的 promise。
+       */
+      if (this.started && !this.paused) {
+        void this.runStartupReconcileAfterWarmup(null)
+      }
     }
 
     // 同步根变了 → 监控必须重建（但只在已开始同步时才建）
@@ -1284,8 +1489,8 @@ export class Engine {
    * - ignored → 仅记录
    */
   async resolveDiff(diffId: number, resolution: DiffResolution): Promise<void> {
-    const diffs = this.manifest.listUnresolvedDiffs()
-    const diff = diffs.find((d) => d.id === diffId)
+    // 按 id 单取：以前为了找一条而把整张差异表读进内存
+    const diff = this.manifest.getDiff(diffId)
     if (!diff) return
 
     try {
@@ -1346,7 +1551,7 @@ export class Engine {
        * 推的是**已处置**的完整条目（resolvedAt 非空），
        * 渲染层据此把它从列表里撤掉。
        */
-      if (resolved) this.events.onDiff?.(resolved)
+      if (resolved) this.queueDiff(resolved)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       this.pushLog('error', `差异处置失败 ${diff.remotePath}：${message}`)
@@ -1502,38 +1707,30 @@ export class Engine {
 
   getStats(): AppStats {
     const counts = this.manifest.countByState()
-    const tasks = this.planner?.getTasks() ?? []
-    const diffs = this.manifest.listUnresolvedDiffs()
-
     /*
-     * 一次遍历算完三个计数。
-     *
-     * 以前是三次 `filter(...).length`——任务表满时（三千条）
-     * 每次 getStats 就要多扫两遍。而 getStats 会被界面
-     * 高频调用（每次任务变更多少都会刷一次统计），
-     * 三遍和一遍的差别在高频下会被放大。
+     * 任务计数不经过 `getTasks()`：那个会分配一个最多 3600 条的对象数组，
+     * 而 getStats 是界面高频调用的方法（扫描时每秒好几次）。
      */
-    let active = 0
-    let queued = 0
-    let failed = 0
-    for (const t of tasks) {
-      if (t.state === 'failed') failed++
-      else if (t.state === 'queued') queued++
-      else if (t.state === 'uploading' || t.state === 'hashing' || t.state === 'downloading') {
-        active++
-      }
-    }
+    const taskCounts = this.planner?.countTaskStates() ?? { queued: 0, active: 0, failed: 0 }
+    /*
+     * 只取**数量**，不读整张差异表。
+     *
+     * getStats() 是界面高频调用的方法（任务变更、进度跳变都会问一次），
+     * 以前每次都把上万条差异读成对象数组——对账跑完后界面整个卡住，
+     * 就是这么来的。
+     */
+    const openDiffs = this.manifest.countUnresolvedDiffs()
 
     return {
       synced: counts['synced'] ?? 0,
-      queued,
+      queued: taskCounts.queued,
       skipped: this.skippedThisRun,
       skippedLocal: this.skippedLocal,
       skippedRemote: this.skippedRemote,
       downloaded: this.downloadedCount,
-      failed,
-      active,
-      openDiffs: diffs.length,
+      failed: taskCounts.failed,
+      active: taskCounts.active,
+      openDiffs,
       paused: this.paused,
       totalFiles: Object.values(counts).reduce((a, b) => a + b, 0),
       localScan: {
@@ -1541,7 +1738,13 @@ export class Engine {
         error: this.watcherError,
         root: this.config.syncRoot,
         lastScanAt: this.lastLocalScanAt,
-        scannedCount: this.localScannedCount
+        scannedCount: this.localScannedCount,
+        /*
+         * 监控模式。整盘 / 网络盘上实时监听建不起来时会降级为定时比对，
+         * 界面上必须说清楚——否则用户改完文件等不到同步，
+         * 会以为「同步坏了」而不是「要等下一轮比对」。
+         */
+        mode: this.watchMode
       },
       remoteScan: {
         enabled: this.config.remoteScan.enabled,
@@ -1624,6 +1827,8 @@ export class Engine {
   pause(): void {
     if (this.paused) return
     this.paused = true
+    // 放行可能正在等待首轮扫描的预热流程（否则它会挂到超时）
+    this.markLocalReady()
     this.watcher?.stop()
     this.watcher = null
     this.reconciler?.stop()
@@ -1671,8 +1876,11 @@ export class Engine {
     if (recovered > 0) {
       this.pushLog('info', `已恢复同步，重新排队 ${recovered} 个待处理文件`)
     }
+    const localReady = this.armLocalReady()
     this.startWatcher()
     this.startReconciler()
+    // 恢复后同样要等首轮扫描跑完再对账（理由见 startSync）
+    void this.runStartupReconcileAfterWarmup(localReady)
     this.pushLog('info', '已恢复同步')
   }
 
@@ -1743,6 +1951,50 @@ export class Engine {
     if (this.pendingLogs.length === 0) return
     const batch = this.pendingLogs.splice(0)
     this.events.onLogBatch?.(batch)
+  }
+
+  /**
+   * 收下一条差异变化，攒批推送。
+   *
+   * 与任务推送同理：一轮对账可能一次产生上万条差异。逐条推意味着
+   * 上万次 IPC、渲染层上万次全表重建、上万次 getStats 往返——
+   * 实测对账刚跑完的那几秒界面完全卡死，用户以为程序挂了。
+   */
+  private queueDiff(diff: DiffEntry): void {
+    this.pendingDiffs.push(diff)
+    if (this.pendingDiffs.length >= DIFF_BATCH_MAX) {
+      this.flushDiffs()
+      return
+    }
+    if (this.diffFlushTimer) return
+    const timer = setTimeout(() => this.flushDiffs(), DIFF_FLUSH_MS)
+    timer.unref?.()
+    this.diffFlushTimer = timer
+  }
+
+  /** 把攒下的差异整批推给渲染进程（单批不超过 DIFF_BATCH_MAX） */
+  private flushDiffs(): void {
+    if (this.diffFlushTimer) {
+      clearTimeout(this.diffFlushTimer)
+      this.diffFlushTimer = null
+    }
+    if (this.pendingDiffs.length === 0) return
+
+    const batch = this.pendingDiffs.splice(0, DIFF_BATCH_MAX)
+
+    if (this.events.onDiffBatch) {
+      this.events.onDiffBatch(batch)
+    } else if (this.events.onDiff) {
+      // 兼容旧调用方（单条通道）
+      for (const diff of batch) this.events.onDiff(diff)
+    }
+
+    // 还有剩的 → 立刻再排一批，别等下一个窗口
+    if (this.pendingDiffs.length > 0) {
+      const timer = setTimeout(() => this.flushDiffs(), 0)
+      timer.unref?.()
+      this.diffFlushTimer = timer
+    }
   }
 
   /**

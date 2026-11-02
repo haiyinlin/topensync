@@ -463,6 +463,14 @@ export interface MainToRendererEvents {
   /** 扫描/对账进度；扫描过程中持续推送 */
   'scan:progress': (progress: ScanProgress) => void
   'diff:update': (diff: DiffEntry) => void
+  /**
+   * 差异批量变更。
+   *
+   * 一轮对账可能一次产生上万条差异，逐条推 = 上万次 IPC +
+   * 渲染层上万次全表重建 + 上万次 getStats 往返，界面会直接卡死。
+   * 攒批之后推送次数与「批」成正比。
+   */
+  'diff:batch': (diffs: DiffEntry[]) => void
   'config:update': (config: AppConfig) => void
   /**
    * 日志批量追加。
@@ -533,6 +541,16 @@ export interface AppStats {
     root: string
     lastScanAt: number | null
     scannedCount: number
+    /**
+     * 监控模式。
+     *
+     * - `watch`：实时监听（文件改动秒级可见）
+     * - `poll`：定时比对（整盘 / 网络盘上 fs.watch 句柄不够时的降级模式，
+     *   文件改动要等下一轮遍历才发现）
+     *
+     * 界面必须把这两种说清楚：模式不同，用户对「多久同步」的预期完全不同。
+     */
+    mode?: 'watch' | 'poll'
   }
   /** 远端对账通道状态 */
   remoteScan: {

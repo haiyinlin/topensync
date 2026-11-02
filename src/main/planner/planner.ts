@@ -181,6 +181,14 @@ interface QueueItem {
    * 这正是「取消按钮点了没反应」的根因。
    */
   canceled?: boolean
+  /**
+   * 这一项是否会被重新塞回队列（失败重试 / 句柄冷却重试）。
+   *
+   * 流水线阶段收尾时据此决定要不要从 `queuedPaths` 里摘掉它——
+   * 摘错了会漏传（项还在队列里，去重却认为它不在），
+   * 不摘会永远卡住（项已经结束，去重却认为它还在排队）。
+   */
+  requeued?: boolean
 }
 
 /**
@@ -207,6 +215,19 @@ interface DeleteItem {
 export class Planner {
   private readonly hashQueue: QueueItem[] = []
   private readonly uploadQueue: QueueItem[] = []
+  /**
+   * 「已排队或已在跑」的路径索引。
+   *
+   * 为什么需要它：`enqueue()` 要去重，以前是
+   * `hashQueue.some(...) || uploadQueue.some(...)`——队列长到几万条时，
+   * 每来一个事件都要线性扫两遍，整体是 O(n²)。
+   * 实测六万文件时主线程几乎全耗在这两个 `some()` 里，
+   * 界面表现为「点了扫描就一直卡」。
+   *
+   * 用 Set 之后去重是 O(1)。它必须与三个容器保持同步：
+   * hashQueue / uploadQueue / inFlight。
+   */
+  private readonly queuedPaths = new Set<string>()
   private readonly downloadQueue: DownloadItem[] = []
   private readonly deleteQueue: DeleteItem[] = []
   /**
@@ -318,6 +339,7 @@ export class Planner {
     this.hashQueue.length = 0
     this.uploadQueue.length = 0
     this.downloadQueue.length = 0
+    this.queuedPaths.clear()
     if (this.removalTimer) {
       clearInterval(this.removalTimer)
       this.removalTimer = null
@@ -376,6 +398,45 @@ export class Planner {
   /** 队列里还有多少项没跑完（含在途） */
   get pendingCount(): number {
     return this.hashQueue.length + this.uploadQueue.length + this.inFlight.size
+  }
+
+  /**
+   * 任务表各状态的数量。
+   *
+   * 为什么单独给一个方法，而不是让上层 `getTasks()` 再 `filter`：
+   * getStats() 是界面高频调用的（每次任务变更、每次进度跳变都会问一次），
+   * 而任务表上限 3600 条——每次都分配 3600 个对象的数组纯属浪费，
+   * 在扫描期间（每秒问几次）这笔开销会叠加成可见的卡顿。
+   */
+  countTaskStates(): { queued: number; active: number; failed: number } {
+    let queued = 0
+    let active = 0
+    let failed = 0
+    for (const t of this.tasks.values()) {
+      if (t.state === 'failed') failed++
+      else if (t.state === 'queued') queued++
+      else if (t.state === 'uploading' || t.state === 'hashing' || t.state === 'downloading') {
+        active++
+      }
+    }
+    return { queued, active, failed }
+  }
+
+  /**
+   * 积压量：入口事件队列 + 哈希队列 + 上传队列 + 在途。
+   *
+   * 给「后台任务让路」用（远端对账据此决定要不要多睡一会儿）。
+   * 取的是**数量**而不是百分比：积压为 0 时让路毫无意义——
+   * 前台根本没活，让了也省不出什么。
+   */
+  get backlog(): number {
+    return (
+      this.eventQueue.length +
+      this.hashQueue.length +
+      this.uploadQueue.length +
+      this.inFlight.size +
+      this.inFlightDownloads.size
+    )
   }
 
   /** 按相对路径取任务（进度回调用它把字节数对应回任务） */
@@ -1174,6 +1235,8 @@ export class Planner {
     }
     drop(this.hashQueue)
     drop(this.uploadQueue)
+    // 在途的那一项由它自己的阶段收尾时清索引；这里清队列部分
+    if (!this.inFlight.has(relPath)) this.queuedPaths.delete(relPath)
   }
 
   /** 从下载队列里摘掉指定路径的项 */
@@ -1258,14 +1321,20 @@ export class Planner {
   }
 
   private enqueue(item: QueueItem): void {
-    // 同一路径已在队列中就不重复排。
-    // 但**在途**的那一项也必须算上：它已经从队列 shift 出来了，
-    // 只看队列数组会以为它没排过，于是同一个文件被排两次、
-    // 上传两次，远端就多出一个 `xxx(1).ext`。
-    if (this.hashQueue.some((q) => q.relPath === item.relPath)) return
-    if (this.uploadQueue.some((q) => q.relPath === item.relPath)) return
+    /*
+     * 同一路径已在队列中（或在途）就不重复排。
+     *
+     * 「在途」必须算上：它已经从队列 shift 出来了，
+     * 只看队列数组会以为它没排过，于是同一个文件被排两次、
+     * 上传两次，远端就多出一个 `xxx(1).ext`。
+     *
+     * 用 Set 判定而不是遍历两个数组：六万文件时后者的累计代价是
+     * O(n²)，主线程会被它吃干净。
+     */
+    if (this.queuedPaths.has(item.relPath)) return
     if (this.inFlight.has(item.relPath)) return
 
+    this.queuedPaths.add(item.relPath)
     this.hashQueue.push(item)
     this.touch(item.relPath, { state: 'queued' })
     void this.pump()
@@ -1320,6 +1389,8 @@ export class Planner {
   private async runHashStage(item: QueueItem): Promise<void> {
     // 登记在途项：取消操作要靠它才能找到「正在跑的这一项」
     this.inFlight.set(item.relPath, item)
+    /** 是否交棒给上传池。没交棒的项到此为止，索引要跟着清 */
+    let keptInPipeline = false
     try {
       if (item.canceled) return
       const manifest = this.opts.manifest
@@ -1367,8 +1438,12 @@ export class Planner {
       }
 
       this.uploadQueue.push(item)
+      keptInPipeline = true
     } finally {
       this.inFlight.delete(item.relPath)
+      // 从这里出去的项（认领成功 / 判重跳过 / 取消）不会再被调度，
+      // 索引必须同步清掉，否则同一个路径以后永远被当成「已排队」
+      if (!keptInPipeline && !item.requeued) this.queuedPaths.delete(item.relPath)
     }
   }
 
@@ -1379,6 +1454,9 @@ export class Planner {
       await this.doUploadStage(item)
     } finally {
       this.inFlight.delete(item.relPath)
+      // 失败重试 / 句柄冷却重试会把项重新塞回队列，那时索引要保留
+      if (!item.requeued) this.queuedPaths.delete(item.relPath)
+      item.requeued = false
     }
   }
 
@@ -1491,6 +1569,8 @@ export class Planner {
       await sleep(backoff(config.retry.baseDelayMs, item.attempts))
       // 退避期间用户可能点了取消：这时不要再把项塞回队列
       if (item.canceled) return
+      item.requeued = true
+      this.queuedPaths.add(item.relPath)
       this.hashQueue.push(item)
       return
     }
@@ -1579,8 +1659,10 @@ export class Planner {
       `本机文件句柄已用尽，暂停 ${Math.max(1, Math.round(waitMs / 1000))} 秒后重试：${item.relPath}`,
       { category: 'system', filePath: item.relPath }
     )
+    item.requeued = true
     setTimeout(() => {
       if (this.running && !item.canceled) {
+        this.queuedPaths.add(item.relPath)
         this.hashQueue.push(item)
         void this.pump()
       }
@@ -2065,6 +2147,8 @@ export class Planner {
         }
       }
 
+      if (this.queuedPaths.has(item.relPath)) continue
+      this.queuedPaths.add(item.relPath)
       if (reusable && entry.md5 && entry.sha1) {
         item.hashes = { md5: entry.md5, sha1: entry.sha1, size: entry.localSize }
         this.uploadQueue.push(item)

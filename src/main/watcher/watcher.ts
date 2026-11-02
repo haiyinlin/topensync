@@ -1,7 +1,9 @@
 import chokidar, { type FSWatcher } from 'chokidar'
-import { readdir } from 'fs/promises'
+import { readdir, stat } from 'fs/promises'
 import type { Dirent } from 'fs'
 import { join } from 'path'
+import { ioGovernor, isResourceExhausted } from '../io/governor'
+import { tick } from '../io/tick'
 import { getExcludeMatcher, hasIgnoredSegment, isExcluded, relativize, toLongPath } from './paths'
 
 /**
@@ -19,6 +21,41 @@ import { getExcludeMatcher, hasIgnoredSegment, isExcluded, relativize, toLongPat
  */
 
 export type WatchEventType = 'upsert' | 'remove'
+
+/**
+ * 监控模式。
+ *
+ * - `watch`：chokidar 实时监听（fs.watch / ReadDirectoryChangesW），秒级可见
+ * - `poll`：定时遍历目录树做差异比对。**没有实时性**，但几乎不占句柄
+ *
+ * 为什么需要后者：`fs.watch` 是**每个目录一个句柄**。整块盘（实测 5.8 万文件、
+ * 上万个目录）或网络映射盘上，句柄根本不够——chokidar 会在遍历阶段就
+ * 成片报 `EMFILE: too many open files, watch '...'` / `scandir '...'`，
+ * 此时它连一个 watch 都没建起来，等于**完全没有监控**，而界面上却显示
+ * 「正在监控」，文件改了永远同步不上去。
+ *
+ * 降级到轮询不是「变差」——在这种规模下轮询是唯一能真正工作的模式。
+ */
+export type WatchMode = 'watch' | 'poll'
+
+/** 连续多少次 watch/scandir 错误后判定「实时监听不可用」 */
+const WATCH_ERROR_LIMIT = 8
+/** 错误统计窗口：只有短时间内的密集报错才算「不可用」 */
+const WATCH_ERROR_WINDOW_MS = 60_000
+/** 同类错误最多往上报几条（其余只计数，避免把日志刷满） */
+const WATCH_ERROR_LOG_MAX = 3
+
+/**
+ * 降级后默认的轮询间隔。
+ *
+ * 每轮要把目录树 stat 一遍（六万文件在本地盘约十几秒，网络盘更久），
+ * 所以不能太密；但备份场景 5 分钟的可见延迟是可接受的——
+ * 对比「实时监听完全失效、文件永远不同步」，这个延迟是明确更优的取舍。
+ */
+const DEFAULT_POLL_INTERVAL_MS = 300_000
+
+/** 轮询时每处理多少个文件让出一次事件循环 */
+const POLL_YIELD_EVERY = 500
 
 export interface WatchEvent {
   type: WatchEventType
@@ -48,6 +85,17 @@ export interface WatcherOptions {
   onReady?: (count: number) => void
   onError?: (err: Error) => void
   onLog?: (level: 'info' | 'warn' | 'error', message: string) => void
+  /**
+   * 监控模式发生变化（实时监听失效 → 轮询，或反之）。
+   *
+   * 上层用它更新界面状态并写一条**人话**日志：用户必须知道
+   * 「现在是定时比对」——否则他会奇怪为什么改完文件过几分钟才同步。
+   */
+  onModeChange?: (mode: WatchMode, reason: string) => void
+  /** 强制轮询模式（测试与「网络盘」手动降级用） */
+  forcePolling?: boolean
+  /** 轮询间隔（毫秒），默认 5 分钟 */
+  pollIntervalMs?: number
 }
 /** chokidar 递归深度上限，防止病态目录把进程拖死 */
 const MAX_DEPTH = 24
@@ -83,11 +131,39 @@ export class Watcher {
   /** 扫描期间在飞的事件处理（窗口背压用） */
   private readonly rescanInflight: Array<Promise<void>> = []
   private lastReadyAt: number | null = null
+  /** 当前监控模式；见 WatchMode 的说明 */
+  private mode: WatchMode = 'watch'
+  /** 轮询定时器（仅 poll 模式） */
+  private pollTimer: NodeJS.Timeout | null = null
+  /** 轮询是否正在跑（上一轮没跑完就不再起新一轮） */
+  private pollInFlight: Promise<number> | null = null
+  /**
+   * 轮询模式的「上一轮看到的样子」：相对路径 → `size:mtimeMs`。
+   *
+   * 只存指纹不存完整元信息：一轮几十万个条目时，
+   * 一个短字符串比一个对象省一个数量级的内存。
+   */
+  private readonly pollSnapshot = new Map<string, string>()
+  /** 本窗口内的 watch 错误计数与首次时间 */
+  private watchErrorCount = 0
+  private watchErrorSince = 0
+  /** 同类错误已经往上报了几条 */
+  private watchErrorLogged = 0
 
-  constructor(private readonly opts: WatcherOptions) {}
+  constructor(private readonly opts: WatcherOptions) {
+    if (opts.forcePolling) this.mode = 'poll'
+  }
 
   get isWatching(): boolean {
-    return this.watcher !== null
+    // 已停止（暂停 / 退出）就是没在监控——轮询模式下没有 chokidar
+    // 实例，不能靠「watcher 为 null」来推断
+    if (this.stopped) return false
+    return this.watcher !== null || this.mode === 'poll'
+  }
+
+  /** 当前监控模式（界面上要说清楚是实时还是定时） */
+  get watchMode(): WatchMode {
+    return this.mode
   }
 
   get lastScanAt(): number | null {
@@ -95,9 +171,22 @@ export class Watcher {
   }
 
   start(): void {
-    if (this.watcher) return
+    if (this.watcher || this.pollTimer) return
     const { root } = this.opts
     this.stopped = false
+    this.watchErrorCount = 0
+    this.watchErrorLogged = 0
+
+    /*
+     * 强制轮询（或已经降级过）：不建 chokidar。
+     *
+     * 降级是**单向**的：一轮对账中途重新尝试实时监听，只会把
+     * 已经稳定跑着的轮询打断，再撞一次同样的 EMFILE。
+     */
+    if (this.mode === 'poll') {
+      this.startPolling()
+      return
+    }
 
     this.watcher = chokidar.watch(toLongPath(root), {
       // 自行判定忽略项：chokidar 的 glob 匹配对 Windows 路径分隔符不友好
@@ -137,8 +226,7 @@ export class Watcher {
       .on('unlinkDir', (p) => this.onFsEvent(p, 'remove', true))
       .on('error', (err) => {
         const e = err instanceof Error ? err : new Error(String(err))
-        this.opts.onError?.(e)
-        this.opts.onLog?.('error', `监控出错：${e.message}`)
+        this.handleWatchError(e)
       })
       .on('ready', () => {
         this.initialDone = true
@@ -186,7 +274,191 @@ export class Watcher {
     this.pendingAbs.clear()
     void this.watcher?.close()
     this.watcher = null
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer)
+      this.pollTimer = null
+    }
+    this.pollSnapshot.clear()
     this.initialDone = false
+  }
+
+  // ── 监控模式 ──────────────────────────────────────────
+
+  /**
+   * 处理 chokidar 的 error 事件。
+   *
+   * 两件事：
+   * 1. **降噪**。整块盘同步时同一类错误会成片出现（截图里几十条
+   *    `EMFILE ... watch Z:\...`），逐条写库+推前端只会把真正有用的
+   *    信息淹掉，还额外给已经卡住的主线程加活。
+   * 2. **判定不可用 → 降级到轮询**。短时间内密集出现句柄/监听类错误，
+   *    说明这台机器上实时监听根本建不起来，再重试也只是重复失败。
+   */
+  private handleWatchError(err: Error): void {
+    const message = err.message
+    const isHandleIssue =
+      isResourceExhausted(err) ||
+      /too many open files|scandir|unknown error, watch|EMFILE|ENFILE/i.test(message)
+
+    // 与句柄无关的错误（权限、路径消失）：报一次就够，且不参与降级判定
+    if (!isHandleIssue) {
+      this.opts.onError?.(err)
+      this.opts.onLog?.('error', `监控出错：${message}`)
+      return
+    }
+
+    const now = Date.now()
+    if (this.watchErrorSince === 0 || now - this.watchErrorSince > WATCH_ERROR_WINDOW_MS) {
+      this.watchErrorSince = now
+      this.watchErrorCount = 1
+      this.watchErrorLogged = 0
+    } else {
+      this.watchErrorCount++
+    }
+
+    if (this.watchErrorLogged < WATCH_ERROR_LOG_MAX) {
+      this.watchErrorLogged++
+      this.opts.onError?.(err)
+      this.opts.onLog?.('error', `监控出错：${message}`)
+      if (this.watchErrorLogged === WATCH_ERROR_LOG_MAX) {
+        this.opts.onLog?.(
+          'warn',
+          '同类监控错误后续不再逐条记录（实时监听的句柄数已接近上限）'
+        )
+      }
+    }
+
+    if (this.watchErrorCount >= WATCH_ERROR_LIMIT && this.mode === 'watch') {
+      this.degradeToPolling(
+        `实时监听无法建立（${this.watchErrorCount} 次句柄不足：${message.slice(0, 80)}）`
+      )
+    }
+  }
+
+  /**
+   * 从实时监听降级为定时比对。
+   *
+   * 不能只是「关掉 chokidar 然后什么都不做」——那等于彻底不监控了。
+   * 降级后立刻做一轮完整遍历（把当前目录树喂给上层，该传的照传），
+   * 然后按固定间隔做差异比对。
+   */
+  private degradeToPolling(reason: string): void {
+    if (this.mode === 'poll') return
+    this.mode = 'poll'
+    void this.watcher?.close()
+    this.watcher = null
+    this.opts.onModeChange?.('poll', reason)
+    this.opts.onLog?.(
+      'warn',
+      `已切换为定时比对模式：${reason}。` +
+        `实时监听在整盘 / 网络盘上会耗尽文件句柄，改用每 ${Math.round(
+          (this.opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS) / 1000
+        )} 秒遍历一次目录树比对变化（文件改动最多延迟这么久被发现）。`
+    )
+    this.startPolling()
+  }
+
+  /** 启动轮询：先做一轮完整遍历，再按间隔做差异比对 */
+  private startPolling(): void {
+    if (this.pollTimer || this.stopped) return
+    if (this.mode !== 'poll') return
+    void this.pollOnce(true).catch((err: unknown) => {
+      const e = err instanceof Error ? err : new Error(String(err))
+      this.opts.onError?.(e)
+    })
+    const interval = Math.max(5_000, this.opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS)
+    this.pollTimer = setInterval(() => {
+      void this.pollOnce(false).catch((err: unknown) => {
+        const e = err instanceof Error ? err : new Error(String(err))
+        this.opts.onError?.(e)
+      })
+    }, interval)
+    this.pollTimer.unref?.()
+  }
+
+  /**
+   * 轮询一轮：遍历目录树 → 与上一轮快照比对 → 产出 upsert / remove。
+   *
+   * @param initial true 表示这是降级（或首次启动）后的第一轮：
+   *   所有文件都作为 upsert 发出，不做差异判断。
+   *   否则只发「新增 / 变大变小 / 消失」的那部分。
+   * @returns 本轮看到的文件数
+   */
+  private async pollOnce(
+    initial: boolean,
+    onProgress?: (done: number) => void
+  ): Promise<number> {
+    // 上一轮还没跑完就复用它：并发跑两轮只会把同一批文件读两遍
+    if (this.pollInFlight) return this.pollInFlight
+    this.pollInFlight = this.doPoll(initial, onProgress).finally(() => {
+      this.pollInFlight = null
+    })
+    return this.pollInFlight
+  }
+
+  private async doPoll(
+    initial: boolean,
+    onProgress?: (done: number) => void
+  ): Promise<number> {
+    if (this.stopped) return 0
+    const current = new Map<string, string>()
+    let count = 0
+
+    await scanLocalTree({
+      root: this.opts.root,
+      exclude: this.opts.exclude,
+      shouldStop: () => this.stopped,
+      withStat: true,
+      onFile: async (rel, abs, done, info) => {
+        const fingerprint = `${info?.size ?? 0}:${Math.round(info?.mtimeMs ?? 0)}`
+        current.set(rel, fingerprint)
+        count = done
+
+        const prev = this.pollSnapshot.get(rel)
+        if (!initial && prev === fingerprint) return
+
+        this.discovered.add(abs.toLowerCase())
+        await this.emitEvent({
+          type: 'upsert',
+          relPath: rel,
+          absPath: abs,
+          origin: 'change',
+          isDir: false
+        })
+
+        // 每处理一批让出事件循环：一轮六万个文件，
+        // 不让出的话界面在整轮期间都没有响应
+        if (done % POLL_YIELD_EVERY === 0) {
+          onProgress?.(done)
+          await tick()
+        }
+      }
+    })
+
+    if (this.stopped) return count
+
+    // 上一轮有、这一轮没有 → 本地已删除
+    for (const rel of this.pollSnapshot.keys()) {
+      if (current.has(rel)) continue
+      const abs = join(this.opts.root, rel)
+      await this.emitEvent({ type: 'remove', relPath: rel, absPath: abs, origin: 'change' })
+    }
+
+    this.pollSnapshot.clear()
+    for (const [rel, fp] of current) this.pollSnapshot.set(rel, fp)
+
+    // 把窗口里剩下的收干净，否则上层还在处理时我们就报了「就绪」
+    await Promise.all(this.rescanInflight)
+    this.rescanInflight.length = 0
+
+    if (this.stopped) return count
+    this.initialDone = true
+    this.lastReadyAt = Date.now()
+    if (initial) {
+      this.opts.onReady?.(count)
+      this.opts.onLog?.('info', `本地扫描完成，共 ${count} 个文件（定时比对模式）`)
+    }
+    return count
   }
 
   /**
@@ -223,6 +495,16 @@ export class Watcher {
      * 白白多读两遍盘、多耗一倍句柄。这里直接复用进行中的那一轮。
      */
     if (this.scanPromise) return this.scanPromise
+    /*
+     * 轮询模式下「扫描本地」走轮询那一套：
+     * 它会顺带更新差异快照，否则下一次轮询会把所有文件当成变化再发一遍。
+     */
+    if (this.mode === 'poll') {
+      this.scanPromise = this.pollOnce(true, onProgress).finally(() => {
+        this.scanPromise = null
+      })
+      return this.scanPromise
+    }
     this.scanPromise = this.doRescan(onProgress).finally(() => {
       this.scanPromise = null
     })
@@ -372,10 +654,28 @@ export class Watcher {
 export interface LocalScanOptions {
   root: string
   exclude: string[]
-  /** 每发现一个文件调用一次；返回 Promise 时会被等待（背压） */
-  onFile?: (rel: string, abs: string, done: number) => void | Promise<void>
+  /**
+   * 每发现一个文件调用一次；返回 Promise 时会被等待（背压）。
+   *
+   * `info` 只在 `withStat: true` 时提供——那时每个文件多一次 stat，
+   * 用来做「大小/修改时间」的差异判定（轮询模式必需）。
+   * 只数文件数量（「扫描本地」按钮）不需要它，省掉这一轮 stat。
+   */
+  onFile?: (
+    rel: string,
+    abs: string,
+    done: number,
+    info?: { size: number; mtimeMs: number }
+  ) => void | Promise<void>
   /** 返回 true 时中止扫描 */
   shouldStop?: () => boolean
+  /**
+   * 是否连每个文件的大小/修改时间一起读出来。
+   *
+   * stat 走 IO 闸门：轮询一轮可能要对几万个文件 stat，
+   * 不纳入限流的话，同时跑着的哈希/上传会被抢掉句柄。
+   */
+  withStat?: boolean
 }
 
 export async function scanLocalTree(opts: LocalScanOptions): Promise<number> {
@@ -413,7 +713,25 @@ export async function scanLocalTree(opts: LocalScanOptions): Promise<number> {
       if (!entry.isFile()) continue
 
       count++
-      const ret = opts.onFile?.(rel, abs, count)
+
+      if (!opts.withStat) {
+        const ret = opts.onFile?.(rel, abs, count)
+        if (ret && typeof ret.then === 'function') await ret
+        continue
+      }
+
+      let info: { size: number; mtimeMs: number } | undefined
+      try {
+        const st = await ioGovernor.run(() => stat(toLongPath(abs)))
+        info = { size: st.size, mtimeMs: st.mtimeMs }
+      } catch {
+        // stat 失败（被删/被占用/句柄不足）：这一轮当它不存在，
+        // 下一轮再看——不能因为一个文件读不到就中断整次遍历
+        count--
+        continue
+      }
+
+      const ret = opts.onFile?.(rel, abs, count, info)
       if (ret && typeof ret.then === 'function') await ret
     }
   }

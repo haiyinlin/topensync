@@ -264,26 +264,42 @@ export const useAppStore = create<AppState>((set, get) => ({
     )
 
     /*
-     * 差异更新。
+     * 差异更新（**批量**）。
      *
-     * 收到一条差异就把它顶到列表最前面。
-     * 但**对账结束后**还要整体重拉一次：
-     * 被自动修复掉的差异会从库里消失，只靠增量推送撤不掉。
+     * 一轮对账可能一次产生上万条差异。以前是逐条推、逐条
+     * `[diff, ...s.diffs.filter(...)]`——那是「每条都重建一次全表」，
+     * 一万条就是一万次万级数组重建 + 一万次 getStats 往返，
+     * 对账跑完的瞬间界面直接卡死，用户以为程序挂了。
+     *
+     * 现在一批只重建一次，统计刷新走节流。
      */
-    track(
-      window.topensync?.onDiffUpdate((diff) => {
-        set((s) => ({
-          diffs:
-            // 已处置的差异要从列表里撤掉，而不是置顶。
-            // 主进程在用户处置完差异后会推一条 resolvedAt 非空的条目，
-            // 不撤的话那一行会永远留在表里，用户以为操作没生效、反复点。
-            diff.resolvedAt !== null
-              ? s.diffs.filter((d) => d.id !== diff.id)
-              : [diff, ...s.diffs.filter((d) => d.id !== diff.id)]
-        }))
-        void safe(() => get().refreshStats(), undefined, '刷新统计')
+    const applyDiffs = (diffs: DiffEntry[]): void => {
+      if (diffs.length === 0) return
+      set((s) => {
+        // 已处置的（resolvedAt 非空）从列表里撤掉；其余置顶
+        const removedIds = new Set<number>()
+        const upserts: DiffEntry[] = []
+        for (const d of diffs) {
+          if (d.resolvedAt !== null) removedIds.add(d.id)
+          else upserts.push(d)
+        }
+        if (removedIds.size === 0 && upserts.length === 0) return {}
+
+        // 先按 id 去掉旧版本（一次遍历），再整批拼到最前面。
+        // 批次内倒序：最新收到的那条排在最上面
+        const upsertIds = new Set(upserts.map((d) => d.id))
+        const kept = s.diffs.filter((d) => !removedIds.has(d.id) && !upsertIds.has(d.id))
+        return { diffs: [...upserts.slice().reverse(), ...kept] }
       })
-    )
+      scheduleStatsRefresh(get)
+    }
+
+    if (window.topensync?.onDiffBatch) {
+      track(window.topensync.onDiffBatch(applyDiffs))
+    } else {
+      // 老版本 preload：退回单条通道
+      track(window.topensync?.onDiffUpdate((diff) => applyDiffs([diff])))
+    }
 
     track(
       window.topensync?.onConfigUpdate((config) => {
