@@ -3,12 +3,14 @@ import type {
   AppConfig,
   AppSnapshot,
   AppStats,
+  ClearCacheResult,
   ConnectionStatus,
   DeepVerifyResult,
   DiffEntry,
   FileEntry,
   LogEntry,
   ScanProgressPair,
+  StorageInfo,
   TaskBatch,
   TransferTask
 } from '@shared/types'
@@ -78,6 +80,10 @@ interface AppState {
   clearLogs: () => Promise<number>
   /** 深度校验（批量）：把远端文件拉回来重算哈希，与本地比对 */
   verifyRemoteFiles: (relPaths: string[]) => Promise<DeepVerifyResult>
+  /** 数据目录占用（数据库大小、缓存大小） */
+  getStorageInfo: () => Promise<StorageInfo | null>
+  /** 清除运行时缓存；返回释放字节与清理结果 */
+  clearCache: () => Promise<ClearCacheResult | null>
 }
 
 /*
@@ -447,6 +453,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   exportDiagnostics: async () => {
     return safe(() => ipc(window.topensync?.exportDiagnostics), null, '导出诊断包')
+  },
+
+  getStorageInfo: async () => {
+    return safe(() => ipc(window.topensync?.getStorageInfo), null, '读取存储占用')
+  },
+
+  clearCache: async () => {
+    return safe(() => ipc(window.topensync?.clearCache), null, '清除缓存')
   },
 
   togglePause: async () => {

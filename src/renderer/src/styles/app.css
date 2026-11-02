@@ -1139,6 +1139,12 @@ textarea {
   color: var(--tx3);
 }
 
+/* 键值表里的次级行（如数据库的 manifest.db-wal），往右缩进一档表示从属关系 */
+.kv-row .indent {
+  padding-left: 16px;
+  color: var(--tx4);
+}
+
 .kv-row b {
   font-weight: 500;
 }
@@ -1147,8 +1153,20 @@ textarea {
   color: var(--accent);
 }
 
+/* 操作成功后的提示（绿色），区别于 warn-note 的黄色告警 */
+.ok-note {
+  background: var(--ok-bg, rgba(34, 197, 94, 0.08)) !important;
+  border-color: rgba(34, 197, 94, 0.2) !important;
+  color: var(--ok, #22c55e) !important;
+}
+
 .tiny {
   font-size: 10.5px;
+  color: var(--tx3);
+}
+
+/* 弱化文字（次级信息、从属行里的数值） */
+.dim {
   color: var(--tx3);
 }
 

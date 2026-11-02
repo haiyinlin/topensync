@@ -13,6 +13,13 @@ import { hashFile } from './hash/hashes'
 import { ioGovernor, isResourceExhausted } from './io/governor'
 import { loadConfig, normalizeConfig, saveConfig } from './config/store'
 import { exportDiagnostics } from './diagnostics/export'
+import {
+  clearCache,
+  formatBytes,
+  getStorageInfo,
+  type ClearCacheResult,
+  type StorageInfo
+} from './storage/storage'
 import type {
   AppConfig,
   AppSnapshot,
@@ -2022,6 +2029,28 @@ export class Engine {
     const path = await exportDiagnostics(this, this.manifest)
     this.pushLog('info', `已导出诊断包：${path}`)
     return path
+  }
+
+  /**
+   * 数据目录的占用情况（数据库大小、缓存大小）。
+   * 供高级设置页展示。
+   */
+  async getStorageInfo(): Promise<StorageInfo> {
+    return getStorageInfo()
+  }
+
+  /**
+   * 清除运行时缓存（Electron / Chromium 缓存目录）。
+   * 只清白名单里的缓存目录，数据库、配置、日志一律不碰。
+   */
+  async clearCache(): Promise<ClearCacheResult> {
+    const result = await clearCache()
+    this.pushLog(
+      'info',
+      `已清除缓存，释放 ${formatBytes(result.freedBytes)}` +
+        (result.failedDirs.length > 0 ? `（${result.failedDirs.length} 个目录被占用未清理）` : '')
+    )
+    return result
   }
 
   // ── 内部 ──────────────────────────────────────────────

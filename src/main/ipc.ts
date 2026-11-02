@@ -39,6 +39,8 @@ export function registerIpc(engine: Engine): void {
   ipcMain.handle('tasks:list', () => engine.listTasks())
   ipcMain.handle('connection:check', () => engine.recheckConnection())
   ipcMain.handle('diagnostics:export', () => engine.exportDiagnostics())
+  ipcMain.handle('storage:info', () => engine.getStorageInfo())
+  ipcMain.handle('storage:clearCache', () => engine.clearCache())
   ipcMain.handle('sync:pause', () => {
     engine.pause()
     return true

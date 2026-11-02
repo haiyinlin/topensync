@@ -63,6 +63,12 @@ const api = {
   checkConnection: (): Promise<ConnectionStatus> => ipcRenderer.invoke('connection:check'),
   /** 导出诊断包，返回生成的文件路径 */
   exportDiagnostics: (): Promise<string> => ipcRenderer.invoke('diagnostics:export'),
+  /** 数据目录占用（数据库大小、缓存大小） */
+  getStorageInfo: (): Promise<import('@shared/types').StorageInfo> =>
+    ipcRenderer.invoke('storage:info'),
+  /** 清除运行时缓存 */
+  clearCache: (): Promise<import('@shared/types').ClearCacheResult> =>
+    ipcRenderer.invoke('storage:clearCache'),
   /** 暂停同步（停止本地监控与远端对账，保留清单与配置） */
   pauseSync: (): Promise<boolean> => ipcRenderer.invoke('sync:pause'),
   /** 恢复同步 */

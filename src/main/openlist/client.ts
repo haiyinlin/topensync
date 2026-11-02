@@ -372,8 +372,31 @@ export class OpenListClient {
       lastModifiedMs: number
       overwrite?: boolean
       signal?: AbortSignal
+      /**
+       * 流式进度回调（累计已发送字节数）。
+       *
+       * 单次 PUT 的大文件（服务端不支持分片时，几百 MB 也只能走这一条路）
+       * 整段传输可能持续几十秒到几分钟。没有这个回调，上层就只能在
+       * 传输**结束**后才知道发生了多少流量——期间速率显示一直是 0，
+       * 用户看到的就是「正在上传却显示 0 B/s」。
+       */
+      onProgress?: (sent: number) => void
     }
   ): Promise<void> {
+    // 包一层字节计数：每读出一块就上报累计发送字节，让单次 PUT 也有实时速率
+    let sent = 0
+    const counted = opts.onProgress
+      ? body.pipeThrough(
+          new TransformStream<Uint8Array, Uint8Array>({
+            transform(chunk, controller) {
+              sent += chunk.byteLength
+              controller.enqueue(chunk)
+              opts.onProgress?.(sent)
+            }
+          })
+        )
+      : body
+
     await this.request('PUT', '/api/fs/put', {
       headers: {
         'File-Path': encodeURI(remotePath),
@@ -384,7 +407,7 @@ export class OpenListClient {
         'Content-Type': 'application/octet-stream',
         Overwrite: opts.overwrite === false ? 'false' : 'true'
       },
-      body,
+      body: counted,
       signal: opts.signal,
       timeoutMs: Math.max(this.timeoutMs, opts.size / (1024 * 1024) * 1000 * 60)
     })

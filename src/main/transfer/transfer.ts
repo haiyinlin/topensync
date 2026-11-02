@@ -285,12 +285,16 @@ export class Transfer {
       const speed = elapsedMs > 0 ? Math.round((size * 1000) / elapsedMs) : 0
 
       // synced 状态由 upload() 在校验通过后统一写入
+      //
+      // 注意 delta: 0：字节增量已经由 putFile 的流式 onProgress 实时上报了，
+      // 这里再报一次 delta: size 会把整份文件重复计入总体速率（totalBytes 翻倍、
+      // 速率虚高）。收尾只补一个完成态（sent=size），不再计流量。
       this.opts.onProgress?.({
         fileId: req.fileId,
         relPath: req.relPath,
         sent: size,
         total: size,
-        delta: size,
+        delta: 0,
         chunksDone: 1,
         chunksTotal: 1,
         speed
@@ -379,11 +383,35 @@ export class Transfer {
       const stream = createReadStream(req.absPath)
       try {
         const body = Readable.toWeb(stream) as ReadableStream<Uint8Array>
+        /*
+         * 单次 PUT 的流式进度。
+         *
+         * 大文件在服务端不支持分片时只能走这条路，整段传输可能持续
+         * 几十秒到几分钟。`putFile` 的 onProgress 给的是**累计**字节，
+         * 这里换算成增量后喂给上层，总体速率（Engine.recordSpeed）才能
+         * 在传输期间实时更新，而不是等传完才一次性补一个天文数字。
+         */
+        const startedAt = Date.now()
+        let lastSent = 0
         await this.opts.client.putFile(req.remotePath, body, {
           size,
           md5,
           sha1,
-          lastModifiedMs: Math.floor(mtimeMs)
+          lastModifiedMs: Math.floor(mtimeMs),
+          onProgress: (sent) => {
+            const elapsed = (Date.now() - startedAt) / 1000
+            this.opts.onProgress?.({
+              fileId: req.fileId,
+              relPath: req.relPath,
+              sent,
+              total: size,
+              delta: sent - lastSent,
+              chunksDone: 0,
+              chunksTotal: 0,
+              speed: elapsed > 0 ? sent / elapsed : 0
+            })
+            lastSent = sent
+          }
         })
       } finally {
         if (!stream.destroyed) stream.destroy()

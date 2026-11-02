@@ -731,3 +731,36 @@ export interface DiagnosticBundle {
   /** 同步根目录下的顶层条目，便于看出目录结构 */
   treePreview: string[]
 }
+
+/** 数据目录里某个文件 / 目录的占用明细 */
+export interface StorageDirInfo {
+  name: string
+  bytes: number
+  fileCount: number
+}
+
+/** 数据目录占用概览（高级设置页展示） */
+export interface StorageInfo {
+  /** 数据目录绝对路径 */
+  dataDir: string
+  /** 数据库文件大小（manifest.db + -wal + -shm），字节 */
+  databaseBytes: number
+  /** 数据库明细 */
+  databaseFiles: StorageDirInfo[]
+  /** 缓存总大小，字节 */
+  cacheBytes: number
+  /** 缓存目录明细 */
+  cacheDirs: StorageDirInfo[]
+  /** 诊断包目录大小，字节 */
+  diagnosticsBytes: number
+}
+
+/** 清除缓存的结果 */
+export interface ClearCacheResult {
+  /** 释放的字节数 */
+  freedBytes: number
+  /** 清理掉的目录名 */
+  removedDirs: string[]
+  /** 清理失败（仍残留）的目录名 */
+  failedDirs: string[]
+}
