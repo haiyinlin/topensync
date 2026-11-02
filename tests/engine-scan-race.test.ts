@@ -125,6 +125,8 @@ describe('对账与上传的时序', () => {
       remoteRoot: '/qh/backup',
       remoteScan: { ...BASE_CONFIG.remoteScan }
     })
+    // 调度器在「开始同步」之后才建——启动时默认不跑
+    engine.startSync()
 
     const planner = (engine as unknown as { planner: { isIdle: boolean } }).planner
     expect(planner).toBeDefined()
@@ -151,11 +153,13 @@ describe('对账与上传的时序', () => {
       remoteRoot: '/qh/backup',
       remoteScan: { ...BASE_CONFIG.remoteScan }
     })
+    engine.startSync()
 
     const engineAny = engine as unknown as {
       planner: { isIdle: boolean; pendingCount: number }
       waitForUploadsToSettle: (ms?: number) => Promise<void>
     }
+    expect(engineAny.planner).toBeDefined()
 
     // 假装队列里有东西在跑
     Object.defineProperty(engineAny.planner, 'isIdle', {

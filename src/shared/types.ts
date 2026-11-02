@@ -205,6 +205,31 @@ export interface TransferTask {
   attempts: number
 }
 
+// ── 传输速率────────────────────────────────────────
+
+/**
+ * 传输速率统计。
+ *
+ * 三个数字各有各的用处，不能只留一个：
+ * - `current`：此刻的速率，看上传卡没卡
+ * - `max`：本次运行的峰值，看线路能跑多快
+ * - `avg`：本次运行的平均速率，看整体效率
+ *
+ * 单位统一为字节/秒（不是 bit）。
+ */
+export interface TransferSpeed {
+  /** 当前瞬时速率（字节/秒） */
+  current: number
+  /** 本次运行观测到的峰值速率（字节/秒） */
+  max: number
+  /** 本次运行的平均速率（字节/秒） */
+  avg: number
+  /** 累计传输字节数 */
+  totalBytes: number
+  /** 平均速率的统计时长（毫秒） */
+  elapsedMs: number
+}
+
 // ── 配置──────────────────────────────────────────
 export interface RemoteScanConfig {
   enabled: boolean
@@ -370,6 +395,27 @@ export interface ScanProgress {
   total: number | null
   /** 人类可读描述，如「已扫描 128 个文件」 */
   detail: string
+  /**
+   * 这次为什么失败（只在 running=false 且确实是失败时非空）。
+   *
+   * 失败与成功在界面上长得一模一样的话，用户完全看不出刚才对账失败了。
+   */
+  error?: string | null
+}
+
+/**
+ * 两条扫描通道各自的进度。
+ *
+ * 以前只有**一个** progress 对象，两条通道共用：
+ * 对账一开始就把本地扫描的进度覆盖掉，本地扫描的状态再也回不来；
+ * 而且对账成功路径不推终态，进度条就一直挂着。
+ *
+ * 拆成两个独立槽位，两条通道互不干扰——
+ * 本地扫描可以正在跑，同时对账也在跑，界面各显示各的。
+ */
+export interface ScanProgressPair {
+  local: ScanProgress | null
+  remote: ScanProgress | null
 }
 
 export interface MainToRendererEvents {
@@ -427,6 +473,17 @@ export interface AppStats {
   /** 本地扫描通道状态 */
   localScan: {
     watching: boolean
+    /**
+     * 监控没起来时的原因（目录不存在、权限不足等）；null 表示正常。
+     *
+     * 必须把「没设置目录」和「设了但起不来」分开：
+     * 用户配的是盘符根（`Z:/`）时，网卡没插上 / 盘符未映射 / 权限不足
+     * 都会让监控起不来。这两种情况给同一句「尚未设置同步目录」，
+     * 用户只会反复去改设置，而真正的原因是盘符当时不存在。
+     */
+    error: string | null
+    /** 正在监听的本地目录（未设置时为空串） */
+    root: string
     lastScanAt: number | null
     scannedCount: number
   }
@@ -440,13 +497,27 @@ export interface AppStats {
     diffCount: number
     nextScanAt: number | null
   }
+  /** 传输速率统计（上传 + 下载合计） */
+  speed: TransferSpeed
   /**
-   * 当前正在跑的扫描进度（本地扫描或远端对账）。
+   * 当前正在跑的扫描进度（本地扫描与远端对账各自独立）。
    *
    * 没有它的话，扫描期间界面完全没有反馈——
    * 用户点了「扫描本地」，不知道程序是在跑还是已经卡死。
    */
-  progress: ScanProgress | null
+  progress: ScanProgressPair
+  /**
+   * 是否已经开始同步。
+   *
+   * 程序启动后**默认不开始**——本地扫描、远端对账、上传队列
+   * 都要用户显式点「开始同步」才启动。
+   * 备份工具在启动瞬间就抢带宽、扫全盘，不是用户想要的。
+   *
+   * 与 `paused` 分开：`started=false` 是「还没开始」，
+   * `started=true && paused=true` 是「运行中途暂停了」，
+   * 两者的界面文案不一样。
+   */
+  started: boolean
 }
 
 /** 首屏一次性拉取的全部数据 */

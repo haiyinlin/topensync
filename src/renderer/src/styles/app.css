@@ -1973,3 +1973,78 @@ textarea {
 .act-row.end {
   justify-content: flex-end;
 }
+
+/* ── 虚拟滚动表格 ─────────────────────────────────────
+ *
+ * 只渲染可视区的行，DOM 节点数与总行数无关。
+ * 六万个文件时全量渲染会把渲染进程卡死几秒，
+ * 虚拟滚动之后无论多少行，界面都是流畅的。
+ */
+.vtable {
+  overflow: auto;
+  /* 滚动条样式统一：Windows 默认滚动条在深色主题下很扎眼 */
+  scrollbar-width: thin;
+  scrollbar-color: var(--tx3) transparent;
+}
+
+.vtable::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.vtable::-webkit-scrollbar-thumb {
+  background: var(--tx3);
+  border-radius: 5px;
+}
+
+.vtable::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.vtable-tbl {
+  table-layout: fixed;
+}
+
+/*
+ * 行高必须固定。
+ *
+ * 虚拟滚动靠「每行等高」推算可视区里该渲染哪些行；
+ * 行高由内容决定的话，两行文字的哈希单元格会把整张表的
+ * 位置算歪——滚动时行会跳、内容会重叠。
+ */
+.vtable-tbl tbody tr {
+  height: 40px;
+}
+
+.vtable-tbl tbody td {
+  height: 40px;
+  padding-top: 0;
+  padding-bottom: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 表头吸顶：滚动时列名始终可见 */
+.vtable-head th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--card);
+}
+
+/* 撑高度的占位行：没有内容、没有边框 */
+.vtable-pad td {
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.vtable-pad:hover td {
+  background: transparent;
+}
+
+.vtable-empty-cell {
+  text-align: center;
+  padding: 28px 12px !important;
+  color: var(--tx3);
+}

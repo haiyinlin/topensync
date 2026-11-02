@@ -46,6 +46,17 @@ export function registerIpc(engine: Engine): void {
     engine.resume()
     return true
   })
+  /*
+   * 开始同步。
+   *
+   * 程序启动后默认不开始——本地扫描、远端对账、上传队列
+   * 都要用户点「开始同步」才启动。备份工具多半开机自启，
+   * 用户可能只是路过看一眼状态，不该一开就抢带宽扫全盘。
+   */
+  ipcMain.handle('sync:start', () => {
+    engine.startSync()
+    return true
+  })
 
   // ── 动作 ──────────────────────────────────────────────
   ipcMain.handle('config:patch', (_e, patch: Partial<AppConfig>) => engine.updateConfig(patch))

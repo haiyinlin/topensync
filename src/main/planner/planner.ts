@@ -66,6 +66,14 @@ export interface PlannerOptions {
   onSkipDetail?: (detail: { local: number; remote: number; total: number }) => void
   /** 下载完成计数变化 */
   onDownload?: (count: number) => void
+  /**
+   * 下载流量回调（字节数）。
+   *
+   * 上传的流量由 Transfer 的 onProgress 报；下载不走 Transfer，
+   * 所以要单独开一个口子，否则「总体速率」只统计了一半——
+   * 而下载往往才是备份里的主要流量。
+   */
+  onDownloadBytes?: (bytes: number) => void
 }
 
 interface QueueItem {
@@ -1309,6 +1317,8 @@ export class Planner {
     await mkdir(dirname(item.absPath), { recursive: true })
 
     const controller = new AbortController()
+    // 上一次累计接收量；用来把回调里的累计值换算成增量
+    let lastReceived = 0
     try {
       await this.opts.client.downloadTo(item.remotePath, item.absPath, {
         signal: controller.signal,
@@ -1318,6 +1328,15 @@ export class Planner {
             return
           }
           const elapsed = (Date.now() - startedAt) / 1000
+          /*
+           * 报**增量**字节，不是累计值。
+           *
+           * 累计值直接喂给总体速率统计的话，每个进度回调都会把
+           * 已传的量再累加一遍，速率成倍虚高。
+           */
+          const delta = Math.max(0, received - lastReceived)
+          lastReceived = received
+          this.opts.onDownloadBytes?.(delta)
           this.touch(item.relPath, {
             state: 'downloading',
             category: 'download',

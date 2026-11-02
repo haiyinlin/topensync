@@ -23,10 +23,12 @@ export function TopBar(): React.JSX.Element {
   const connection = useAppStore((s) => s.connection)
   const remoteScan = useAppStore((s) => s.stats?.remoteScan ?? null)
   const paused = useAppStore((s) => s.stats?.paused ?? false)
+  const started = useAppStore((s) => s.stats?.started ?? false)
   const progress = useAppStore((s) => s.progress)
   const lastError = useAppStore((s) => s.lastError)
   const clearError = useAppStore((s) => s.clearError)
   const togglePause = useAppStore((s) => s.togglePause)
+  const startSync = useAppStore((s) => s.startSync)
 
   // 点击瞬间就要有反馈：主进程推回进度之前，先按「已发起」处理。
   const [requested, setRequested] = useState<{ kind: 'local' | 'remote'; at: number } | null>(null)
@@ -41,9 +43,15 @@ export function TopBar(): React.JSX.Element {
    */
   const [failure, setFailure] = useState<{ kind: 'local' | 'remote'; message: string } | null>(null)
 
-  const localBusy = requested?.kind === 'local' || (progress?.running === true && progress.kind === 'local')
-  const remoteBusy =
-    requested?.kind === 'remote' || (progress?.running === true && progress.kind === 'remote')
+  /*
+   * 两条通道的忙碌态各自独立。
+   *
+   * 以前共用一个 progress 对象：本地扫描和对账互相顶掉，
+   * 正在扫描时点对账，本地扫描的指示就灭了；
+   * 对账结束后进度条还挂着（成功路径不推终态），按钮永远显示「对账中…」。
+   */
+  const localBusy = requested?.kind === 'local' || progress.local?.running === true
+  const remoteBusy = requested?.kind === 'remote' || progress.remote?.running === true
 
   const localFailure = failure?.kind === 'local' ? failure : null
   const remoteFailure = failure?.kind === 'remote' ? failure : null
@@ -57,7 +65,9 @@ export function TopBar(): React.JSX.Element {
    * 只依赖它，effect 根本不会重跑，按钮就永远钉在「扫描中…」。
    */
   React.useEffect(() => {
-    if (requested && progress && !progress.running) {
+    if (!requested) return
+    const p = requested.kind === 'local' ? progress.local : progress.remote
+    if (p && !p.running) {
       setRequested(null)
     }
   }, [requested, progress])
@@ -67,12 +77,17 @@ export function TopBar(): React.JSX.Element {
    *
    * 没有这一步的话失败与成功在界面上长得一模一样：
    * 按钮变回可点，用户完全看不出刚才的对账失败了。
+   *
+   * 两条通道各看各的：本地扫描失败不该把对账按钮也染红。
    */
   React.useEffect(() => {
-    if (!progress || progress.running) return
-    const message = readProgressError(progress)
-    if (!message) return
-    setFailure({ kind: progress.kind, message })
+    for (const p of [progress.local, progress.remote]) {
+      if (!p || p.running) continue
+      const message = readProgressError(p)
+      if (!message) continue
+      setFailure({ kind: p.kind, message })
+      return
+    }
   }, [progress])
 
   /*
@@ -211,14 +226,35 @@ export function TopBar(): React.JSX.Element {
           <Icon name="diff" />
           {remoteBusy ? '对账中…' : remoteFailure ? '对账失败' : '对账远端'}
         </button>
-        <button
-          className={`btn${paused ? ' primary' : ''}`}
-          title={paused ? '恢复本地监控与远端对账' : '暂停同步（保留清单与配置）'}
-          onClick={() => void togglePause()}
-        >
-          <Icon name={paused ? 'play' : 'pause'} />
-          {paused ? '继续同步' : '暂停同步'}
-        </button>
+        {/*
+         * 开始 / 暂停。
+         *
+         * 启动后默认**不开始**：本地扫描、远端对账、上传队列
+         * 都要用户点一下才启动。备份工具多半开机自启，
+         * 用户可能只是路过看一眼状态，不该一开就抢带宽扫全盘。
+         *
+         * 三态分开：「开始同步 / 继续同步 / 暂停同步」——
+         * 「还没开始过」和「中途暂停了」对用户是两回事。
+         */}
+        {started ? (
+          <button
+            className={`btn${paused ? ' primary' : ''}`}
+            title={paused ? '恢复本地监控与远端对账' : '暂停同步（保留清单与配置）'}
+            onClick={() => void togglePause()}
+          >
+            <Icon name={paused ? 'play' : 'pause'} />
+            {paused ? '继续同步' : '暂停同步'}
+          </button>
+        ) : (
+          <button
+            className="btn primary"
+            title="开始本地扫描、远端对账与上传"
+            onClick={() => void startSync()}
+          >
+            <Icon name="play" />
+            开始同步
+          </button>
+        )}
       </div>
     </header>
   )
@@ -244,15 +280,31 @@ function readProgressError(progress: ScanProgress | null): string | null {
  * 进度条必须在他当前所在的页面上也看得见。
  *
  * 总量未知时（遍历型操作事先数不出总数）显示不确定态动画条 + 已处理计数。
+ *
+ * **两条通道各画一条**，不合并：
+ * 本地扫描和远端对账可以同时在跑，合并成一条的话
+ * 一条通道的进度会把另一条顶掉，用户根本不知道自己在看什么。
  */
 export function ScanProgressBar(): React.JSX.Element | null {
   const progress = useAppStore((s) => s.progress)
-  if (!progress || !progress.running) return null
+  const local = progress.local
+  const remote = progress.remote
+  if (!local?.running && !remote?.running) return null
 
+  return (
+    <>
+      {local?.running === true && <ProgressRow progress={local} />}
+      {remote?.running === true && <ProgressRow progress={remote} />}
+    </>
+  )
+}
+
+function ProgressRow({ progress }: { progress: ScanProgress }): React.JSX.Element {
   const label = progress.kind === 'local' ? '扫描本地' : '远端对账'
-  const percent = progress.total && progress.total > 0
-    ? Math.min(100, Math.round((progress.done / progress.total) * 100))
-    : null
+  const percent =
+    progress.total && progress.total > 0
+      ? Math.min(100, Math.round((progress.done / progress.total) * 100))
+      : null
 
   return (
     <div className="scan-progress" role="status" aria-live="polite">

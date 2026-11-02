@@ -402,16 +402,40 @@ export class Manifest {
     return row ? (mapFileRow(row) as unknown as FileEntry) : null
   }
 
-  listFiles(opts: { state?: FileState; limit?: number } = {}): FileEntry[] {
+  /**
+   * 列出文件清单。
+   *
+   * 默认**降序**（local_path DESC）：用户要的「最新/最靠前的先看」，
+   * 升序在几万行里等于让人自己滚到最底下。
+   *
+   * `offset` 配合 `limit` 做分页——数据量大时不能一次把六万行
+   * 全塞进 IPC 的返回值里，那会让渲染进程卡住好几秒。
+   */
+  listFiles(
+    opts: { state?: FileState; limit?: number; offset?: number; desc?: boolean } = {}
+  ): FileEntry[] {
     const limit = opts.limit ?? 500
-    const rows = opts.state
-      ? (this.db
-          .prepare('SELECT * FROM files WHERE state = ? ORDER BY local_path LIMIT ?')
-          .all(opts.state, limit) as Record<string, unknown>[])
-      : (this.db
-          .prepare('SELECT * FROM files ORDER BY local_path LIMIT ?')
-          .all(limit) as Record<string, unknown>[])
+    const offset = opts.offset ?? 0
+    const order = opts.desc === false ? 'local_path ASC' : 'local_path DESC'
+    const sql = opts.state
+      ? `SELECT * FROM files WHERE state = ? ORDER BY ${order} LIMIT ? OFFSET ?`
+      : `SELECT * FROM files ORDER BY ${order} LIMIT ? OFFSET ?`
+    const rows = (
+      opts.state
+        ? this.db.prepare(sql).all(opts.state, limit, offset)
+        : this.db.prepare(sql).all(limit, offset)
+    ) as Record<string, unknown>[]
     return rows.map((r) => mapFileRow(r) as unknown as FileEntry)
+  }
+
+  /** 文件总数（分页与「共 N 个」提示用） */
+  countFiles(state?: FileState): number {
+    const row = (
+      state
+        ? this.db.prepare('SELECT COUNT(*) AS n FROM files WHERE state = ?').get(state)
+        : this.db.prepare('SELECT COUNT(*) AS n FROM files').get()
+    ) as { n: number } | undefined
+    return row?.n ?? 0
   }
 
   /** 按多个状态批量查询（启动时恢复未完成任务用） */
@@ -922,6 +946,79 @@ export class Manifest {
       .prepare('INSERT INTO scans (kind, trigger, started_at) VALUES (?, ?, ?)')
       .run(kind, trigger, Date.now())
     return Number(res.lastInsertRowid)
+  }
+
+  /**
+   * 取某个通道最近一次扫描记录。
+   *
+   * 为什么必须有这个：扫描结果以前只存在 engine 的内存字段里，
+   * 程序一关就没了——用户重开应用看到「已扫描 0 个文件」，
+   * 以为没扫过。实际上上一轮扫了六万个。
+   *
+   * scans 表一直都在，只是没人往里写、也没人读。
+   */
+  lastScan(kind: ScanRecord['kind']): ScanRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM scans WHERE kind = ? AND status != 'running'
+          ORDER BY started_at DESC LIMIT 1`
+      )
+      .get(kind) as Record<string, unknown> | undefined
+    if (!row) return null
+    return {
+      id: Number(row.id),
+      kind: row.kind as ScanRecord['kind'],
+      trigger: row.trigger as ScanRecord['trigger'],
+      startedAt: Number(row.started_at),
+      finishedAt: row.finished_at === null ? null : Number(row.finished_at),
+      scannedCount: Number(row.scanned_count),
+      changedCount: Number(row.changed_count),
+      errorCount: Number(row.error_count),
+      status: row.status as ScanRecord['status'],
+      errorMsg: (row.error_msg as string | null) ?? null
+    }
+  }
+
+  /** 某通道最近一次扫描记录的 id（续写用） */
+  lastScanId(kind: ScanRecord['kind']): number | null {
+    const row = this.db
+      .prepare('SELECT id FROM scans WHERE kind = ? ORDER BY started_at DESC LIMIT 1')
+      .get(kind) as { id: number } | undefined
+    return row?.id ?? null
+  }
+
+  /** 某通道的扫描历史（倒序） */
+  listScans(kind: ScanRecord['kind'], limit = 20): ScanRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM scans WHERE kind = ? ORDER BY started_at DESC LIMIT ?')
+      .all(kind, limit) as Record<string, unknown>[]
+    return rows.map((row) => ({
+      id: Number(row.id),
+      kind: row.kind as ScanRecord['kind'],
+      trigger: row.trigger as ScanRecord['trigger'],
+      startedAt: Number(row.started_at),
+      finishedAt: row.finished_at === null ? null : Number(row.finished_at),
+      scannedCount: Number(row.scanned_count),
+      changedCount: Number(row.changed_count),
+      errorCount: Number(row.error_count),
+      status: row.status as ScanRecord['status'],
+      errorMsg: (row.error_msg as string | null) ?? null
+    }))
+  }
+
+  /**
+   * 更新某通道最近一次扫描的计数（不新建行）。
+   *
+   * 本地扫描是「持续」的：chokidar 的 ready 只报一次总数，
+   * 但后续增量事件一直在来。写入 scans 表能保证重启后
+   * 看到的仍是上次真实的数量，而不是 0。
+   */
+  updateLastScanCounts(kind: ScanRecord['kind'], counts: { scanned: number }): void {
+    const id = this.lastScanId(kind)
+    if (id === null) return
+    this.db
+      .prepare('UPDATE scans SET scanned_count = ?, finished_at = ? WHERE id = ?')
+      .run(counts.scanned, Date.now(), id)
   }
 
   finishScan(

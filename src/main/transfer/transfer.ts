@@ -48,6 +48,13 @@ export interface TransferOptions {
     relPath: string
     sent: number
     total: number
+    /**
+     * 本次新增的字节数（增量）。
+     *
+     * `sent` 是累计值，想统计「总体速率」需要增量——
+     * 否则每个并发任务都会把总量重复累加一遍，速率直接虚高。
+     */
+    delta: number
     chunksDone: number
     chunksTotal: number
     speed: number
@@ -234,8 +241,22 @@ export class Transfer {
     const { manifest } = this.opts
     manifest.setState(req.relPath, 'uploading')
 
+    const startedAt = Date.now()
     try {
       await this.putWithRecovery(req, md5, sha1, size, mtimeMs)
+      const elapsedMs = Date.now() - startedAt
+
+      /*
+       * 单次 PUT 的速率。
+       *
+       * 以前这里写死 0，于是**所有小文件的速度都是 0**——
+       * 而小文件恰恰是绝大多数。界面上「速度 0 B/s」看着像卡住了。
+       *
+       * 用「整个 PUT 的耗时」算：包含建连与服务端处理，
+       * 小文件会低估（几 KB 除以几十毫秒没有参考价值），
+       * 但大文件足够准。而总体速率另有窗口统计兜底（见 Engine.recordSpeed）。
+       */
+      const speed = elapsedMs > 0 ? Math.round((size * 1000) / elapsedMs) : 0
 
       // synced 状态由 upload() 在校验通过后统一写入
       this.opts.onProgress?.({
@@ -243,9 +264,10 @@ export class Transfer {
         relPath: req.relPath,
         sent: size,
         total: size,
+        delta: size,
         chunksDone: 1,
         chunksTotal: 1,
-        speed: 0
+        speed
       })
       return { ok: true }
     } catch (err) {
@@ -368,6 +390,7 @@ export class Transfer {
           relPath: req.relPath,
           sent,
           total: size,
+          delta: length,
           chunksDone: i + 1,
           chunksTotal: total,
           speed: elapsed > 0 ? sent / elapsed : 0

@@ -40,7 +40,14 @@ export const DEFAULT_CONFIG: AppConfig = {
   remoteScan: {
     enabled: true,
     intervalHours: 6,
-    onStartup: true,
+    /*
+     * 「开始同步后立即对账一次」。
+     *
+     * 默认关闭：程序启动后本来就默认不开始同步，
+     * 用户点「开始同步」时也不该立刻列一遍远端树——
+     * 除非他确实开了这个开关。
+     */
+    onStartup: false,
     refresh: true,
     maxConcurrency: 1,
     timeoutMinutes: 30,

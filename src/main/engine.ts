@@ -1,6 +1,6 @@
 import { app } from 'electron'
 import { join } from 'path'
-import { statSync } from 'fs'
+import { statSync, existsSync } from 'fs'
 import { Manifest } from './db/manifest'
 import { OpenListClient } from './openlist/client'
 import { Transfer } from './transfer/transfer'
@@ -26,6 +26,7 @@ import type {
   ScanProgress,
   ScanRecord,
   ScanStatus,
+  TransferSpeed,
   TransferTask
 } from '@shared/types'
 
@@ -78,6 +79,13 @@ export class Engine {
     checkedAt: null
   }
   private skippedThisRun = 0
+  /**
+   * 本地监控起不来的原因；null 表示正常。
+   *
+   * 单独存而不是靠「watcher 是不是 null」推断：
+   * 「没设置目录」和「设了但目录不可达」在界面上必须说不同的话。
+   */
+  private watcherError: string | null = null
   /** 其中「本地内容未变」而跳过 */
   private skippedLocal = 0
   /** 其中「远端已有同样内容」而跳过 */
@@ -94,11 +102,40 @@ export class Engine {
   /** 是否处于暂停状态 */
   private paused = false
   /**
+   * 传输速率统计（上传 + 下载合计）。
+   *
+   * 三个数各有各的用处：
+   * - current：此刻的速率，看有没有卡住
+   * - max：本次运行的峰值，看线路能跑多快
+   * - avg：本次运行的平均，看整体效率
+   *
+   * avg 用「累计字节 / 累计时长」算，而不是「各次速率的平均」——
+   * 后者会让一个 1 KB 的文件和 1 GB 的文件等权，
+   * 算出来的平均速率毫无参考价值。
+   */
+  private speedCurrent = 0
+  private speedMax = 0
+  private speedTotalBytes = 0
+  private speedStartedAt = Date.now()
+  /** 速率采样的时间窗：太密会抖，太疏会迟钝 */
+  private speedSampledAt = Date.now()
+  private speedWindowBytes = 0
+  /**
    * 当前扫描/对账进度。
    *
-   * 供首屏快照与统计使用；运行中的进度靠事件推送。
+   * 两条通道**各存一份**，不共用一个对象。
+   * 共用时对账一启动就把本地扫描的进度覆盖掉，
+   * 本地扫描的状态再也回不来；而且一条通道的终态会误伤另一条。
    */
-  private progress: ScanProgress | null = null
+  private localProgress: ScanProgress | null = null
+  private remoteProgress: ScanProgress | null = null
+  /**
+   * 是否已经开始同步。
+   *
+   * 程序启动后默认**不开始**——本地扫描、远端对账、上传队列
+   * 都要用户点「开始同步」才启动。备份工具不该在启动瞬间就抢带宽。
+   */
+  private started = false
   /**
    * 首次连接自检的 promise。
    *
@@ -123,19 +160,130 @@ export class Engine {
   // ── 生命周期 ──────────────────────────────────────────
 
   async start(): Promise<void> {
-    await this.ensureConnect()
+    /*
+     * 启动后**默认不开始同步**。
+     *
+     * 程序一打开就扫全盘、列远端树、抢带宽——这不是用户想要的：
+     * 备份工具多半是开机自启的，用户可能只是路过看一眼状态。
+     * 现在本地扫描、远端对账、上传队列都要用户点「开始同步」才启动。
+     *
+     * 但**连接自检照做**：那只是几十毫秒的登录探测，
+     * 不产生任何流量，用户需要它来确认配置对不对。
+     */
+    this.started = false
 
-    this.planner = this.buildPlanner()
-    this.planner.start()
+    // 回读上次的扫描结果：重启后概览页不该显示「已扫描 0 个文件」
+    this.restoreScanHistory()
 
-    // 恢复上次未完成的任务
-    const recovered = this.planner.recoverPending()
-    if (recovered > 0) {
-      this.pushLog('info', `恢复未完成任务 ${recovered} 个`)
+    /*
+     * 每一段各自兜住异常。
+     *
+     * 以前是一个大 try 包住后面所有步骤：任何一步抛异常，
+     * 后面的步骤全都不执行，而界面只会显示一句笼统的「引擎启动失败」。
+     * 分段之后，某一步失败不影响其余部分照常工作。
+     */
+    try {
+      await this.ensureConnect()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.pushLog('error', `连接自检失败：${message}`, { category: 'system' })
     }
 
+    this.pushLog('info', '已就绪，点击「开始同步」后开始扫描与上传', { category: 'system' })
+  }
+
+  /**
+   * 开始同步。
+   *
+   * 把本地监控、远端对账、上传调度一次性拉起来。
+   * 界面上就是顶栏那个按钮。
+   */
+  startSync(): void {
+    if (this.started && !this.paused) return
+    this.started = true
+    this.paused = false
+
+    // 本地监控不依赖 OpenList 连接，先起来
     this.startWatcher()
-    this.startReconciler()
+
+    try {
+      this.planner = this.buildPlanner()
+      this.planner.start()
+
+      // 恢复上次未完成的任务
+      const recovered = this.planner.recoverPending()
+      if (recovered > 0) {
+        this.pushLog('info', `恢复未完成任务 ${recovered} 个`)
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.pushLog('error', `调度器启动失败：${message}`, { category: 'system' })
+    }
+
+    try {
+      this.startReconciler()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.pushLog('error', `远端对账启动失败：${message}`, { category: 'system' })
+    }
+
+    this.pushLog('info', '已开始同步', { category: 'system' })
+  }
+
+  /**
+   * 把一次本地扫描的结果写进 scans 表。
+   *
+   * 为什么要专门记：本地扫描跟远端对账不同，它是**持续**的——
+   * chokidar 就绪时报一次总数，之后增量事件一直在来。
+   * 所以这里不是「每次新建一行」，而是：
+   * - 第一次就绪时开一行（后续复用同一行更新计数）
+   * - 手动重扫时把那一行更新成最新的数
+   *
+   * 这样重启后回读到的就是上次真实的文件数，概览页不会显示 0。
+   */
+  private recordLocalScan(count: number): void {
+    try {
+      const existing = this.manifest.lastScanId('local')
+      if (existing === null) {
+        const id = this.manifest.startScan('local', 'startup')
+        this.manifest.finishScan(id, 'done', { scanned: count, changed: 0, errors: 0 })
+      } else {
+        this.manifest.updateLastScanCounts('local', { scanned: count })
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.pushLog('warn', `写入本地扫描记录失败：${message}`, { category: 'system' })
+    }
+  }
+
+  /**
+   * 从数据库回读上次的扫描结果。
+   *
+   * 扫描结果以前只存在内存里，程序一关就没了：
+   * 用户重开应用看到「已扫描 0 个文件」「尚未执行对账」，
+   * 以为上次根本没扫过——实际上上一轮扫了六万个。
+   *
+   * scans 表一直都在，只是没人往里写、也没人读。这一步把两头接上。
+   */
+  private restoreScanHistory(): void {
+    try {
+      const local = this.manifest.lastScan('local')
+      if (local) {
+        this.localScannedCount = local.scannedCount
+        this.lastLocalScanAt = local.finishedAt ?? local.startedAt
+      }
+      const remote = this.manifest.lastScan('remote')
+      if (remote) {
+        this.remoteScannedCount = remote.scannedCount
+        this.remoteLastScanAt = remote.finishedAt ?? remote.startedAt
+        this.remoteLastStatus = remote.status
+        // 差异数以数据库里的未处置差异为准（那才是当前真实待办）
+        this.remoteDiffCount = this.manifest.listUnresolvedDiffs().length
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.pushLog('warn', `读取历史扫描记录失败：${message}`, { category: 'system' })
+    }
   }
 
   stop(): void {
@@ -266,6 +414,8 @@ export class Engine {
       // 取配置的方式与 Planner 一致：实时读，不吃构造时的快照
       getConfig: () => this.config,
       onProgress: (info) => {
+        // 总体速率统计：按**增量**字节累计，与并发任务数无关
+        this.recordSpeed(info.delta)
         const task = this.planner?.getTaskByPath(info.relPath)
         if (!task) return
         this.events.onTransfer?.({
@@ -301,54 +451,99 @@ export class Engine {
       },
       onDownload: (count) => {
         this.downloadedCount = count
+      },
+      onDownloadBytes: (bytes) => {
+        // 下载流量计入总体速率
+        this.recordSpeed(bytes)
       }
     })
   }
 
+  /**
+   * 启动本地监控。
+   *
+   * 三处必须做对，否则用户会看到「配了目录却提示没设置」：
+   *
+   * ①**先确认目录真的在**。盘符根（`Z:/`）尤其危险：
+   * 网络映射盘没连上、移动盘没插、盘符被系统重新分配，配置里那串
+   * `Z:/` 就指向一个不存在的位置。以前这里不检查，chokidar 对不存在的
+   * 路径不报错也不抛，只是静默什么都不产出——界面上只能显示
+   * 「未在监控中（尚未设置同步目录）」，把用户的注意力引向错误的方向。
+   *
+   * ②**失败原因要留下来**，让界面能说清楚是「没设目录」还是「目录不可用」。
+   *
+   * ③**不许抛异常**。watcher 起不来不该让整个引擎跟着挂掉。
+   */
   private startWatcher(): void {
-    if (!this.config.syncRoot) return
-    this.watcher?.stop()
+    this.watcherError = null
 
-    this.watcher = new Watcher({
-      root: this.config.syncRoot,
-      exclude: this.config.exclude,
-      onEvent: (e: WatchEvent) => {
-        /*
-         * 必须挂 catch。
-         *
-         * handleEvent 内部有多处可能抛：重命名窗口里把文件改完就删
-         * → hashFile 读文件时 ENOENT；清单写入失败 → DB 错误。
-         *
-         * 异常从 async 函数里逃出变成未处理的 Promise 拒绝，
-         * Node 的默认行为是**终止进程**——用户的应用就这么崩了，
-         * 而且界面上什么都看不到。
-         */
-        void this.planner
-          ?.handleEvent(e.relPath, e.type === 'upsert', e.isDir === true)
-          .catch((err: unknown) => {
-            const message = err instanceof Error ? err.message : String(err)
-            this.pushLog('error', `处理本地变更失败 ${e.relPath}：${message}`)
+    const root = this.config.syncRoot
+    if (!root) {
+      this.watcher = null
+      return
+    }
+
+    // 盘符根 / 映射盘：配置里的路径可能指向一个当前不可达的位置
+    if (!isDirectoryAccessible(root)) {
+      this.watcher = null
+      this.watcherError = describeInaccessibleRoot(root)
+      this.pushLog('error', `本地同步目录不可用：${this.watcherError}`, { category: 'system' })
+      return
+    }
+    this.watcher?.stop()
+    this.watcher = null
+
+    try {
+      this.watcher = new Watcher({
+        root,
+        exclude: this.config.exclude,
+        onEvent: (e: WatchEvent) => {
+          /*
+           * 必须挂 catch。
+           *
+           * handleEvent 内部有多处可能抛：重命名窗口里把文件改完就删
+           * → hashFile 读文件时 ENOENT；清单写入失败 → DB 错误。
+           *
+           * 异常从 async 函数里逃出变成未处理的 Promise 拒绝，
+           * Node 的默认行为是**终止进程**——用户的应用就这么崩了，
+           * 而且界面上什么都看不到。
+           */
+          void this.planner
+            ?.handleEvent(e.relPath, e.type === 'upsert', e.isDir === true)
+            .catch((err: unknown) => {
+              const message = err instanceof Error ? err.message : String(err)
+              this.pushLog('error', `处理本地变更失败 ${e.relPath}：${message}`)
+            })
+        },
+        onReady: (count) => {
+          this.localScannedCount = count
+          this.lastLocalScanAt = Date.now()
+          // 落库：重启后概览页还能显示上次的真实数量，而不是 0
+          this.recordLocalScan(count)
+          this.events.onScan?.({
+            id: 0,
+            kind: 'local',
+            trigger: 'event',
+            startedAt: this.lastLocalScanAt,
+            finishedAt: Date.now(),
+            scannedCount: count,
+            changedCount: 0,
+            errorCount: 0,
+            status: 'done',
+            errorMsg: null
           })
-      },
-      onReady: (count) => {
-        this.localScannedCount = count
-        this.lastLocalScanAt = Date.now()
-        this.events.onScan?.({
-          id: 0,
-          kind: 'local',
-          trigger: 'event',
-          startedAt: this.lastLocalScanAt,
-          finishedAt: Date.now(),
-          scannedCount: count,
-          changedCount: 0,
-          errorCount: 0,
-          status: 'done',
-          errorMsg: null
-        })
-      },
-      onError: (err) => this.pushLog('error', `监控出错：${err.message}`)
-    })
-    this.watcher.start()
+        },
+        onError: (err) => {
+          this.watcherError = err.message
+          this.pushLog('error', `监控出错：${err.message}`)
+        }
+      })
+      this.watcher.start()
+    } catch (err) {
+      this.watcher = null
+      this.watcherError = err instanceof Error ? err.message : String(err)
+      this.pushLog('error', `本地监控启动失败：${this.watcherError}`, { category: 'system' })
+    }
   }
 
   private startReconciler(): void {
@@ -413,6 +608,28 @@ export class Engine {
         this.remoteScannedCount = res.scannedFiles
         this.remoteDiffCount = res.diffCount
         this.remoteScanRunning = false
+        /*
+         * 收掉对账进度条。
+         *
+         * 这里以前**漏了**：只有失败分支推了 running=false，
+         * 成功路径没推——于是对账早就结束了，顶栏的进度条还挂着，
+         * 按钮也一直显示「对账中…」。用户只能重启应用。
+         *
+         * 放在 onComplete 里而不是 triggerScan 里，
+         * 是因为定时触发的对账也走这个回调——两条路径都会收尾。
+         */
+        this.pushProgress({
+          kind: 'remote',
+          running: false,
+          done: res.scannedFiles,
+          total: null,
+          detail: res.error
+            ? `对账失败：${res.error}`
+            : res.timedOut
+              ? '对账超时结束'
+              : `对账完成，扫描 ${res.scannedFiles} 个文件，发现 ${res.diffCount} 处差异`,
+          error: res.error ?? null
+        })
         this.events.onScan?.({
           id: res.scanId,
           kind: 'remote',
@@ -443,7 +660,20 @@ export class Engine {
         })
       }
     })
-    this.reconciler.start()
+
+    /*
+     * 对账器**建**与**排期**分开。
+     *
+     * 建：随时都建。改完地址/账号后必须马上有对账器，
+     * 否则用户点「立即对账」会静默失败（这是修过的 P0）。
+     *
+     * 排期（定时器 + 启动即对账）：只在**已开始同步**时排。
+     * 用户还没点「开始同步」，远端对账就自己跑起来了——
+     * 那正是「启动默认关闭对账」要避免的事。
+     */
+    if (this.started) {
+      this.reconciler.start()
+    }
   }
 
   // ── 对外能力 ──────────────────────────────────────────
@@ -522,11 +752,43 @@ export class Engine {
       this.startReconciler()
     }
 
-    // 同步根变了 → 监控必须重建
+    // 同步根变了 → 监控必须重建（但只在已开始同步时才建）
     if (previousRoot !== this.config.syncRoot) {
-      this.startWatcher()
+      if (this.started) {
+        this.startWatcher()
+      } else {
+        /*
+         * 还没开始同步时也要检查目录可达性。
+         *
+         * 用户刚把目录填成 `Z:/`，而 Z 盘此刻没插上——
+         * 界面必须立刻说「Z: 盘当前不可用」，
+         * 而不是等到他点「开始同步」才反应，
+         * 更不能显示那句误导性的「尚未设置同步目录」。
+         */
+        this.checkSyncRootAccessibility()
+      }
     }
     return this.config
+  }
+
+  /**
+   * 只检查同步目录的可达性，不启动监控。
+   *
+   * 与 startWatcher() 分开：未开始同步时也要能给出准确的诊断，
+   * 但不能因为检查就起了监控（那等于偷偷开始同步）。
+   */
+  private checkSyncRootAccessibility(): void {
+    const root = this.config.syncRoot
+    if (!root) {
+      this.watcherError = null
+      return
+    }
+    if (isDirectoryAccessible(root)) {
+      this.watcherError = null
+      return
+    }
+    this.watcherError = describeInaccessibleRoot(root)
+    this.pushLog('error', `本地同步目录不可用：${this.watcherError}`, { category: 'system' })
   }
 
   /**
@@ -559,6 +821,31 @@ export class Engine {
   }
 
   async triggerScan(kind: ScanKind): Promise<void> {
+    /*
+     * 用户显式点了扫描/对账 → 视为「开始同步」。
+     *
+     * 启动后默认不开始，但用户主动点「扫描本地」时还回一句
+     * 「请先点开始同步」是自作多情——他要的就是这个动作。
+     */
+    if (!this.started) {
+      this.pushLog('info', '检测到手动扫描，已开始同步', { category: 'system' })
+      this.startSync()
+    }
+
+    /*
+     * 同一条通道已经在跑了就别再起一轮。
+     *
+     * 用户连点「对账远端」会起两个对账：两边同时列远端树、
+     * 同时比对、同时写差异表——差异会被重复插入，
+     * 而对账器自己也会抛「对账已在进行中」。
+     */
+    if (this.isScanning(kind)) {
+      this.pushLog('warn', kind === 'remote' ? '对账已在进行中' : '本地扫描已在进行中', {
+        category: 'system'
+      })
+      return
+    }
+
     if (kind === 'remote') {
       if (!this.reconciler) {
         this.pushLog('warn', '尚未连接 OpenList，无法执行远端对账', { category: 'system' })
@@ -718,6 +1005,7 @@ export class Engine {
       })
       this.localScannedCount = count
       this.lastLocalScanAt = Date.now()
+      this.recordLocalScan(count)
       this.events.onScan?.({
         id: 0,
         kind: 'local',
@@ -1047,6 +1335,8 @@ export class Engine {
       totalFiles: Object.values(counts).reduce((a, b) => a + b, 0),
       localScan: {
         watching: this.watcher?.isWatching ?? false,
+        error: this.watcherError,
+        root: this.config.syncRoot,
         lastScanAt: this.lastLocalScanAt,
         scannedCount: this.localScannedCount
       },
@@ -1061,7 +1351,12 @@ export class Engine {
           ? Date.now() + this.config.remoteScan.intervalHours * 3600_000
           : null
       },
-      progress: this.progress
+      speed: this.getSpeedStats(),
+      progress: {
+        local: this.localProgress,
+        remote: this.remoteProgress
+      },
+      started: this.started
     }
   }
 
@@ -1124,13 +1419,34 @@ export class Engine {
     this.reconciler?.stop()
     this.reconciler = null
     this.planner?.stop()
+    // 暂停时两条通道的进度都要收掉，否则界面上的进度条会挂着不消失
+    this.pushProgress({
+      kind: 'local',
+      running: false,
+      done: 0,
+      total: null,
+      detail: '同步已暂停'
+    })
+    this.pushProgress({
+      kind: 'remote',
+      running: false,
+      done: 0,
+      total: null,
+      detail: '同步已暂停'
+    })
     this.pushLog('warn', '已暂停同步')
   }
 
-  /** 恢复同步 */
+  /**
+   * 恢复同步。
+   *
+   * 与 startSync() 走同一条路径：两者都是「把一切拉起来」，
+   * 区别只是 startSync() 还要处理「从未开始过」的状态。
+   */
   resume(): void {
     if (!this.paused) return
     this.paused = false
+    this.started = true
     this.planner = this.buildPlanner()
     this.planner.start()
     /*
@@ -1152,6 +1468,11 @@ export class Engine {
 
   get isPaused(): boolean {
     return this.paused
+  }
+
+  /** 是否已经开始同步（未开始 ≠ 已暂停） */
+  get isStarted(): boolean {
+    return this.started
   }
 
   /**
@@ -1191,8 +1512,16 @@ export class Engine {
    * 所以每一次进度变化都要推给渲染进程。
    */
   private pushProgress(progress: ScanProgress): void {
-    this.progress = progress
+    // 按通道分流：两条通道各存各的，互不覆盖
+    if (progress.kind === 'local') this.localProgress = progress
+    else this.remoteProgress = progress
     this.events.onProgress?.(progress)
+  }
+
+  /** 某条通道当前是否正在跑 */
+  private isScanning(kind: ScanKind): boolean {
+    const p = kind === 'local' ? this.localProgress : this.remoteProgress
+    return p?.running === true
   }
 
   /**
@@ -1201,11 +1530,102 @@ export class Engine {
    * 返回一个收尾函数：调用它就把进度标记为结束并推一次。
    * 用 try/finally 保证异常路径下进度条也会收掉，
    * 否则界面会永远停在「扫描中」。
+   *
+   * 收尾时**保留最后一次的进度描述**（done 也保留），
+   * 而不是硬写成「已完成」——用户看到的应该是
+   * 「已扫描 128 个文件」这种有信息量的结果。
    */
-  private beginProgress(kind: ScanKind, detail: string): () => void {
+  private beginProgress(kind: ScanKind, detail: string): (finalDetail?: string) => void {
     this.pushProgress({ kind, running: true, done: 0, total: null, detail })
-    return () => {
-      this.pushProgress({ kind, running: false, done: 0, total: null, detail: '已完成' })
+    return (finalDetail?: string): void => {
+      // pushProgress 已经把每次进度存进了对应的槽位，直接读回来即可
+      const cur = kind === 'local' ? this.localProgress : this.remoteProgress
+      this.pushProgress({
+        kind,
+        running: false,
+        done: cur?.done ?? 0,
+        total: cur?.total ?? null,
+        detail: finalDetail ?? cur?.detail ?? '已完成'
+      })
     }
   }
+
+  /**
+   * 记录一段传输流量，刷新速率统计。
+   *
+   * `bytes` 是这一段新增的字节数（不是累计值）。
+   *
+   * current 用**时间窗**算而不是「这一段 / 这一段的时长」：
+   * 单次 PUT 的传输可能只有几十毫秒，用它自己的时长算出来的速率
+   * 会是天文数字（几百 MB/s），而实际线路可能只有 5 MB/s。
+   * 所以这里按 1 秒窗口累计，到窗口边界才结算一次速率。
+   */
+  private recordSpeed(bytes: number): void {
+    if (bytes <= 0) return
+    const now = Date.now()
+    this.speedTotalBytes += bytes
+    this.speedWindowBytes += bytes
+
+    const windowMs = now - this.speedSampledAt
+    if (windowMs < 1000) {
+      // 窗口未满：保留当前速率的衰减估计，让数字不至于完全不动
+      return
+    }
+    const instant = (this.speedWindowBytes * 1000) / windowMs
+    this.speedCurrent = instant
+    if (instant > this.speedMax) this.speedMax = instant
+    this.speedWindowBytes = 0
+    this.speedSampledAt = now
+  }
+
+  /** 当前速率统计快照 */
+  private getSpeedStats(): TransferSpeed {
+    const elapsedMs = Math.max(1, Date.now() - this.speedStartedAt)
+    return {
+      current: Math.round(this.speedCurrent),
+      max: Math.round(this.speedMax),
+      avg: Math.round((this.speedTotalBytes * 1000) / elapsedMs),
+      totalBytes: this.speedTotalBytes,
+      elapsedMs
+    }
+  }
+}
+
+/**
+ * 判断本地同步目录当前是否可达。
+ *
+ * 盘符根（`Z:/`）是最容易踩的一种：网络映射盘没连上、移动盘没插上、
+ * 盘符被系统重新分配给别的设备，配置里那串路径就指向一个
+ * **不存在或不对**的位置。这种情况下 chokidar 不会报错——
+ * 它只是静默地什么都不产出，用户在界面上看到的却是
+ * 「尚未设置同步目录」，然后去反复改设置，永远找不到原因。
+ *
+ * 所以在起监控之前先探一次，把「目录不可用」这件事说清楚。
+ */
+function isDirectoryAccessible(root: string): boolean {
+  try {
+    if (!existsSync(root)) return false
+    return statSync(root).isDirectory()
+  } catch {
+    // 权限不足、路径过长、盘符未就绪——一律按「不可达」处理
+    return false
+  }
+}
+
+/**
+ * 把「目录不可达」翻译成人能看懂的一句话。
+ *
+ * 注意区分两种情况：
+ * - 路径**就是**盘符根（`Z:/`）→ 说「盘不可用」，用户该去查盘符/网盘
+ * - 路径是某个子目录 → 说「目录不存在或不可访问」，用户该去查路径
+ *
+ * 以前这里只用 `/^([A-Za-z]):/` 判断，于是 `C:\Users\me\Desktop\missing`
+ * 也被说成「C: 盘当前不可用」——完全指错了方向。
+ */
+function describeInaccessibleRoot(root: string): string {
+  const driveRoot = /^([A-Za-z]):[\\/]?$/.exec(root.trim())
+  if (driveRoot) {
+    return `${driveRoot[1].toUpperCase()}: 盘当前不可用（未映射、未插入或无访问权限）`
+  }
+  return `目录不存在或不可访问：${root}`
 }

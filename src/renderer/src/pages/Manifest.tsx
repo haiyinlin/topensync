@@ -2,6 +2,7 @@ import * as React from 'react'
 import { useMemo, useState } from 'react'
 import { Icon } from '../components/Icon'
 import { BatchBar } from '../components/BatchBar'
+import { VirtualTable } from '../components/VirtualTable'
 import type { PageKey } from '../App'
 import type { DeepVerifyResult, DiffKind, DiffResolution } from '@shared/types'
 import { formatSize } from './Queue'
@@ -70,6 +71,8 @@ function RemotePath({
 
 export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void }): React.JSX.Element {
   const files = useAppStore((s) => s.files)
+  const filesLimit = useAppStore((s) => s.filesLimit)
+  const loadMoreFiles = useAppStore((s) => s.loadMoreFiles)
   const diffs = useAppStore((s) => s.diffs)
   const config = useAppStore((s) => s.config)
   const deleteLocalFiles = useAppStore((s) => s.deleteLocalFiles)
@@ -183,6 +186,47 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
 
   /** 远端根目录：用来把远端绝对路径拆成「根 + 相对路径」 */
   const remoteRoot = config?.remoteRoot || '/'
+
+  /*
+   * 全选（表头常驻）。
+   *
+   * 两张表各管各的命名空间：本地文件用 `local:` 前缀，
+   * 远端独有文件用 `remote:` 前缀——两者绝不能混，
+   * 否则「全选远端」会把本地文件也勾上，一删就是一整批本地文件。
+   */
+  const localIds = useMemo(
+    () => shown.map((f) => `${LOCAL_ID_PREFIX}${f.localPath}`),
+    [shown]
+  )
+  const remoteIds = useMemo(
+    () => remoteOnly.map((d) => `${REMOTE_ID_PREFIX}${d.remotePath}`),
+    [remoteOnly]
+  )
+
+  const allLocalSelected = localIds.length > 0 && localIds.every((id) => selected.has(id))
+  const someLocalSelected = localIds.some((id) => selected.has(id))
+  const allRemoteSelected = remoteIds.length > 0 && remoteIds.every((id) => selected.has(id))
+  const someRemoteSelected = remoteIds.some((id) => selected.has(id))
+
+  const toggleSelectAllLocal = (): void => {
+    const next = new Set(selected)
+    if (allLocalSelected) {
+      for (const id of localIds) next.delete(id)
+    } else {
+      for (const id of localIds) next.add(id)
+    }
+    setSelected(next)
+  }
+
+  const toggleSelectAllRemote = (): void => {
+    const next = new Set(selected)
+    if (allRemoteSelected) {
+      for (const id of remoteIds) next.delete(id)
+    } else {
+      for (const id of remoteIds) next.add(id)
+    }
+    setSelected(next)
+  }
 
   /** 任一维度不是默认值 → 处于筛选状态 */
   const filtersActive =
@@ -319,24 +363,38 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
               只存在于远端、本地还没有的文件，共 {remoteOnly.length} 个 —— 路径相对远端根目录，可下载到本地或忽略
             </span>
           </div>
-          <table className="tbl">
-            <thead>
+          <VirtualTable
+            head={
               <tr>
-                <th style={{ width: '4%' }} />
+                <th style={{ width: '4%' }}>
+                  <label className="batch-check" title="全选 / 全不选远端独有文件">
+                    <input
+                      type="checkbox"
+                      checked={allRemoteSelected}
+                      ref={(el) => {
+                        if (el) el.indeterminate = !allRemoteSelected && someRemoteSelected
+                      }}
+                      onChange={toggleSelectAllRemote}
+                    />
+                  </label>
+                </th>
                 <th style={{ width: '46%' }}>远端文件（相对远端根）</th>
                 <th style={{ width: '12%' }}>大小</th>
                 <th style={{ width: '14%' }}>发现时间</th>
                 <th style={{ width: '24%' }}>操作</th>
               </tr>
-            </thead>
-            <tbody>
-              {remoteOnly.map((d) => (
+            }
+            rowCount={remoteOnly.length}
+            renderRow={(index) => {
+              const d = remoteOnly[index]
+              if (!d) return null
+              return (
                 <tr key={d.id}>
                   <td>
                     <label className="batch-check">
                       <input
                         type="checkbox"
-                        checked={selected.has(d.remotePath)}
+                        checked={selected.has(`${REMOTE_ID_PREFIX}${d.remotePath}`)}
                         onChange={() => {
                           const next = new Set(selected)
                           const id = `${REMOTE_ID_PREFIX}${d.remotePath}`
@@ -375,9 +433,10 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
                     </div>
                   </td>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              )
+            }}
+            maxHeight={280}
+          />
         </div>
       )}
 
@@ -396,138 +455,169 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
             本地文件
           </h2>
           <span className="muted">
-            同步目录内受管的文件，共 {shown.length} 个 —— 路径均相对本地同步目录
+            同步目录内受管的文件，共 {shown.length} 个
+            {files.length >= filesLimit && filesLimit > 0 && (
+              <>（已加载前 {files.length} 条）</>
+            )}
+             —— 路径均相对本地同步目录
           </span>
         </div>
-        <table className="tbl">
-          <thead>
+        <VirtualTable
+          head={
             <tr>
-              <th style={{ width: '4%' }} />
-              <th style={{ width: '22%' }}>本地文件</th>
-              <th style={{ width: '8%' }}>大小</th>
-              <th style={{ width: '11%' }}>修改时间</th>
-              <th style={{ width: '19%' }} title="相对远端根目录的路径；与本地路径不同时会高亮">
-                远端位置
-              </th>
-              <th style={{ width: '10%' }}>哈希 (md5:sha1)</th>
-              <th style={{ width: '9%' }}>同步状态</th>
-              <th style={{ width: '8%' }}>可信度</th>
-              <th style={{ width: '9%' }}>对账差异</th>
-              <th style={{ width: '4%' }}>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {shown.length === 0 && (
-              <tr>
-                <td
-                  colSpan={10}
-                  className="dim"
-                  style={{ textAlign: 'center', padding: '28px 12px' }}
-                >
-                  {files.length === 0
-                    ? '清单为空。启动本地扫描后这里会列出所有受管文件。'
-                    : `当前筛选条件下没有文件（共 ${files.length} 个）。放宽筛选条件试试。`}
-                </td>
-              </tr>
-            )}
-            {shown.map((f) => (
-              <tr key={f.id}>
-                <td>
-                  <label className="batch-check">
+              <th style={{ width: '4%' }}>
+                <label className="batch-check" title="全选 / 全不选当前筛选出的本地文件">
                     <input
                       type="checkbox"
-                      checked={selected.has(f.localPath)}
-                      onChange={() => {
-                        const next = new Set(selected)
-                        const id = `${LOCAL_ID_PREFIX}${f.localPath}`
-                        if (next.has(id)) next.delete(id)
-                        else next.add(id)
-                        setSelected(next)
+                      checked={allLocalSelected}
+                      ref={(el) => {
+                        if (el) el.indeterminate = !allLocalSelected && someLocalSelected
                       }}
+                      onChange={toggleSelectAllLocal}
                     />
                   </label>
-                </td>
-                <td>
-                  <div className="cell-file">
-                    <Icon name="files" className="ic file" />
-                    <span title={f.localPath}>{f.localPath}</span>
-                  </div>
-                </td>
-                <td className="mono dim">{formatSize(f.localSize)}</td>
-                <td className="mono dim nw">{formatTime(f.mtimeMs)}</td>
-                <td className="mono">
-                  {f.remotePath ? (
-                    <div className="cell-file">
-                      <Icon name="cloud-check" className="ic file" />
-                      {(() => {
-                        const rel = splitRemote(remoteRoot, f.remotePath).rel
-                        // 远端位置与本地路径一致时压暗：
-                        // 这一列真正要回答的是「远端放的位置跟本地一样吗」，
-                        // 几百行都一样的路径刷成亮色只会变成冗余列。
-                        const same = rel.replace(/^\//, '') === f.localPath
-                        return (
-                          <span className="path-split" title={f.remotePath}>
-                            <span className="path-root">{splitRemote(remoteRoot, f.remotePath).root}</span>
-                            <span className={same ? 'path-rel same' : 'path-rel'}>{rel}</span>
-                          </span>
-                        )
-                      })()}
-                    </div>
-                  ) : (
-                    <span className="dim">—</span>
-                  )}
-                </td>
-                <td className="mono dim">
-                  {f.md5 ? `${f.md5.slice(0, 8)}:${f.sha1?.slice(0, 4) ?? ''}…` : '—'}
-                </td>
-                <td>
-                  <span className={`pill ${stateTone(f.state)}`}>{STATE_LABELS[f.state] ?? f.state}</span>
-                </td>
-                <td>
-                  {f.verifyLevel ? (
-                    <span
-                      className={`pill ${verifyTone(f.verifyLevel)}`}
-                      title={
-                        f.verifyLevel === 'size'
-                          ? '仅凭「文件名 + 大小」认定远端已有，内容未校验。可用深度校验确认。'
-                          : '内容已通过哈希比对确认。'
-                      }
-                    >
-                      {VERIFY_LABELS[f.verifyLevel]}
-                    </span>
-                  ) : (
-                    <span className="pill gray">—</span>
-                  )}
-                </td>
-                <td>
-                  {(() => {
-                    const kind = diffByPath.get(f.localPath)
-                    if (!kind) return <span className="pill gray">—</span>
-                    return (
-                      <span className={`pill ${diffTone(kind)}`}>
-                        {DIFF_KIND_LABELS[kind]}
-                      </span>
-                    )
-                  })()}
-                </td>
-                <td>
-                  <button
-                    className="btn tiny ghost"
-                    title="删除本地文件"
-                    onClick={() => {
-                      const next = new Set(selected)
-                      next.add(`${LOCAL_ID_PREFIX}${f.localPath}`)
-                      setSelected(next)
-                    }}
-                  >
-                    <Icon name="trash" />
-                  </button>
-                </td>
+                </th>
+                <th style={{ width: '22%' }}>本地文件</th>
+                <th style={{ width: '8%' }}>大小</th>
+                <th style={{ width: '11%' }}>修改时间</th>
+                <th style={{ width: '19%' }} title="相对远端根目录的路径；与本地路径不同时会高亮">
+                  远端位置
+                </th>
+                <th style={{ width: '10%' }}>哈希 (md5:sha1)</th>
+                <th style={{ width: '9%' }}>同步状态</th>
+                <th style={{ width: '8%' }}>可信度</th>
+                <th style={{ width: '9%' }}>对账差异</th>
+                <th style={{ width: '4%' }}>操作</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            }
+            rowCount={shown.length}
+            renderRow={(index) => {
+              const f = shown[index]
+              if (!f) return null
+              return (
+                <tr key={f.id}>
+                  <td>
+                    <label className="batch-check">
+                      <input
+                        type="checkbox"
+                        checked={selected.has(`${LOCAL_ID_PREFIX}${f.localPath}`)}
+                        onChange={() => {
+                          const next = new Set(selected)
+                          const id = `${LOCAL_ID_PREFIX}${f.localPath}`
+                          if (next.has(id)) next.delete(id)
+                          else next.add(id)
+                          setSelected(next)
+                        }}
+                      />
+                    </label>
+                  </td>
+                  <td>
+                    <div className="cell-file">
+                      <Icon name="files" className="ic file" />
+                      <span title={f.localPath}>{f.localPath}</span>
+                    </div>
+                  </td>
+                  <td className="mono dim">{formatSize(f.localSize)}</td>
+                  <td className="mono dim nw">{formatTime(f.mtimeMs)}</td>
+                  <td className="mono">
+                    {f.remotePath ? (
+                      <div className="cell-file">
+                        <Icon name="cloud-check" className="ic file" />
+                        {(() => {
+                          const rel = splitRemote(remoteRoot, f.remotePath).rel
+                          // 远端位置与本地路径一致时压暗：
+                          // 这一列真正要回答的是「远端放的位置跟本地一样吗」，
+                          // 几百行都一样的路径刷成亮色只会变成冗余列。
+                          const same = rel.replace(/^\//, '') === f.localPath
+                          return (
+                            <span className="path-split" title={f.remotePath}>
+                              <span className="path-root">{splitRemote(remoteRoot, f.remotePath).root}</span>
+                              <span className={same ? 'path-rel same' : 'path-rel'}>{rel}</span>
+                            </span>
+                          )
+                        })()}
+                      </div>
+                    ) : (
+                      <span className="dim">—</span>
+                    )}
+                  </td>
+                  <td className="mono dim" title={f.md5 && f.sha1 ? `${f.md5}\n${f.sha1}` : undefined}>
+                    {f.md5 ? `${f.md5.slice(0, 8)}:${f.sha1?.slice(0, 4) ?? ''}…` : '—'}
+                  </td>
+                  <td>
+                    <span className={`pill ${stateTone(f.state)}`}>{STATE_LABELS[f.state] ?? f.state}</span>
+                  </td>
+                  <td>
+                    {f.verifyLevel ? (
+                      <span
+                        className={`pill ${verifyTone(f.verifyLevel)}`}
+                        title={
+                          f.verifyLevel === 'size'
+                            ? '仅凭「文件名 + 大小」认定远端已有，内容未校验。可用深度校验确认。'
+                            : '内容已通过哈希比对确认。'
+                        }
+                      >
+                        {VERIFY_LABELS[f.verifyLevel]}
+                      </span>
+                    ) : (
+                      <span className="pill gray">—</span>
+                    )}
+                  </td>
+                  <td>
+                    {(() => {
+                      const kind = diffByPath.get(f.localPath)
+                      if (!kind) return <span className="pill gray">—</span>
+                      return (
+                        <span className={`pill ${diffTone(kind)}`}>
+                          {DIFF_KIND_LABELS[kind]}
+                        </span>
+                      )
+                    })()}
+                  </td>
+                  <td>
+                    <button
+                      className="btn tiny ghost"
+                      title="删除本地文件"
+                      onClick={() => {
+                        const next = new Set(selected)
+                        next.add(`${LOCAL_ID_PREFIX}${f.localPath}`)
+                        setSelected(next)
+                      }}
+                    >
+                      <Icon name="trash" />
+                    </button>
+                  </td>
+                </tr>
+              )
+            }}
+            maxHeight={520}
+            empty={
+              files.length === 0
+                ? '清单为空。开始同步后这里会列出所有受管文件。'
+                : `当前筛选条件下没有文件（共 ${files.length} 个）。放宽筛选条件试试。`
+            }
+          />
       </div>
+
+      {/*
+       * 加载更多。
+       *
+       * 六万个文件一次性塞进 IPC 返回值，JSON 序列化要一两秒，
+       * 渲染进程主线程直接卡住。所以分页加载：
+       * 先给五千条，虚拟滚动让这五千条渲染毫无压力，
+       * 用户需要更多时再点一次。
+       *
+       * 判断「还有更多」用「已加载数正好等于页大小」——
+       * 清单里到底有多少条，概览页的统计才是准数（要 COUNT 全表，
+       * 每次拉清单都 COUNT 一次反而更慢）。
+       */}
+      {filesLimit > 0 && files.length >= filesLimit && (
+        <div className="card toolbar" style={{ justifyContent: 'center' }}>
+          <button className="btn ghost" onClick={() => void loadMoreFiles()}>
+            加载更多（已显示 {files.length} 条）
+          </button>
+        </div>
+      )}
 
       <BatchBar
         allIds={[

@@ -2,6 +2,7 @@ import * as React from 'react'
 import { useMemo, useState } from 'react'
 import { Icon } from '../components/Icon'
 import { BatchBar } from '../components/BatchBar'
+import { VirtualTable } from '../components/VirtualTable'
 import type { DiffKind, DiffResolution } from '@shared/types'
 import { useAppStore } from '../store'
 
@@ -61,13 +62,15 @@ export function Reconcile(): React.JSX.Element {
    * 以前用 setTimeout(2600) 猜「对账大概要这么久」——
    * 远端文件多的时候对账要好几分钟，按钮早就恢复了常态，
    * 用户会以为没生效。现在由真实进度驱动。
+   *
+   * 只看**对账那条通道**的进度：本地扫描在跑不该让这个按钮转圈。
    */
-  const reconciling = busy || (progress?.running === true && progress.kind === 'remote')
+  const reconciling = busy || progress.remote?.running === true
 
   // 进度结束就清掉本地标记，否则按钮永远停在禁用态
   React.useEffect(() => {
-    if (!progress?.running) setBusy(false)
-  }, [progress?.running])
+    if (!progress.remote?.running) setBusy(false)
+  }, [progress.remote?.running])
 
   // 进页面刷一次差异：对账是后台跑的，差异可能在你不看这个页面时产生或消失
   React.useEffect(() => {
@@ -94,6 +97,25 @@ export function Reconcile(): React.JSX.Element {
     )
   }, [diffs, filter, query])
   const shownIds = useMemo(() => shown.map((d) => String(d.id)), [shown])
+
+  /*
+   * 全选（表头常驻）。
+   *
+   * 以前全选框藏在 BatchBar 里，而 BatchBar 在「没选中任何项」时
+   * 整个不渲染——用户永远看不到全选框，
+   * 必须先手动勾一个才能「全选」。逻辑倒置。
+   */
+  const allSelected = shownIds.length > 0 && shownIds.every((id) => selected.has(id))
+  const someSelected = shownIds.some((id) => selected.has(id))
+  const toggleSelectAll = (): void => {
+    if (allSelected) {
+      const next = new Set(selected)
+      for (const id of shownIds) next.delete(id)
+      setSelected(next)
+      return
+    }
+    setSelected(new Set([...selected, ...shownIds]))
+  }
 
   const resolve = (id: number, resolution: DiffResolution): void => {
     /*
@@ -219,10 +241,21 @@ export function Reconcile(): React.JSX.Element {
       </div>
 
       <div className="card table-card">
-        <table className="tbl">
-          <thead>
+        <VirtualTable
+          head={
             <tr>
-              <th style={{ width: '4%' }} />
+              <th style={{ width: '4%' }}>
+                <label className="batch-check" title="全选 / 全不选当前筛选出的差异项">
+                  <input
+                    type="checkbox"
+                    checked={allSelected}
+                    ref={(el) => {
+                      if (el) el.indeterminate = !allSelected && someSelected
+                    }}
+                    onChange={toggleSelectAll}
+                  />
+                </label>
+              </th>
               <th style={{ width: '11%' }}>类型</th>
               <th style={{ width: '25%' }}>路径</th>
               <th style={{ width: '13%' }}>本地</th>
@@ -230,22 +263,12 @@ export function Reconcile(): React.JSX.Element {
               <th style={{ width: '11%' }}>发现时间</th>
               <th style={{ width: '23%' }}>处理</th>
             </tr>
-          </thead>
-          <tbody>
-            {shown.length === 0 && (
-              <tr>
-                <td
-                  colSpan={7}
-                  className="dim"
-                  style={{ textAlign: 'center', padding: '28px 12px' }}
-                >
-                  {diffs.length === 0
-                    ? '暂无差异。运行一次对账以核对远端文件树。'
-                    : '没有符合当前筛选条件的差异项。'}
-                </td>
-              </tr>
-            )}
-            {shown.map((d) => (
+          }
+          rowCount={shown.length}
+          renderRow={(index) => {
+            const d = shown[index]
+            if (!d) return null
+            return (
               <tr key={d.id}>
                 <td>
                   <label className="batch-check">
@@ -271,17 +294,26 @@ export function Reconcile(): React.JSX.Element {
                     <span title={d.remotePath}>{d.remotePath}</span>
                   </div>
                 </td>
-                <td className="mono dim">
+                <td className="mono dim" title={d.localMtime ? formatTime(d.localMtime) : undefined}>
                   {d.localSize !== null ? `${formatSize(d.localSize)}` : '—'}
-                  <br />
-                  <span className="tiny">{d.localMtime ? formatTime(d.localMtime) : ''}</span>
+                  {d.localMtime ? ` · ${formatTime(d.localMtime)}` : ''}
                 </td>
-                <td className="mono dim">
+                <td
+                  className="mono dim"
+                  title={
+                    d.kind === 'missing_remote'
+                      ? '已被外部删除'
+                      : d.remoteMtime
+                        ? formatTime(d.remoteMtime)
+                        : undefined
+                  }
+                >
                   {d.remoteSize !== null ? formatSize(d.remoteSize) : '—'}
-                  <br />
-                  <span className="tiny">
-                    {d.kind === 'missing_remote' ? '已被外部删除' : d.remoteMtime ? formatTime(d.remoteMtime) : ''}
-                  </span>
+                  {d.kind === 'missing_remote'
+                    ? ' · 已被外部删除'
+                    : d.remoteMtime
+                      ? ` · ${formatTime(d.remoteMtime)}`
+                      : ''}
                 </td>
                 <td className="mono dim nw">{formatTime(d.detectedAt)}</td>
                 <td>
@@ -314,9 +346,15 @@ export function Reconcile(): React.JSX.Element {
                   </div>
                 </td>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            )
+          }}
+          maxHeight={520}
+          empty={
+            diffs.length === 0
+              ? '暂无差异。运行一次对账以核对远端文件树。'
+              : '没有符合当前筛选条件的差异项。'
+          }
+        />
       </div>
 
       <BatchBar

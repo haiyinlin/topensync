@@ -151,6 +151,75 @@ chokidar 监听的是带前缀的路径，它回报的事件路径也带前缀�
 
 用 Proxy 而不是逐个方法加判断：写操作点有 40+ 个，逐个加守卫一定会漏。
 
+### scans 表：扫描结果的持久化
+
+`scans` 表一直都在，但此前**只有远端对账往里写**，本地扫描的结果只存在 engine 的内存字段里——程序一关就没了，用户重开看到「已扫描 0 个文件」，以为没扫过。
+
+现在：
+
+- 本地扫描首次就绪时 `startScan('local')` 开一行，之后用 `updateLastScanCounts()` 更新同一行（本地扫描是**持续**的，不能每个事件插一行）
+- 远端对账每轮 `startScan('remote')` → `finishScan()`
+- 引擎启动时 `restoreScanHistory()` 回读最近一轮，概览页显示真实数字
+
+**口径必须一致**：`scans.scanned_count` 存的是**文件数**（不是目录数）。引擎运行时展示的是 `scannedFiles`，两处口径不一致的话，重启后回读的数字会和运行中显示的对不上——同一轮对账，两个数。
+
+---
+
+## 五之二、两条通道的进度必须分开
+
+`ScanProgress` 以前只有**一个**实例，两条通道共用：
+
+- 对账一开始就把本地扫描的进度覆盖掉，本地扫描的状态永远回不来
+- 一条通道推终态会误伤另一条
+- 对账的**成功路径压根没推终态**（只有 catch 分支推了），于是对账早就结束了，顶栏进度条还挂着、按钮永远显示「对账中…」
+
+现在 `AppStats.progress` 是 `ScanProgressPair`：
+
+```typescript
+interface ScanProgressPair {
+  local: ScanProgress | null
+  remote: ScanProgress | null
+}
+```
+
+主进程按 `kind` 分流存，渲染层按 `kind` 分流渲染成**两条独立的进度条**。
+
+**教训**：共用一个「当前进度」对象，天然就会互相覆盖。两条独立的通道就该有两个独立的槽位。
+
+---
+
+## 五之三、启动默认不开始同步
+
+`engine.start()` 只做两件事：连接自检、回读历史扫描结果。**不建 watcher、不建 reconciler、不建 planner**。
+
+用户点顶栏「开始同步」才调 `engine.startSync()`，把三者一次性拉起来。
+
+三处需要区分：
+
+| 状态 | `started` | `paused` | 顶栏按钮 |
+|---|---|---|---|
+| 刚启动 | false | false | 开始同步 |
+| 运行中 | true | false | 暂停同步 |
+| 中途暂停 | true | true | 继续同步 |
+
+**「对账器创建」与「对账器排期」必须分开**：`updateConfig()` 改完地址后要**立刻**建对账器（否则用户点「立即对账」会静默失败——这是修过的 P0），但**排期**（定时器 + 启动即对账）只在 `started` 为真时才开。否则用户还没点「开始同步」，远端对账自己就跑起来了。
+
+---
+
+## 五之四、大数据量：分页 + 虚拟滚动
+
+六万个本地文件、几千个远端文件时，界面会卡死。两层解决：
+
+**数据层**：`manifest.listFiles({ limit, offset })` 分页查询，渲染进程每次只取 5000 条（`FILE_PAGE_SIZE`），「加载更多」按钮追加。一次性把六万条塞进 IPC 返回值，JSON 序列化要一两秒，渲染进程主线程直接卡住。
+
+**渲染层**：`components/VirtualTable.tsx` 只渲染可视区 + 缓冲区的行，上方/下方各放一个撑高度的占位行，DOM 节点数恒定在几十个。
+
+虚拟滚动的前提是**行高固定**：
+
+- CSS 里 `.vtable-tbl tbody tr { height: 40px }` 强制等高
+- 组件里的 `ROW_HEIGHT` 必须与 CSS **严格一致**，否则滚动会跳行
+- 单元格内容不能撑高行：原来「哈希」列是两行（md5 + sha1），改成单行 + `title` 提示完整值
+
 ---
 
 ## 六、配置
@@ -175,13 +244,23 @@ chokidar 监听的是带前缀的路径，它回报的事件路径也带前缀�
 
 ## 七、IPC 契约
 
-`src/main/ipc.ts` 注册 22 个 invoke 通道 + 3 个 on 通道；`src/shared/types.ts` 的 `MainToRendererEvents` 声明 7 个推送通道。
+`src/main/ipc.ts` 注册 23 个 invoke 通道 + 3 个 on 通道；`src/shared/types.ts` 的 `MainToRendererEvents` 声明 7 个推送通道。
 
 **约定**：
 
 - **查询类**用 `handle`（返回数据）
 - **动作类**用 `on`（单向触发，不需要回执）
 - **需要等结果的动作用 `handle`**——例如 `diff:resolve`：以前用 `send` + `setTimeout(400)` 猜时间，而「移入回收站」要走网络请求，400ms 常常不够，差异行就永远留在表里，用户以为操作没生效、反复点
+
+### 同步状态的三态
+
+| 通道 | 用途 | 何时可调 |
+|---|---|---|
+| `sync:start` | 开始同步（建 watcher / reconciler / planner） | 任意时候 |
+| `sync:pause` | 暂停（停三者，保留清单与配置） | 已开始时 |
+| `sync:resume` | 继续（重建三者并恢复未完成任务） | 已暂停时 |
+
+启动后默认未开始——`sync:start` 是唯一能把同步拉起来的入口。
 
 ### 渲染进程的事件订阅
 

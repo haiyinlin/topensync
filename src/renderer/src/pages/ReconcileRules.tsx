@@ -124,8 +124,8 @@ export function ReconcileRules(): React.JSX.Element {
           </label>
           <label className="switch-row">
             <span>
-              <b>启动后立即对账一次</b>
-              <em>异步执行，不阻塞启动</em>
+              <b>开始同步后立即对账一次</b>
+              <em>程序启动后默认不开始同步；点「开始同步」时按此开关决定要不要先对账一次</em>
             </span>
             <span className="switch">
               <input

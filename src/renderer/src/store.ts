@@ -8,7 +8,7 @@ import type {
   DiffEntry,
   FileEntry,
   LogEntry,
-  ScanProgress,
+  ScanProgressPair,
   TransferTask
 } from '@shared/types'
 
@@ -26,12 +26,20 @@ interface AppState {
   config: AppConfig | null
   stats: AppStats | null
   files: FileEntry[]
+  /** 当前已加载的文件条数（分页上限） */
+  filesLimit: number
   diffs: DiffEntry[]
   tasks: TransferTask[]
   logs: LogEntry[]
   connection: ConnectionStatus | null
-  /** 当前扫描/对账进度；null 表示没有进行中的扫描 */
-  progress: ScanProgress | null
+  /**
+   * 两条扫描通道各自的进度。
+   *
+   * 分开存，而不是一个 progress 对象：
+   * 共用时对账一启动就把本地扫描的进度覆盖掉，
+   * 本地扫描的状态再也回不来；而且一条通道的终态会误伤另一条。
+   */
+  progress: ScanProgressPair
   /** 最近一次失败的说明；null 表示当前没有失败 */
   lastError: string | null
 
@@ -46,6 +54,8 @@ interface AppState {
   clearError: () => void
   refreshStats: () => Promise<void>
   refreshFiles: () => Promise<void>
+  /** 加载更多文件（分页追加） */
+  loadMoreFiles: () => Promise<void>
   refreshDiffs: () => Promise<void>
   saveConfig: (patch: Partial<AppConfig>) => Promise<AppConfig | null>
   recheckConnection: () => Promise<void>
@@ -53,6 +63,8 @@ interface AppState {
   exportDiagnostics: () => Promise<string | null>
   /** 切换暂停状态；返回切换后的状态 */
   togglePause: () => Promise<boolean | null>
+  /** 开始同步（启动后默认不开始） */
+  startSync: () => Promise<void>
   /** 删除本地文件（批量）；返回成功/失败数 */
   deleteLocalFiles: (relPaths: string[]) => Promise<{ deleted: number; failed: number }>
   /** 从队列移除任务记录（批量）；返回移除条数 */
@@ -84,16 +96,26 @@ let initCleanup: (() => void) | null = null
 /** 空的清理函数：没有订阅需要退时用它 */
 function noop(): void {}
 
+/**
+ * 文件清单的分页大小。
+ *
+ * 六万个文件一次性塞进 IPC 的返回值里，JSON 序列化要一两秒，
+ * 渲染进程主线程直接卡住。分页之后每次只传几千条，
+ * 配合虚拟滚动，界面始终是流畅的。
+ */
+const FILE_PAGE_SIZE = 5000
+
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
   config: null,
   stats: null,
   files: [],
+  filesLimit: 0,
   diffs: [],
   tasks: [],
   logs: [],
   connection: null,
-  progress: null,
+  progress: { local: null, remote: null },
   lastError: null,
 
   init: async () => {
@@ -246,7 +268,19 @@ export const useAppStore = create<AppState>((set, get) => ({
      */
     track(
       window.topensync?.onScanProgress((progress) => {
-        set({ progress })
+        /*
+         * 按通道分流存进度。
+         *
+         * 以前是一个 progress 对象：本地扫描和对账共用，
+         * 对账一开始就把本地扫描的进度顶掉，本地扫描的状态永远回不来，
+         * 而且对账完成后进度条还挂着不消失。
+         */
+        set((s) => ({
+          progress:
+            progress.kind === 'local'
+              ? { ...s.progress, local: progress }
+              : { ...s.progress, remote: progress }
+        }))
         void safe(() => get().refreshStats(), undefined, '刷新统计')
       })
     )
@@ -292,11 +326,22 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   refreshFiles: async () => {
     const files = await safe(
-      () => ipc(() => window.topensync?.listFiles({ limit: 2000 })),
+      () => ipc(() => window.topensync?.listFiles({ limit: FILE_PAGE_SIZE })),
       null,
       '刷新文件清单'
     )
-    if (files) set({ files })
+    if (files) set({ files, filesLimit: FILE_PAGE_SIZE })
+  },
+
+  loadMoreFiles: async () => {
+    const current = get().files.length
+    const nextLimit = current + FILE_PAGE_SIZE
+    const files = await safe(
+      () => ipc(() => window.topensync?.listFiles({ limit: nextLimit })),
+      null,
+      '加载更多文件'
+    )
+    if (files) set({ files, filesLimit: nextLimit })
   },
 
   refreshDiffs: async () => {
@@ -331,6 +376,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     // 暂停会改变监控状态，重新拉一次统计
     await get().refreshStats()
     return !current
+  },
+
+  startSync: async () => {
+    await safe(() => ipc(window.topensync?.startSync), null, '开始同步')
+    await get().refreshStats()
   },
 
   deleteLocalFiles: async (relPaths) => {

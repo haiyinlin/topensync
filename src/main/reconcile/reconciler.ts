@@ -465,7 +465,14 @@ export class Reconciler {
       }
 
       manifest.finishScan(scanId, timedOut ? 'cancelled' : 'done', {
-        scanned: scannedDirs,
+        /*
+         * 存**文件数**，不是目录数。
+         *
+         * 界面上「上次扫描 N 个文件」说的是文件数（引擎用的是
+         * scannedFiles）。这里存目录数的话，重启后回读出来的数字
+         * 会跟运行中显示的对不上——同一轮对账，两个数。
+         */
+        scanned: scannedFiles,
         changed: diffCount,
         errors: 0
       })
@@ -475,7 +482,7 @@ export class Reconciler {
       return result
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      manifest.finishScan(scanId, 'failed', { scanned: scannedDirs, changed: diffCount, errors: 1 }, message)
+      manifest.finishScan(scanId, 'failed', { scanned: scannedFiles, changed: diffCount, errors: 1 }, message)
       manifest.log('error', `远端对账失败：${message}`)
       const result = {
         scanId,

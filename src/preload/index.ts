@@ -63,6 +63,8 @@ const api = {
   pauseSync: (): Promise<boolean> => ipcRenderer.invoke('sync:pause'),
   /** 恢复同步 */
   resumeSync: (): Promise<boolean> => ipcRenderer.invoke('sync:resume'),
+  /** 开始同步（启动后默认不开始，由用户显式触发） */
+  startSync: (): Promise<boolean> => ipcRenderer.invoke('sync:start'),
 
   // ── 动作 ──────────────────────────────────────────────
   /** 改配置走请求-响应：调用方需要拿到合并后的新配置 */
