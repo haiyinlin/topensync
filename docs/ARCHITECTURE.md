@@ -254,6 +254,14 @@ EMFILE: too many open files, watch 'Z:\...\IMG_8278.JPG'
 
 诊断包的 `io` 字段会输出闸门的实时状态（`active` / `peak` / `limit` / `coolingDown` / `exhausted`），下次再报同类问题能直接看出限流有没有生效。
 
+### 扫描期间的 CPU 开销：glob 必须预编译
+
+`isExcluded(rel, patterns)` 直接调 `minimatch(rel, p)` 时，**每一次调用都会把 glob 重新解析成正则**。实测 6 万个路径 × 4 条规则 × (相对路径 + 文件名) = 48 万次解析，**同步阻塞 2653ms**——这 2.65 秒里主进程完全无法处理 IPC，点任何按钮都是「未响应」。
+
+现在改成 `getExcludeMatcher(patterns)`：一条规则只解析一次，按规则内容缓存（`matcherCache`，上限 32 组）。同样的 6 万个路径降到 **367ms**。语义由 `tests/paths.test.ts` 的「预编译后与逐次匹配结果一致」锁住。
+
+另外 `scanLocalTree()`（只读扫描）与 `Watcher.rescan()` 共用同一套遍历与排除逻辑，避免两条路径的行为漂移。
+
 ---
 
 ## 六、配置

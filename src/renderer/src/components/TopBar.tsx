@@ -229,7 +229,11 @@ export function TopBar(): React.JSX.Element {
       <div className="topbar-right">
         <button
           className={`btn ghost${localBusy ? ' busy' : ''}`}
-          title={localFailure ? `扫描失败：${localFailure.message}` : '重新扫描本地同步目录'}
+          title={
+            localFailure
+              ? `扫描失败：${localFailure.message}`
+              : '只数一遍本地目录并更新统计，不会上传。要开始同步请点右侧「开始同步」'
+          }
           style={localFailure ? { color: 'var(--red)', borderColor: 'var(--red)' } : undefined}
           onClick={triggerLocal}
           disabled={localBusy}
@@ -239,7 +243,11 @@ export function TopBar(): React.JSX.Element {
         </button>
         <button
           className={`btn ghost${remoteBusy ? ' busy' : ''}`}
-          title={remoteFailure ? `对账失败：${remoteFailure.message}` : '立即对账远端（列出远端树并比对差异）'}
+          title={
+            remoteFailure
+              ? `对账失败：${remoteFailure.message}`
+              : '列出远端文件树并与清单比对，只记录差异，不会上传或下载'
+          }
           style={remoteFailure ? { color: 'var(--red)', borderColor: 'var(--red)' } : undefined}
           onClick={triggerReconcile}
           disabled={remoteBusy}

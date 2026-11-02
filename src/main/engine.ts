@@ -6,7 +6,7 @@ import { OpenListClient } from './openlist/client'
 import { Transfer } from './transfer/transfer'
 import { Planner } from './planner/planner'
 import { Reconciler } from './reconcile/reconciler'
-import { Watcher, type WatchEvent } from './watcher/watcher'
+import { Watcher, scanLocalTree, type WatchEvent } from './watcher/watcher'
 import { TaskBatcher } from './task-batcher'
 import { absolutize, relativizeRemote } from './watcher/paths'
 import { hashFile } from './hash/hashes'
@@ -301,6 +301,21 @@ export class Engine {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       this.pushLog('error', `连接自检失败：${message}`, { category: 'system' })
+    }
+
+    /*
+     * 建对账器，但**不排期**。
+     *
+     * 「对账远端」是个只读操作（列远端树 + 比清单），跟同步开没开始无关，
+     * 所以对账器要提前建好，用户点按钮就能用。
+     * 定时对账与「启动即对账」仍然只在 startSync() 之后才排——
+     * 那才是「启动默认关闭对账」要拦的东西。
+     */
+    try {
+      this.startReconciler()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.pushLog('warn', `对账器初始化失败：${message}`, { category: 'system' })
     }
 
     this.pushLog('info', '已就绪，点击「开始同步」后开始扫描与上传', { category: 'system' })
@@ -975,18 +990,22 @@ export class Engine {
     }
   }
 
+  /**
+   * 手动触发一次扫描 / 对账。
+   *
+   * **不启动同步。**
+   *
+   * 以前这里第一件事就是 `startSync()`——用户只是想看看目录里有什么，
+   * 结果整个上传队列跑起来了。备份工具里「看一眼」和「开始传」是
+   * 两个完全不同的意图，不能混在一个按钮里：
+   *
+   * - 扫描本地：只读巡检，数一遍文件、更新统计，不读清单、不上传
+   * - 对账远端：列出远端树、和清单比对、记差异；同步没开始时
+   *   差异只记录不自动处置（自动重传挂在 Planner 上，没启动就没有）
+   *
+   * 要真正开始传，用户得点「开始同步」。这是两件事，两个按钮。
+   */
   async triggerScan(kind: ScanKind): Promise<void> {
-    /*
-     * 用户显式点了扫描/对账 → 视为「开始同步」。
-     *
-     * 启动后默认不开始，但用户主动点「扫描本地」时还回一句
-     * 「请先点开始同步」是自作多情——他要的就是这个动作。
-     */
-    if (!this.started) {
-      this.pushLog('info', '检测到手动扫描，已开始同步', { category: 'system' })
-      this.startSync()
-    }
-
     /*
      * 同一条通道已经在跑了就别再起一轮。
      *
@@ -1105,15 +1124,14 @@ export class Engine {
       return
     }
 
-    // 本地扫描：对**现有 watcher** 发起一次强制全量重扫。
-    //
-    // 以前这里是 startWatcher()——停掉旧实例再建一个新的。
-    // 那条路走不通：chokidar 的 close() 是异步的，旧实例还没关完，
-    // 新实例就在同一目录上起了，可能收不到初始事件；
-    // 而且重建会把扫描计数复位，用户点完按钮看到的数字没变化，
-    // 于是「点了没反应」。
-    //
-    // 现在直接调 watcher.rescan()：不重建，只重走一遍目录树。
+    /*
+     * 本地扫描：只读巡检。
+     *
+     * 同步在跑 → 交给 Watcher.rescan()，事件进 Planner，该传的传（原有行为）。
+     * 同步没跑 → 自己走一遍目录树，只数文件、更新统计。
+     *   **不建 watcher**：整块盘有几千个目录，为了数一遍文件
+     *   就把每个目录的 watch 句柄挂起来不值得，而且那正是句柄耗尽的来源之一。
+     */
     if (!this.config.syncRoot) {
       this.pushLog('warn', '尚未设置本地同步目录', { category: 'system' })
       // 必须回一条终态：否则界面上的「扫描中…」永远收不掉。
@@ -1126,38 +1144,47 @@ export class Engine {
       })
       return
     }
-    if (!this.watcher) {
-      // 监控根本没在跑（暂停过、或目录刚设好）→ 起一个
-      this.startWatcher()
-      this.pushLog('info', '本地监控已启动，扫描交由目录监控接管', { category: 'system' })
-      // 同样要回终态：起 watcher 不等于完成扫描，
-      // 但界面不能因为「没有 progress 更新」而把按钮永远钉在「扫描中」。
-      this.pushProgress({
-        kind: 'local',
-        running: false,
-        done: 0,
-        total: null,
-        detail: '本地监控已启动'
-      })
-      return
-    }
+
     /*
      * 进度：扫描期间持续汇报「已扫描 N 个文件」。
      *
      * 目录树事先数不出总数，所以用不确定态进度条 + 计数。
      * 但**必须有**——扫一个大目录要几十秒，没反馈就像卡死。
      */
+    // 只有「同步真的在跑」时才把扫描事件喂给调度器；
+    // 暂停中的 planner 会直接丢弃事件（那是刻意的），
+    // 这时候走只读巡检反而更快、也更诚实
+    const scanningWithPipeline = this.watcher !== null && this.planner?.isRunning === true
     const finishProgress = this.beginProgress('local', '正在扫描本地目录…')
     try {
-      const count = await this.watcher.rescan((done) => {
-        this.pushProgress({
-          kind: 'local',
-          running: true,
-          done,
-          total: null,
-          detail: `已扫描 ${done} 个文件`
-        })
-      })
+      const count = scanningWithPipeline
+        ? await this.watcher!.rescan((done) => {
+            this.pushProgress({
+              kind: 'local',
+              running: true,
+              done,
+              total: null,
+              detail: `已扫描 ${done} 个文件`
+            })
+          })
+        : await scanLocalTree({
+            root: this.config.syncRoot,
+            exclude: this.config.exclude,
+            onFile: (_rel, _abs, done) => {
+              // 每 200 个报一次就够了：逐文件推 IPC 只是把渲染进程压死，
+              // 数字跳得快也没人看得清
+              if (done % 200 === 0) {
+                this.pushProgress({
+                  kind: 'local',
+                  running: true,
+                  done,
+                  total: null,
+                  detail: `已扫描 ${done} 个文件`
+                })
+              }
+            }
+          })
+
       this.localScannedCount = count
       this.lastLocalScanAt = Date.now()
       this.recordLocalScan(count)
@@ -1173,10 +1200,16 @@ export class Engine {
         status: 'done',
         errorMsg: null
       })
-      this.pushLog('info', `本地重扫完成：共 ${count} 个文件`, { category: 'system' })
+      this.pushLog(
+        'info',
+        scanningWithPipeline
+          ? `本地重扫完成：共 ${count} 个文件`
+          : `本地扫描完成：共 ${count} 个文件（仅统计，未开始同步）`,
+        { category: 'system' }
+      )
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      this.pushLog('error', `本地重扫失败：${message}`, { category: 'system' })
+      this.pushLog('error', `本地扫描失败：${message}`, { category: 'system' })
     } finally {
       finishProgress()
     }
@@ -1517,9 +1550,15 @@ export class Engine {
         lastScanStatus: this.remoteLastStatus,
         scannedCount: this.remoteScannedCount,
         diffCount: this.remoteDiffCount,
-        nextScanAt: this.config.remoteScan.enabled
-          ? Date.now() + this.config.remoteScan.intervalHours * 3600_000
-          : null
+        /*
+         * 定时对账只在「已开始同步」后才排期（见 startReconciler）。
+         * 没开始时说「下次对账在 6 小时后」是在骗人——
+         * 那个定时器根本没起来。
+         */
+        nextScanAt:
+          this.started && !this.paused && this.config.remoteScan.enabled
+            ? Date.now() + this.config.remoteScan.intervalHours * 3600_000
+            : null
       },
       speed: this.getSpeedStats(),
       tasksTruncated: this.planner?.truncated ?? false,

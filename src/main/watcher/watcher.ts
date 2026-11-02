@@ -1,7 +1,8 @@
 import chokidar, { type FSWatcher } from 'chokidar'
 import { readdir } from 'fs/promises'
+import type { Dirent } from 'fs'
 import { join } from 'path'
-import { hasIgnoredSegment, isExcluded, relativize, toLongPath } from './paths'
+import { getExcludeMatcher, hasIgnoredSegment, isExcluded, relativize, toLongPath } from './paths'
 
 /**
  * 本地文件监控（通道 A）。
@@ -51,6 +52,17 @@ export interface WatcherOptions {
 /** chokidar 递归深度上限，防止病态目录把进程拖死 */
 const MAX_DEPTH = 24
 
+/**
+ * 扫描事件的并发窗口。
+ *
+ * 32 是实测出来的数：定 4 时 4000 个文件要 15 秒（每个都被 await 串起来），
+ * 五万个文件就是几分钟，用户会以为扫描卡死；32 时同样的量 1.7 秒。
+ *
+ * 窗口本身**不负责句柄安全**——真正同时打开的文件数由 IO 闸门压到 8 以内
+ * （见 io/governor.ts）。这里只做一件事：别让待处理的事件无限堆积。
+ */
+const RESCAN_WINDOW = 32
+
 export class Watcher {
   private watcher: FSWatcher | null = null
   private readonly timers = new Map<string, NodeJS.Timeout>()
@@ -68,6 +80,8 @@ export class Watcher {
   private stopped = false
   /** 进行中的扫描（同一时刻只允许一轮） */
   private scanPromise: Promise<number> | null = null
+  /** 扫描期间在飞的事件处理（窗口背压用） */
+  private readonly rescanInflight: Array<Promise<void>> = []
   private lastReadyAt: number | null = null
 
   constructor(private readonly opts: WatcherOptions) {}
@@ -220,71 +234,16 @@ export class Watcher {
     // -1 表示「没扫描」而不是「扫到 0 个文件」，两者在界面上是两件事
     if (!root) return -1
 
-    const found = new Set<string>()
-    let fileCount = 0
+    this.rescanInflight.length = 0
 
-    /*
-     * 事件窗口。
-     *
-     * 上层处理一个文件要 stat、查清单、可能写库——都是异步的。
-     * 以前这里**发完就走**，不 await：一次重扫立刻把 5.8 万个事件
-     * 同时推进 Planner，于是同一时刻有 5.8 万个 stat 在飞，
-     * 句柄当场被吃光（EMFILE），主进程的事件循环也被微任务淹没，
-     * 界面上表现就是「点暂停没反应」。
-     *
-     * 改成滑动窗口后，上层没消化完就不再往下堆：
-     * 并发被钉在 RESCAN_WINDOW，事件循环始终有喘息机会。
-     */
-    const RESCAN_WINDOW = 32
-    const inflight: Array<Promise<void>> = []
-
-    const emit = async (event: WatchEvent): Promise<void> => {
-      const ret = this.opts.onEvent(event)
-      if (ret && typeof ret.then === 'function') {
-        inflight.push(
-          ret.catch((err: unknown) => {
-            const e = err instanceof Error ? err : new Error(String(err))
-            this.opts.onError?.(e)
-          })
-        )
-      }
-      if (inflight.length >= RESCAN_WINDOW) {
-        const oldest = inflight.shift()
-        if (oldest) await oldest
-      }
-    }
-
-    const walk = async (dir: string, depth: number): Promise<void> => {
-      // 暂停/停止后立刻收摊，别把剩下的几万个文件继续灌上去
-      if (this.stopped || depth > MAX_DEPTH) return
-      let entries: import('fs').Dirent[]
-      try {
-        entries = await readdir(toLongPath(dir), { withFileTypes: true })
-      } catch {
-        // 目录读不到（权限、已被删除、被占用）→ 跳过这一支
-        return
-      }
-
-      for (const entry of entries) {
-        if (this.stopped) return
-        const abs = join(dir, entry.name)
-        const rel = relativize(root, abs)
-        if (rel === null || rel === '') continue
-        if (isExcluded(rel, this.opts.exclude)) continue
-        if (hasIgnoredSegment(rel)) continue
-
-        if (entry.isDirectory()) {
-          await walk(abs, depth + 1)
-          continue
-        }
-        // 不跟随符号链接与目录联接，避免循环
-        if (!entry.isFile()) continue
-
-        found.add(rel)
-        fileCount++
+    const count = await scanLocalTree({
+      root,
+      exclude: this.opts.exclude,
+      shouldStop: () => this.stopped,
+      onFile: async (rel, abs, done) => {
         this.discovered.add(abs.toLowerCase())
-        onProgress?.(fileCount)
-        await emit({
+        onProgress?.(done)
+        await this.emitEvent({
           type: 'upsert',
           relPath: rel,
           absPath: abs,
@@ -292,18 +251,42 @@ export class Watcher {
           isDir: false
         })
       }
-    }
+    })
 
-    await walk(root, 0)
     // 把窗口里剩下的收干净，否则上层还在处理时我们就报了「就绪」
-    await Promise.all(inflight)
+    await Promise.all(this.rescanInflight)
+    this.rescanInflight.length = 0
 
-    if (this.stopped) return fileCount
+    if (this.stopped) return count
 
     this.lastReadyAt = Date.now()
-    this.opts.onReady?.(fileCount)
-    this.opts.onLog?.('info', `本地扫描完成，共 ${fileCount} 个文件`)
-    return fileCount
+    this.opts.onReady?.(count)
+    this.opts.onLog?.('info', `本地扫描完成，共 ${count} 个文件`)
+    return count
+  }
+
+  /**
+   * 把一条扫描事件交给上层，并按窗口做背压。
+   *
+   * 为什么要有窗口：上层处理一个文件要 stat、查清单、可能写库，都是异步的。
+   * 一次重扫如果发完就走，五万个事件会同时推进 Planner，
+   * 同一时刻五万个 `stat` 在飞——句柄当场被吃光（EMFILE），
+   * 事件循环也被微任务淹没，表现就是「点任何按钮都没反应」。
+   */
+  private async emitEvent(event: WatchEvent): Promise<void> {
+    const ret = this.opts.onEvent(event)
+    if (ret && typeof ret.then === 'function') {
+      this.rescanInflight.push(
+        ret.catch((err: unknown) => {
+          const e = err instanceof Error ? err : new Error(String(err))
+          this.opts.onError?.(e)
+        })
+      )
+    }
+    if (this.rescanInflight.length >= RESCAN_WINDOW) {
+      const oldest = this.rescanInflight.shift()
+      if (oldest) await oldest
+    }
   }
 
   // ── 内部 ──────────────────────────────────────────────
@@ -374,4 +357,67 @@ export class Watcher {
       }, debounceMs)
     )
   }
+}
+
+/**
+ * 只走一遍本地目录树，不建任何监控。
+ *
+ * 这是「扫描本地」按钮的底座：扫描是**只读巡检**，
+ * 不该启动同步、也不该为了数一遍文件就把 chokidar 挂起来
+ * （整块盘上有几千个目录，每个目录一个 watch 句柄）。
+ *
+ * 与 `Watcher.rescan()` 共用同一套遍历与排除规则，
+ * 区别只在于它不产出事件——上线后两者的行为不会漂移。
+ */
+export interface LocalScanOptions {
+  root: string
+  exclude: string[]
+  /** 每发现一个文件调用一次；返回 Promise 时会被等待（背压） */
+  onFile?: (rel: string, abs: string, done: number) => void | Promise<void>
+  /** 返回 true 时中止扫描 */
+  shouldStop?: () => boolean
+}
+
+export async function scanLocalTree(opts: LocalScanOptions): Promise<number> {
+  const { root } = opts
+  if (!root) return 0
+
+  // 排除规则预编译一次：每个文件现解析 glob 会让六万文件的扫描多烧两秒 CPU
+  const exclude = getExcludeMatcher(opts.exclude)
+  let count = 0
+
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    if (depth > MAX_DEPTH || opts.shouldStop?.()) return
+
+    let entries: Dirent[]
+    try {
+      entries = await readdir(toLongPath(dir), { withFileTypes: true })
+    } catch {
+      // 目录读不到（权限、已被删除、被占用）→ 跳过这一支
+      return
+    }
+
+    for (const entry of entries) {
+      if (opts.shouldStop?.()) return
+      const abs = join(dir, entry.name)
+      const rel = relativize(root, abs)
+      if (rel === null || rel === '') continue
+      if (exclude.test(rel)) continue
+      if (hasIgnoredSegment(rel)) continue
+
+      if (entry.isDirectory()) {
+        await walk(abs, depth + 1)
+        continue
+      }
+      // 不跟随符号链接与目录联接，避免循环
+      if (!entry.isFile()) continue
+
+      count++
+      const ret = opts.onFile?.(rel, abs, count)
+      if (ret && typeof ret.then === 'function') await ret
+    }
+  }
+
+  await walk(root, 0)
+  return count
 }

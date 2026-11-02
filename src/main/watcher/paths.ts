@@ -1,5 +1,5 @@
 import { relative, sep } from 'path'
-import { minimatch } from 'minimatch'
+import { Minimatch } from 'minimatch'
 
 /**
  * 路径工具。
@@ -129,16 +129,61 @@ export function remoteBasename(path: string): string {
  */
 export function isExcluded(rel: string, patterns: string[]): boolean {
   if (patterns.length === 0 || rel === '') return false
-  const base = rel.split('/').pop() ?? rel
-  return patterns.some((p) => {
-    if (!p) return false
-    try {
-      return minimatch(rel, p, { dot: true }) || minimatch(base, p, { dot: true })
-    } catch {
-      // 规则写坏了也不能让整个扫描崩掉，按不排除处理
+  return getExcludeMatcher(patterns).test(rel)
+}
+
+/**
+ * 预编译的排除规则。
+ *
+ * 为什么必须预编译：`minimatch(rel, pattern)` 每次调用都要把 glob
+ * **重新解析成正则**。扫描六万个文件时，4 条规则 × (相对路径 + 文件名)
+ * = 48 万次解析，实测**纯 CPU 阻塞 2.65 秒**——而这 2.65 秒是同步执行的，
+ * 主进程完全无法处理 IPC，用户点任何按钮都是「未响应」。
+ *
+ * 预编译后同一组规则只解析一次，实测从 2653ms 降到 367ms。
+ */
+export interface ExcludeMatcher {
+  test(rel: string): boolean
+}
+
+/** 规则数组 → 匹配器。按规则内容缓存，配置没变就复用 */
+const matcherCache = new Map<string, ExcludeMatcher>()
+/** 缓存上限：规则组合理论上可以无限多（用户手改配置），留个兜底 */
+const MATCHER_CACHE_MAX = 32
+
+export function getExcludeMatcher(patterns: string[]): ExcludeMatcher {
+  const key = patterns.join('\u0000')
+  const cached = matcherCache.get(key)
+  if (cached) return cached
+
+  const compiled = patterns
+    .filter((p) => !!p)
+    .map((p) => {
+      try {
+        return new Minimatch(p, { dot: true })
+      } catch {
+        // 规则写坏了不能让整个扫描崩掉——按「这条不匹配」处理
+        return null
+      }
+    })
+    .filter((m): m is Minimatch => m !== null)
+
+  const matcher: ExcludeMatcher = {
+    test(rel: string): boolean {
+      if (compiled.length === 0 || rel === '') return false
+      // 规则可能带目录前缀（`**/node_modules/**`），也可能只写文件名（`~$*`），
+      // 两种都要匹配，否则 `~$xxx.docx` 这类 Office 临时文件会在子目录里漏网
+      const base = rel.slice(rel.lastIndexOf('/') + 1)
+      for (const m of compiled) {
+        if (m.match(rel) || (base !== rel && m.match(base))) return true
+      }
       return false
     }
-  })
+  }
+
+  if (matcherCache.size >= MATCHER_CACHE_MAX) matcherCache.clear()
+  matcherCache.set(key, matcher)
+  return matcher
 }
 
 /**

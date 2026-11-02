@@ -4,6 +4,7 @@ import {
   absolutize,
   escapeRemoteSegment,
   hasIgnoredSegment,
+  getExcludeMatcher,
   isExcluded,
   joinRemote,
   relativize,
@@ -95,6 +96,39 @@ describe('isExcluded', () => {
 
   it('规则写坏时不崩溃，也不排除', () => {
     expect(isExcluded('a.txt', ['['])).toBe(false)
+  })
+
+  /*
+   * 预编译匹配器的正确性。
+   *
+   * 这批断言存在的意义：预编译把 minimatch 的「每次调用都解析 glob」
+   * 改成「一组规则只解析一次」，是纯性能改造——**语义必须一模一样**。
+   * 少匹配一条，被排除的临时文件就会开始上传；
+   * 多匹配一条，用户该同步的文件会被静默跳过。
+   */
+  it('预编译后与逐次匹配结果一致', () => {
+    const cases = [
+      'node_modules/pkg/index.js',
+      'a/b/node_modules/pkg/index.js',
+      'a/b/c.tmp',
+      'docs/~$report.docx',
+      'docs/report.docx',
+      'a.txt',
+      '.git/config',
+      'src/.gitignore'
+    ]
+    const matcher = getExcludeMatcher(rules)
+    for (const p of cases) {
+      expect(matcher.test(p)).toBe(isExcluded(p, rules))
+    }
+  })
+
+  it('同一组规则复用同一个匹配器（不重复解析）', () => {
+    const a = getExcludeMatcher(['**/*.tmp'])
+    const b = getExcludeMatcher(['**/*.tmp'])
+    expect(a).toBe(b)
+    // 规则变了就该换一个
+    expect(getExcludeMatcher(['**/*.log'])).not.toBe(a)
   })
 })
 

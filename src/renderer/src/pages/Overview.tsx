@@ -104,8 +104,15 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
                     <i className="pulse" />
                     实时监控中
                   </span>
-                ) : (
+                ) : stats?.started ? (
                   <span className="ch-state">未在监控</span>
+                ) : (
+                  /*
+                   * 没点「开始同步」时说「未在监控」会让人以为自己配错了。
+                   * 这是**正常状态**：扫描和同步已经解耦，
+                   * 没开始同步时依然可以点「重新扫描」数一遍文件。
+                   */
+                  <span className="ch-state">未开始同步</span>
                 )}
               </div>
               <div className="ch-sub mono">
@@ -116,8 +123,12 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
                     : localScan?.error
                       ? localScan.error
                       : localScan?.root
-                        ? `未在监控中（${localScan.root}）`
-                        : '未在监控中（尚未设置同步目录）'}
+                        ? `已设置同步目录（${localScan.root}）· ${
+                            localScan.lastScanAt
+                              ? `上次扫描 ${localScan.scannedCount} 个文件`
+                              : '尚未扫描'
+                          }`
+                        : '尚未设置同步目录'}
               </div>
               {/* 扫描中才显示进度条；平时那条 100% 的条是假的 */}
               <div className={localScanning ? 'bar thin indeterminate' : 'bar thin idle'}>

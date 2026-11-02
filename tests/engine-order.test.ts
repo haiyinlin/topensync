@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterAll, vi } from 'vitest'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -200,6 +200,84 @@ describe('Engine 配置更新后的装配顺序', () => {
     for (const l of engineLogs) logs.push(l.message)
 
     expect(logs.some((m) => m.includes('尚未连接 OpenList，无法执行远端对账'))).toBe(false)
+    engine.stop()
+  })
+})
+
+/**
+ * 「扫描」与「同步」必须是两件事。
+ *
+ * 曾经的实现里，triggerScan 第一件事就是 startSync()：
+ * 用户只是想看看目录里有什么，点完「扫描本地」，整个上传队列跑起来了，
+ * 带宽被占满、远端多出几千个文件。这不是他要的动作。
+ */
+describe('扫描不启动同步', () => {
+  beforeEach(() => {
+    configStore = JSON.parse(JSON.stringify(BASE_CONFIG))
+    login.mockClear()
+    list.mockClear()
+  })
+
+  it('点「扫描本地」只数文件，不建调度器、不上传', async () => {
+    const engine = new Engine({})
+    await engine.start()
+
+    const root = join(userDataDir, 'scan-root')
+    mkdirSync(join(root, 'sub'), { recursive: true })
+    writeFileSync(join(root, 'a.txt'), 'a')
+    writeFileSync(join(root, 'b.txt'), 'b')
+    writeFileSync(join(root, 'sub', 'c.txt'), 'c')
+
+    await engine.updateConfig({ syncRoot: root })
+
+    await engine.triggerScan('local')
+
+    const stats = engine.getStats()
+    // 关键：没有「开始同步」
+    expect(stats.started).toBe(false)
+    expect(stats.paused).toBe(false)
+    // 调度器不该被建起来（没建就不会有任何上传）
+    expect((engine as unknown as { planner: unknown }).planner).toBeNull()
+    // 但扫描真的做了事：数出 3 个文件
+    expect(stats.localScan.scannedCount).toBe(3)
+    expect(stats.localScan.lastScanAt).not.toBeNull()
+
+    engine.stop()
+  })
+
+  it('点「对账远端」同样不启动同步', async () => {
+    const engine = new Engine({})
+    await engine.start()
+
+    await engine.updateConfig({
+      syncRoot: join(userDataDir, 'scan-root'),
+      openlist: {
+        baseUrl: 'http://192.168.100.10:5244',
+        username: 'admin',
+        password: 'secret'
+      },
+      remoteRoot: '/qh/backup',
+      remoteScan: { ...BASE_CONFIG.remoteScan }
+    })
+
+    await engine.triggerScan('remote')
+
+    expect(engine.getStats().started).toBe(false)
+    expect((engine as unknown as { planner: unknown }).planner).toBeNull()
+
+    engine.stop()
+  })
+
+  it('显式点「开始同步」才会建调度器', async () => {
+    const engine = new Engine({})
+    await engine.start()
+    await engine.updateConfig({ syncRoot: join(userDataDir, 'scan-root') })
+
+    engine.startSync()
+
+    expect(engine.getStats().started).toBe(true)
+    expect((engine as unknown as { planner: unknown }).planner).not.toBeNull()
+
     engine.stop()
   })
 })
