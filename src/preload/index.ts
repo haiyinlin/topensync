@@ -92,6 +92,9 @@ const api = {
   cancelTransfer: (taskId: string) => ipcRenderer.send('transfer:cancel', taskId),
   resolveDiff: (diffId: number, resolution: DiffResolution) =>
     ipcRenderer.invoke('diff:resolve', diffId, resolution),
+  /** 批量处置差异：返回成功 / 跳过 / 失败与原因聚合 */
+  resolveDiffMany: (diffIds: number[], resolution: DiffResolution) =>
+    ipcRenderer.invoke('diff:resolveMany', diffIds, resolution),
 
   /*
    * 删除（批量）。

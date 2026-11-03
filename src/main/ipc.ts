@@ -93,6 +93,20 @@ export function registerIpc(engine: Engine): void {
   })
 
   /*
+   * 批量处置差异（「全部重新上传」这类按钮）。
+   *
+   * 为什么不做成渲染层循环调 diff:resolve：两百条差异要来回两百次 IPC，
+   * 每次都要等一个 stat，界面要等十几秒；而且两百条各自写一行日志，
+   * 真正要看的失败原因会被刷出屏幕。放在主进程里连跑并汇总，
+   * 只回一句「成功 196 条，跳过 4 条（本地文件读不到 ×4）」。
+   */
+  ipcMain.handle(
+    'diff:resolveMany',
+    async (_e, diffIds: number[], resolution: DiffResolution) =>
+      engine.resolveDiffs(diffIds ?? [], resolution)
+  )
+
+  /*
    * 删除（批量）。
    *
    * 三种删除语义分开，不混成一个接口：

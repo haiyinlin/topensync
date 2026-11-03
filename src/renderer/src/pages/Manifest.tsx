@@ -888,6 +888,7 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
           {
             label: '删除本地文件',
             danger: true,
+            icon: 'trash',
             confirmTitle: '删除本地文件',
             confirmBody: selectedPaths.length
               ? `将删除 ${selectedPaths.length} 个本地文件，远端副本按删除策略处理（通常是移入回收站）。`
@@ -906,6 +907,7 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
           {
             label: '删除远端文件',
             danger: true,
+            icon: 'trash',
             confirmTitle: '删除远端文件',
             confirmBody: '将把选中的远端文件移入远端回收站，并关闭对应差异。',
             onRun: async (ids) => {
@@ -931,6 +933,7 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
              */
             label: '深度校验',
             danger: false,
+            icon: 'shield',
             confirmTitle: '深度校验',
             confirmBody:
               '把选中的远端文件下载回来重算哈希，与本地比对。' +

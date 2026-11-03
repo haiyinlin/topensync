@@ -144,6 +144,25 @@ export interface DiffEntry {
   resolution: DiffResolution | null
 }
 
+/**
+ * 批量处置差异的结果。
+ *
+ * 一次点 200 条「重新上传」，不可能每条都成功：
+ * 有的本地文件读不到（网络盘掉线）、有的超过单文件上限。
+ * 只回一句「已完成」等于骗人，所以按结果分类回传，
+ * 界面据此告诉用户「排入 196 条，跳过 4 条：本地文件读不到」。
+ */
+export interface BulkResolveResult {
+  /** 已真的处理（入队 / 删除 / 下载 / 忽略） */
+  handled: number
+  /** 没动手，但也算有结论（例如冲突策略不允许）——与 failed 合并计为 skipped */
+  skipped: number
+  /** 处理过程抛错 */
+  failed: number
+  /** 跳过原因聚合（brief → 条数），按条数降序 */
+  reasons: { reason: string; count: number }[]
+}
+
 // ── 传输任务────────────────────────────────────────
 
 /**

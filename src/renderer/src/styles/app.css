@@ -1436,24 +1436,46 @@ textarea {
   font-style: normal;
 }
 
+/*
+ * 提示条：图标 + 一段说明文字。
+ *
+ * **不能用 flex 排。**
+ *
+ * 提示文字里夹着 `<b>不校验内容</b>` 这类强调标签。一旦父级是 flex，
+ * 每一段连续文本、每一个行内元素都会被当成**独立的 flex 项**，
+ * 各自收缩到最小宽度——「认领只比对文件名与」占一列、
+ * 「不校验内容」占一列、后半句再占一列，排出来就是断成碎块的两三列，
+ * 完全读不通。
+ *
+ * 改成块级 + 图标绝对定位：文字回到正常的内联流，
+ * `<b>` / `<code>` 只是加粗，不再参与分列。
+ */
 .warn-note {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
+  display: block;
+  position: relative;
   margin-top: 14px;
-  padding: 10px 12px;
+  padding: 10px 12px 10px 34px;
   border-radius: 9px;
   background: var(--amber-bg);
   border: 1px solid rgba(245, 165, 36, 0.2);
   color: var(--amber);
   font-size: 11.5px;
+  line-height: 1.65;
 }
 
 .warn-note .ic {
+  position: absolute;
+  left: 12px;
+  top: 12px;
   width: 14px;
   height: 14px;
   flex: none;
-  margin-top: 2px;
+}
+
+/* 提示里的强调：与正文同色，只加粗，避免再来一层撞色 */
+.warn-note b {
+  font-weight: 600;
+  color: inherit;
 }
 
 /* ── 键值表 ───────────────────────────────────────────── */
@@ -1837,6 +1859,29 @@ textarea {
   margin-left: auto;
   flex: none;
   font-size: 12px;
+}
+
+/*
+ * 工具栏右侧的动作组（对账页的「全部重新上传 N 条」）。
+ *
+ * margin-left:auto 把它推到最后：左边是搜索与筛选，右边是一键处理，
+ * 点完筛选手指不用跨半个屏幕去找按钮。
+ */
+.toolbar .tb-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.toolbar .tb-actions .btn {
+  white-space: nowrap;
+}
+
+.toolbar .tb-actions .btn .ic {
+  width: 12px;
+  height: 12px;
 }
 
 /*

@@ -23,6 +23,16 @@ export interface BatchAction {
   label: string
   /** 危险操作（删除类）用红色 */
   danger?: boolean
+  /**
+   * 主操作（如「重新上传 206 条」）用实心按钮。
+   *
+   * 批量条里的按钮以前全是 ghost 灰底 + 硬编码的垃圾桶图标，
+   * 「重新上传」「下载」前面也顶着个垃圾桶——图标与动作对不上，
+   * 用户得读文字才知道自己按的是什么。
+   */
+  primary?: boolean
+  /** 图标名；不传则不画图标 */
+  icon?: string
   /** 二次确认的标题；不传则不弹确认 */
   confirmTitle?: string
   /** 二次确认的正文 */
@@ -124,11 +134,11 @@ export function BatchBar({
           {actions.map((a) => (
             <button
               key={a.label}
-              className={`btn tiny ${a.danger ? 'danger' : 'ghost'}`}
+              className={`btn tiny ${a.danger ? 'danger' : a.primary ? 'primary' : 'ghost'}`}
               disabled={busy}
               onClick={() => onClick(a)}
             >
-              <Icon name="trash" />
+              {a.icon && <Icon name={a.icon} />}
               {a.label}
             </button>
           ))}
@@ -172,7 +182,7 @@ export function BatchBar({
                 取消
               </button>
               <button
-                className="btn danger"
+                className={`btn ${pending.danger ? 'danger' : 'primary'}`}
                 disabled={busy}
                 onClick={() => void run(pending)}
               >

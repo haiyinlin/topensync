@@ -24,6 +24,7 @@ import type {
   AppConfig,
   AppSnapshot,
   AppStats,
+  BulkResolveResult,
   ConnectionStatus,
   DeepVerifyResult,
   DiffEntry,
@@ -1697,49 +1698,11 @@ export class Engine {
     if (!diff) return
 
     try {
-      let acted = true
-      /** 没动手时的原因：直接拼进日志，别让用户猜 */
-      let whyNot = ''
-      switch (resolution) {
-        case 'uploaded':
-        case 'overwritten': {
-          if (diff.localPath) {
-            /*
-             * handleDiff 会返回「是否真的处理了 + 为什么没处理」。
-             *
-             * 它有多个「什么都没做」的分支：冲突策略不是 local-wins、
-             * 自动修复额度已满、本地文件读不到、超单文件上限。
-             * 以前不管三七二十一都把差异标成「已处置」——
-             * 用户以为远端已经用本地那份覆盖了，其实远端那份错的文件一直留着。
-             */
-            const r = (await this.planner?.handleDiff({
-              kind: 'size_mismatch',
-              localPath: diff.localPath,
-              remotePath: diff.remotePath
-            })) ?? { handled: false, reason: '同步引擎未启动' }
-            acted = r.handled
-            whyNot = r.reason ?? ''
-          }
-          break
-        }
-        case 'deleted_remote': {
-          await this.client.remove([diff.remotePath])
-          break
-        }
-        case 'pulled': {
-          await this.pullRemote(diff)
-          break
-        }
-        case 'ignored':
-        default:
-          // 「忽略」本身就是处置：明确表示「这条差异我知道了，不处理」
-          break
-      }
-
-      if (!acted) {
+      const r = await this.resolveOne(diff, resolution, true)
+      if (!r.acted) {
         this.pushLog(
           'warn',
-          `差异未处理，仍待处置：${diff.remotePath} —— ${whyNot || '原因未知'}`,
+          `差异未处理，仍待处置：${diff.remotePath} —— ${r.reason || '原因未知'}`,
           { category: 'system' }
         )
         return
@@ -1762,6 +1725,116 @@ export class Engine {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       this.pushLog('error', `差异处置失败 ${diff.remotePath}：${message}`)
+    }
+  }
+
+  /**
+   * 批量处置差异（「全部重新上传」「全部覆盖远端」用）。
+   *
+   * 为什么不复用 resolveDiff 循环：那样每条都要走一次日志、一次推送，
+   * 200 条会在运行日志里刷出 200 行「差异已处置」，把真正需要看的
+   * 失败原因顶到看不见的地方；渲染层也要收 200 次 diff 更新。
+   * 这里只写一条汇总，失败/跳过的原因按类别聚合后回给界面。
+   */
+  async resolveDiffs(
+    diffIds: number[],
+    resolution: DiffResolution
+  ): Promise<BulkResolveResult> {
+    const result: BulkResolveResult = { handled: 0, skipped: 0, failed: 0, reasons: [] }
+    if (diffIds.length === 0) return result
+
+    const reasonCount = new Map<string, number>()
+    const touchReason = (r: string): void => {
+      reasonCount.set(r, (reasonCount.get(r) ?? 0) + 1)
+    }
+
+    for (const id of diffIds) {
+      const diff = this.manifest.getDiff(id)
+      if (!diff) continue
+      try {
+        const r = await this.resolveOne(diff, resolution, false)
+        if (r.acted) {
+          this.manifest.resolveDiff(id, resolution)
+          const resolved = this.manifest.getDiff(id)
+          if (resolved) this.queueDiff(resolved)
+          result.handled++
+        } else {          result.skipped++
+          touchReason(r.reason || '原因未知')
+        }
+      } catch (err) {
+        result.failed++
+        touchReason(err instanceof Error ? err.message : String(err))
+      }
+    }
+
+    result.reasons = [...reasonCount.entries()]
+      .map(([reason, count]) => ({ reason, count }))
+      .sort((a, b) => b.count - a.count)
+
+    const tail =
+      result.reasons.length > 0
+        ? `；跳过 ${result.skipped + result.failed} 条（${result.reasons
+            .slice(0, 3)
+            .map((r) => `${r.reason} ×${r.count}`)
+            .join('、')}）`
+        : ''
+    this.pushLog(
+      result.handled > 0 ? 'info' : 'warn',
+      `批量处置差异：成功 ${result.handled} 条${tail}`,
+      { category: 'system' }
+    )
+    return result
+  }
+
+  /**
+   * 处置一条差异，只回答「动了没有 + 为什么没动」。
+   *
+   * 单条与批量共用这段逻辑，避免两条路径对「冲突策略 / 上限 / 超限文件」
+   * 的判断出现分歧。
+   */
+  private async resolveOne(
+    diff: DiffEntry,
+    resolution: DiffResolution,
+    quiet: boolean
+  ): Promise<{ acted: boolean; reason?: string }> {
+    switch (resolution) {
+      case 'uploaded':
+      case 'overwritten':
+      case 'pulled': {
+        if (resolution === 'pulled') {
+          await this.pullRemote(diff)
+          return { acted: true }
+        }
+        if (!diff.localPath) {
+          return { acted: false, reason: '这条差异没有对应的本地文件，无从回传' }
+        }
+        /*
+         * handleDiff 会返回「是否真的处理了 + 为什么没处理」。
+         *
+         * 它有多个「什么都没做」的分支：冲突策略不是 local-wins、
+         * 自动修复额度已满、本地文件读不到、超单文件上限。
+         * 以前不管三七二十一都把差异标成「已处置」——
+         * 用户以为远端已经用本地那份覆盖了，其实远端那份错的文件一直留着。
+         *
+         * manual=true：这是用户点的按钮，不该被「自动修复上限」拦住。
+         */
+        const r = (await this.planner?.handleDiff(
+          { kind: diff.kind, localPath: diff.localPath, remotePath: diff.remotePath },
+          { manual: true }
+        )) ?? { handled: false, reason: '同步引擎未启动' }
+        if (r.handled && !quiet) {
+          // 批量路径不逐条写日志，由调用方汇总
+        }
+        return { acted: r.handled, reason: r.reason }
+      }
+      case 'deleted_remote': {
+        await this.client.remove([diff.remotePath])
+        return { acted: true }
+      }
+      case 'ignored':
+      default:
+        // 「忽略」本身就是处置：明确表示「这条差异我知道了，不处理」
+        return { acted: true }
     }
   }
 

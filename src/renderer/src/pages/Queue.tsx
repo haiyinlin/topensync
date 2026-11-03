@@ -546,6 +546,7 @@ export function Queue(): React.JSX.Element {
           {
             label: '移除记录',
             danger: true,
+            icon: 'trash',
             confirmTitle: '从队列移除记录',
             confirmBody: '只移除队列中的任务记录，不会删除任何文件。',
             onRun: async (ids) => {

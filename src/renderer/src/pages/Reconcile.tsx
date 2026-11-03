@@ -2,6 +2,7 @@ import * as React from 'react'
 import { useCallback, useMemo, useState } from 'react'
 import { Icon } from '../components/Icon'
 import { BatchBar } from '../components/BatchBar'
+import type { BatchAction } from '../components/BatchBar'
 import { ROW_HEIGHT, VirtualTable } from '../components/VirtualTable'
 import {
   Cell2,
@@ -54,16 +55,75 @@ const KIND_CARD_CLASS: Record<DiffKind, string> = {
 
 type Filter = DiffKind | 'all'
 
+/**
+ * 每类差异的「一键全处理」动作。
+ *
+ * 用户的原话：206 条远端缺失，难道要一条一条点过去。
+ * 每类差异的正确处置方向其实只有一种，所以按类型给一个批量入口——
+ * 不需要先勾选，直接对**当前筛选出的全部**生效。
+ *
+ * remote_only 不给「批量删除」：它删的是别人设备刚传上去的文件，
+ * 且与本地无关，误点一次就是不可逆的数据丢失。这类仍走勾选 + 确认。
+ */
+const BULK_META: Record<
+  DiffKind,
+  { label: string; resolution: DiffResolution; icon: string; desc: string } | null
+> = {
+  missing_remote: {
+    label: '全部重新上传',
+    resolution: 'uploaded',
+    icon: 'upload',
+    desc: '把当前列出的本地文件重新上传到远端，补回被删掉的那一份'
+  },
+  local_only: {
+    label: '全部上传',
+    resolution: 'uploaded',
+    icon: 'upload',
+    desc: '把当前列出的本地文件上传到远端'
+  },
+  size_mismatch: {
+    label: '全部覆盖远端',
+    resolution: 'overwritten',
+    icon: 'overwrite',
+    desc: '用本地版本覆盖远端那份大小不一致的文件'
+  },
+  remote_only: {
+    label: '全部下载',
+    resolution: 'pulled',
+    icon: 'down',
+    desc: '把远端多出的文件下载到本地同步目录'
+  }
+}
+
 export function Reconcile(): React.JSX.Element {
   const diffs = useAppStore((s) => s.diffs)
   const refreshDiffs = useAppStore((s) => s.refreshDiffs)
   const deleteRemoteFiles = useAppStore((s) => s.deleteRemoteFiles)
+  const resolveDiffs = useAppStore((s) => s.resolveDiffs)
   const scan = useAppStore((s) => s.stats?.remoteScan ?? null)
   const progress = useAppStore((s) => s.progress)
   const [filter, setFilter] = useState<Filter>('all')
   const [query, setQuery] = useState('')
   const [busy, setBusy] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(new Set())
+
+  /* ── 批量处置 ────────────────────────────────────────── */
+  const [bulkBusy, setBulkBusy] = useState(false)
+  /** 等待确认的批量动作（条数多时先问一句） */
+  const [bulkPending, setBulkPending] = useState<{
+    label: string
+    desc: string
+    ids: number[]
+    resolution: DiffResolution
+  } | null>(null)
+  /** 批量执行后的结果摘要：跳过多少、为什么，必须当场说清楚 */
+  const [bulkDone, setBulkDone] = useState<{
+    label: string
+    handled: number
+    skipped: number
+    failed: number
+    reasons: { reason: string; count: number }[]
+  } | null>(null)
 
   /*
    * 对账进行中：本地标记 + 主进程推来的真实进度。
@@ -106,6 +166,63 @@ export function Reconcile(): React.JSX.Element {
     )
   }, [diffs, filter, query])
   const shownIds = useMemo(() => shown.map((d) => String(d.id)), [shown])
+
+  /**
+   * 当前列表能一键处理什么。
+   *
+   * - 选中某一类筛选 → 就是那一类
+   * - 「全部差异」→ 只有当前列出的**全是同一类**时才给按钮；
+   *   混着好几类时不能用一个按钮，否则「全部重新上传 206」会
+   *   悄悄跳过另外 4 条仅在远端的，用户以为 210 条都处理了
+   */
+  const bulkTarget = useMemo(() => {
+    if (shown.length === 0) return null
+    let kind: DiffKind
+    if (filter !== 'all') {
+      kind = filter
+    } else {
+      const kinds = new Set(shown.map((d) => d.kind))
+      if (kinds.size !== 1) return null
+      kind = shown[0].kind
+    }
+    const meta = BULK_META[kind]
+    if (!meta) return null
+    return { kind, meta, ids: shown.map((d) => d.id), count: shown.length }
+  }, [filter, shown])
+
+  const byId = useMemo(() => new Map(diffs.map((d) => [String(d.id), d])), [diffs])
+
+  const runBulk = useCallback(
+    async (ids: number[], resolution: DiffResolution, label: string): Promise<void> => {
+      if (ids.length === 0 || bulkBusy) return
+      setBulkBusy(true)
+      setBulkPending(null)
+      setBulkDone(null)
+      const res = await resolveDiffs(ids, resolution)
+      setBulkBusy(false)
+      if (res) {
+        setBulkDone({
+          label,
+          handled: res.handled,
+          skipped: res.skipped,
+          failed: res.failed,
+          reasons: res.reasons
+        })
+      }
+      setSelected(new Set())
+    },
+    [bulkBusy, resolveDiffs]
+  )
+
+  /** 条数多就问一句，只有一条就直接做 */
+  const askBulk = (ids: number[], resolution: DiffResolution, meta: { label: string; desc: string }): void => {
+    if (ids.length === 0 || bulkBusy) return
+    if (ids.length === 1) {
+      void runBulk(ids, resolution, meta.label.replace('全部', ''))
+      return
+    }
+    setBulkPending({ label: meta.label, desc: meta.desc, ids, resolution })
+  }
 
   /* ── 展开详情 ────────────────────────────────────────── */
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
@@ -175,6 +292,96 @@ export function Reconcile(): React.JSX.Element {
     // 这里再兜一次：慢速服务端上对账可能超过 3 秒。
     setTimeout(() => void refreshDiffs(), 2600)
   }
+
+  /**
+   * 勾选后的批量动作：按**选中项里真的存在哪些类型**来给按钮。
+   *
+   * 以前这里无论选什么都只有「删除远端文件」和「忽略」两个，
+   * 而最常见的需求恰恰是「这 200 条远端缺失，全部重新上传」——
+   * 用户只能一条条点行尾的按钮。现在选中的类型有什么，
+   * 就出什么批量动作，并且带条数。
+   */
+  const batchActions = useMemo<BatchAction[]>(() => {
+    const sel = [...selected]
+      .map((id) => byId.get(id))
+      .filter((d): d is DiffEntry => d !== undefined)
+    if (sel.length === 0) return []
+
+    const idsOf = (kinds: DiffKind[]): number[] =>
+      sel.filter((d) => kinds.includes(d.kind)).map((d) => d.id)
+
+    const actions: BatchAction[] = []
+
+    const uploadIds = idsOf(['missing_remote', 'local_only'])
+    if (uploadIds.length > 0) {
+      actions.push({
+        label: `重新上传 ${uploadIds.length} 条`,
+        icon: 'upload',
+        primary: true,
+        // 与工具栏的批量按钮同一条规矩：两条以上先确认一次
+        confirmTitle: uploadIds.length > 1 ? '重新上传这些文件' : undefined,
+        confirmBody:
+          uploadIds.length > 1
+            ? `将把选中的 ${uploadIds.length} 个本地文件重新上传到远端。上传会占用带宽，期间可在「传输队列」查看进度或取消。`
+            : undefined,
+        onRun: () => runBulk(uploadIds, 'uploaded', '重新上传')
+      })
+    }
+
+    const overIds = idsOf(['size_mismatch'])
+    if (overIds.length > 0) {
+      actions.push({
+        label: `覆盖远端 ${overIds.length} 条`,
+        icon: 'overwrite',
+        primary: true,
+        confirmTitle: overIds.length > 1 ? '覆盖远端文件' : undefined,
+        confirmBody:
+          overIds.length > 1
+            ? `将用本地版本覆盖选中的 ${overIds.length} 个远端文件，远端原文件不可恢复。`
+            : undefined,
+        onRun: () => runBulk(overIds, 'overwritten', '覆盖远端')
+      })
+    }
+
+    const pullIds = idsOf(['remote_only'])
+    if (pullIds.length > 0) {
+      actions.push({
+        label: `下载 ${pullIds.length} 条`,
+        icon: 'down',
+        primary: true,
+        onRun: () => runBulk(pullIds, 'pulled', '下载')
+      })
+    }
+
+    /*
+     * 删除只针对「远端确实有这份文件」的差异。
+     * 远端缺失的行本来就没有远端文件，把它们塞进删除队列，
+     * 每条都会以 object not found 失败，日志里白刷一片红。
+     */
+    const deletable = sel.filter((d) => d.kind !== 'missing_remote' && d.kind !== 'local_only')
+    if (deletable.length > 0) {
+      actions.push({
+        label: '删除远端文件',
+        danger: true,
+        icon: 'trash',
+        confirmTitle: '删除远端文件',
+        confirmBody: `将把选中的 ${deletable.length} 个远端文件移入远端回收站，并关闭对应差异。本地文件不受影响。`,
+        onRun: async () => {
+          await deleteRemoteFiles(
+            deletable.map((d) => ({ remotePath: d.remotePath, diffId: d.id }))
+          )
+        }
+      })
+    }
+
+    actions.push({
+      label: '忽略',
+      icon: 'eye-off',
+      onRun: () => runBulk(sel.map((d) => d.id), 'ignored', '忽略')
+    })
+
+    return actions
+  }, [selected, byId, bulkBusy, deleteRemoteFiles, runBulk])
 
   return (
     <section>
@@ -273,7 +480,66 @@ export function Reconcile(): React.JSX.Element {
             </button>
           ))}
         </div>
+        {/*
+          * 一键处理当前筛选出来的全部差异。
+          *
+          * 放在筛选条右侧、紧挨着刚点过的筛选，视线不用来回跑；
+          * 按钮文案带条数，点之前就知道会影响多少行。
+          */}
+        <div className="tb-actions">
+          {bulkTarget && (
+            <>
+              <button
+                className="btn tiny primary"
+                disabled={bulkBusy}
+                title={bulkTarget.meta.desc}
+                onClick={() => askBulk(bulkTarget.ids, bulkTarget.meta.resolution, bulkTarget.meta)}
+              >
+                <Icon name={bulkTarget.meta.icon} />
+                {bulkBusy ? '处理中…' : `${bulkTarget.meta.label} ${bulkTarget.count} 条`}
+              </button>
+              {bulkTarget.kind === 'remote_only' && (
+                <button
+                  className="btn tiny ghost"
+                  disabled={bulkBusy}
+                  title="只标记为已知，不下载也不删除"
+                  onClick={() =>
+                    askBulk(bulkTarget.ids, 'ignored', {
+                      label: '全部忽略',
+                      desc: '仅把差异标记为已忽略，不改动任何文件'
+                    })
+                  }
+                >
+                  全部忽略
+                </button>
+              )}
+            </>
+          )}
+        </div>
       </div>
+
+      {bulkDone && (
+        <p className={`warn-note${bulkDone.skipped + bulkDone.failed === 0 ? ' ok-note' : ''}`}>
+          <Icon name={bulkDone.skipped + bulkDone.failed === 0 ? 'check' : 'alert'} />
+          {bulkDone.label}：成功 {bulkDone.handled} 条
+          {bulkDone.skipped + bulkDone.failed > 0 && (
+            <>
+              ，跳过 {bulkDone.skipped + bulkDone.failed} 条
+              {bulkDone.reasons.length > 0 && (
+                <>
+                  （
+                  {bulkDone.reasons
+                    .slice(0, 3)
+                    .map((r) => `${r.reason} ×${r.count}`)
+                    .join('；')}
+                  {bulkDone.reasons.length > 3 ? ' 等' : ''}）
+                </>
+              )}
+            </>
+          )}
+          。{bulkDone.handled > 0 ? '已排入传输队列，进度见「传输队列」。' : ''}
+        </p>
+      )}
 
       <div className="card table-card">
         <VirtualTable
@@ -378,7 +644,7 @@ export function Reconcile(): React.JSX.Element {
                       * 整张表的节奏全乱。次要操作改成图标 + 悬停提示。
                       */}
                     <div className="act-row">
-                      {d.kind === 'missing_remote' && (
+                      {(d.kind === 'missing_remote' || d.kind === 'local_only') && (
                         <button
                           className="btn tiny primary"
                           onClick={() => resolve(d.id, 'uploaded')}
@@ -439,42 +705,50 @@ export function Reconcile(): React.JSX.Element {
         selected={selected}
         onSelectionChange={setSelected}
         hint={`已选 ${selected.size} 项`}
-        actions={[
-          {
-            label: '删除远端文件',
-            danger: true,
-            confirmTitle: '删除远端文件',
-            confirmBody: '将把选中的远端文件移入远端回收站，并关闭对应差异。本地文件不受影响。',
-            onRun: async (ids) => {
-              const targets = diffs
-                .filter((d) => ids.includes(String(d.id)))
-                .map((d) => ({ remotePath: d.remotePath, diffId: d.id }))
-              if (targets.length === 0) return
-              await deleteRemoteFiles(targets)
-            }
-          },
-          {
-            label: '忽略',
-            danger: false,
-            confirmTitle: '忽略这些差异',
-            confirmBody: '仅标记为已忽略，不改动任何文件。',
-            onRun: async (ids) => {
-              for (const id of ids) {
-                const diffId = Number(id)
-                if (Number.isFinite(diffId)) {
-                  window.topensync?.resolveDiff(diffId, 'ignored')
-                }
-              }
-              setTimeout(() => void refreshDiffs(), 400)
-            }
-          }
-        ]}
+        actions={batchActions}
       />
 
       <p className="warn-note">
         <Icon name="shield" />
         默认策略为「本地为准」：远端缺失与内容不符会自动重传；仅远端存在的文件只记录不处理，避免误删其他设备刚上传的内容。单次自动修复上限 20 个文件，超出则仅记录并在此列出。
       </p>
+
+      {/*
+        * 批量动作的二次确认。
+        *
+        * 只对「条数 ≥ 2」弹：一条的时候多点一次弹窗纯属烦人，
+        * 而几百条一起重传/覆盖已经是不可逆的大动作，必须让用户看清数量再按。
+        */}
+      {bulkPending && (
+        <div className="modal-mask" onClick={() => setBulkPending(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>{bulkPending.label}</h3>
+            <p className="dim">
+              即将对当前列出的 <b>{bulkPending.ids.length}</b> 条差异执行：{bulkPending.desc}。
+              {bulkPending.label.includes('上传') &&
+                '上传会占用带宽，期间可在「传输队列」查看进度或取消。'}
+              {bulkPending.label.includes('覆盖') &&
+                '远端那份大小不一致的文件会被本地版本覆盖，原文件不可恢复。'}
+            </p>
+            <div className="act-row end">
+              <button className="btn ghost" onClick={() => setBulkPending(null)}>
+                取消
+              </button>
+              <button
+                className="btn primary"
+                disabled={bulkBusy}
+                onClick={() => {
+                  const target = bulkPending
+                  if (!target) return
+                  void runBulk(target.ids, target.resolution, target.label)
+                }}
+              >
+                {bulkBusy ? '处理中…' : `确认${bulkPending.label}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   )
 }

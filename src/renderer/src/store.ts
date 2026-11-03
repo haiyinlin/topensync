@@ -3,10 +3,12 @@ import type {
   AppConfig,
   AppSnapshot,
   AppStats,
+  BulkResolveResult,
   ClearCacheResult,
   ConnectionStatus,
   DeepVerifyResult,
   DiffEntry,
+  DiffResolution,
   FileEntry,
   LogEntry,
   ScanProgressPair,
@@ -60,6 +62,13 @@ interface AppState {
   /** 加载更多文件（分页追加） */
   loadMoreFiles: () => Promise<void>
   refreshDiffs: () => Promise<void>
+  /**
+   * 批量处置差异（全部重新上传 / 全部覆盖** / 全部下载 / 全部忽略）。
+   *
+   * 走主进程一次调完再汇总，不在渲染层循环——两百条差异循环调单条接口
+   * 要来回两百次 IPC、每次等一个 stat，界面会僵住十几秒。
+   */
+  resolveDiffs: (diffIds: number[], resolution: DiffResolution) => Promise<BulkResolveResult | null>
   saveConfig: (patch: Partial<AppConfig>) => Promise<AppConfig | null>
   recheckConnection: () => Promise<void>
   /** 导出诊断包；返回生成的文件路径，失败返回 null */
@@ -437,6 +446,20 @@ export const useAppStore = create<AppState>((set, get) => ({
   refreshDiffs: async () => {
     const diffs = await safe(() => ipc(window.topensync?.listDiffs), null, '刷新差异列表')
     if (diffs) set({ diffs })
+  },
+
+  resolveDiffs: async (diffIds, resolution) => {
+    if (diffIds.length === 0) return { handled: 0, skipped: 0, failed: 0, reasons: [] }
+    const res = await safe(
+      () => ipc(() => window.topensync?.resolveDiffMany(diffIds, resolution)),
+      null,
+      '批量处置差异'
+    )
+    // 无论成败都要重拉：成功的那批要从列表里消失，失败的还得留在原地
+    await get().refreshDiffs()
+    await get().refreshFiles()
+    await get().refreshStats()
+    return res
   },
 
   saveConfig: async (patch) => {

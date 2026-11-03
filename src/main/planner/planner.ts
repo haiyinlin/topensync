@@ -1087,13 +1087,31 @@ export class Planner {
    * 用户看到「已处置」，以为远端已经用本地那份覆盖了，
    * 其实什么都没发生——远端那份错的文件一直留着。
    */
-  async handleDiff(diff: {
-    kind: DiffKind
-    localPath: string | null
-    remotePath: string
-  }): Promise<{ handled: boolean; reason?: string }> {
+  async handleDiff(
+    diff: {
+      kind: DiffKind
+      localPath: string | null
+      remotePath: string
+    },
+    /*
+     * manual = 用户显式点的「重新上传 / 覆盖远端」（含批量）。
+     *
+     * autoFixLimit 是给「对账自动修复」设的保险丝，防止一轮对账
+     * 因为远端异常而自己发起几万条重传。但用户手动点「全部重新上传」时，
+     * 他已经明确要求处理这些文件——再被 20 条的上限拦住，
+     * 界面上只会看到「已跳过」和一条「自动修复已达上限」，
+     * 点 200 次也只有前 20 次生效。这不是保险丝，是坏掉的按钮。
+     */
+    opts: { manual?: boolean } = {}
+  ): Promise<{ handled: boolean; reason?: string }> {
     const config = this.opts.getConfig()
-    if (config.remoteScan.conflictPolicy !== 'local-wins') {
+    /*
+     * 冲突策略只管「机器自己动手」。
+     *
+     * 策略是「全部交由我确认」时，用户手动点「重新上传」本身就是确认——
+     * 这时候再拦一次，按钮就成了摆设。自动对账仍然按策略走。
+     */
+    if (!opts.manual && config.remoteScan.conflictPolicy !== 'local-wins') {
       /*
        * 返回**原因**而不是光一个 false。
        *
@@ -1107,7 +1125,11 @@ export class Planner {
       }
     }
 
-    if (diff.kind !== 'missing_remote' && diff.kind !== 'size_mismatch') {
+    if (
+      diff.kind !== 'missing_remote' &&
+      diff.kind !== 'size_mismatch' &&
+      diff.kind !== 'local_only'
+    ) {
       if (diff.kind === 'remote_only') {
         this.opts.onLog?.('info', `远端多出文件（按策略不动作）：${diff.remotePath}`)
         return {
@@ -1118,7 +1140,7 @@ export class Planner {
       return { handled: false, reason: '这类差异不需要回传本地版本' }
     }
 
-    if (this.autoFixed >= config.remoteScan.autoFixLimit) {
+    if (this.autoFixed >= config.remoteScan.autoFixLimit && !opts.manual) {
       this.opts.onLog?.(
         'warn',
         `对账自动修复已达上限 ${config.remoteScan.autoFixLimit}，其余差异仅记录待人工确认`
@@ -1152,11 +1174,20 @@ export class Planner {
       return { handled: false, reason: message }
     }
 
-    this.autoFixed++
-    this.opts.onLog?.(
-      'info',
-      `对账发现${diff.kind === 'missing_remote' ? '远端缺失' : '内容不符'}，重新上传 ${diff.localPath}`
-    )
+    /*
+     * 只对「自动修复」计数并逐条记日志。
+     *
+     * 用户手动批量处理 200 条时，这里如果每条都写一行 info，
+     * 运行日志会被瞬间刷满、真正要看的失败原因被顶走；
+     * 计数也不该被手动操作吃掉——那会让本轮剩下的自动修复失效。
+     */
+    if (!opts.manual) {
+      this.autoFixed++
+      this.opts.onLog?.(
+        'info',
+        `对账发现${diff.kind === 'missing_remote' ? '远端缺失' : '内容不符'}，重新上传 ${diff.localPath}`
+      )
+    }
 
     /*
      * **必须先清掉同步基准，再入队。**

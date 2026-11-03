@@ -714,3 +714,117 @@ describe('取消后的持久化语义', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 })
+
+/**
+ * 「全部重新上传」这类批量按钮背后仍是 handleDiff。
+ *
+ * 它有两道闸门是为**自动**对账设的：autoFixLimit（防一轮对账自己重传几万条）
+ * 与 conflictPolicy（策略为「全部交由我确认」时机器不动手）。
+ * 用户显式点按钮时这两道闸门不该生效——否则点 206 条只有前 20 条进队列，
+ * 剩下的静静留在列表里，看着像点了没反应。
+ */
+describe('手动处置差异的准入', () => {
+  const setup = (): {
+    dir: string
+    syncRoot: string
+    manifest: Manifest
+    planner: Planner
+    close: () => void
+  } => {
+    const dir = mkdtempSync(join(tmpdir(), 'topensync-manual-diff-'))
+    const syncRoot = join(dir, 'sync')
+    require('fs').mkdirSync(syncRoot, { recursive: true })
+    const manifest = new Manifest(join(dir, 'manifest.db'))
+    const planner = new Planner({
+      manifest,
+      transfer: { upload: vi.fn().mockResolvedValue({ ok: true }) } as unknown as Transfer,
+      client: { mkdir: vi.fn(), move: vi.fn(), remove: vi.fn() } as unknown as OpenListClient,
+      getConfig: () => ({ ...CONFIG, syncRoot })
+    })
+    planner.start()
+    return {
+      dir,
+      syncRoot,
+      manifest,
+      planner,
+      close: () => {
+        planner.stop()
+        manifest.close()
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  }
+
+  const seed = (
+    manifest: Manifest,
+    syncRoot: string,
+    name: string
+  ): void => {
+    const p = join(syncRoot, name)
+    writeFileSync(p, 'x'.repeat(1024))
+    const st = statSync(p)
+    manifest.upsertFile({
+      localPath: name,
+      localSize: st.size,
+      mtimeMs: st.mtimeMs,
+      state: 'synced'
+    })
+    manifest.setState(name, 'synced', {
+      remoteSize: st.size,
+      syncedSize: st.size,
+      syncedMtimeMs: st.mtimeMs
+    })
+  }
+
+  it('手动处置不受自动修复上限约束，自动路径仍然守额度', async () => {
+    const ctx = setup()
+    seed(ctx.manifest, ctx.syncRoot, 'manual.txt')
+    const before = CONFIG.remoteScan.autoFixLimit
+    CONFIG.remoteScan.autoFixLimit = 0
+    try {
+      const manual = await ctx.planner.handleDiff(
+        { kind: 'missing_remote', localPath: 'manual.txt', remotePath: '/q/manual.txt' },
+        { manual: true }
+      )
+      expect(manual.handled).toBe(true)
+
+      const auto = await ctx.planner.handleDiff({
+        kind: 'missing_remote',
+        localPath: 'manual.txt',
+        remotePath: '/q/manual.txt'
+      })
+      expect(auto.handled).toBe(false)
+      expect(auto.reason).toContain('上限')
+    } finally {
+      CONFIG.remoteScan.autoFixLimit = before
+      await settle(200)
+      ctx.close()
+    }
+  })
+
+  it('冲突策略为「全部交由我确认」时，手动处置仍然执行', async () => {
+    const ctx = setup()
+    seed(ctx.manifest, ctx.syncRoot, 'confirm.txt')
+    const before = CONFIG.remoteScan.conflictPolicy
+    CONFIG.remoteScan.conflictPolicy = 'manual'
+    try {
+      const manual = await ctx.planner.handleDiff(
+        { kind: 'missing_remote', localPath: 'confirm.txt', remotePath: '/q/confirm.txt' },
+        { manual: true }
+      )
+      expect(manual.handled).toBe(true)
+
+      const auto = await ctx.planner.handleDiff({
+        kind: 'missing_remote',
+        localPath: 'confirm.txt',
+        remotePath: '/q/confirm.txt'
+      })
+      expect(auto.handled).toBe(false)
+      expect(auto.reason).toContain('冲突策略')
+    } finally {
+      CONFIG.remoteScan.conflictPolicy = before
+      await settle(200)
+      ctx.close()
+    }
+  })
+})

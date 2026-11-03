@@ -473,7 +473,15 @@ export class Transfer {
             const elapsed = now - lastEmitAt
             if (!firstEmit && elapsed < PROGRESS_EMIT_MS && sent < size) return
 
-            const instant = elapsed > 0 ? (sent - lastEmitSent) / (elapsed / 1000) : 0
+            /*
+             * 分母兜底 100ms。
+             *
+             * 第一次回调可能在开传后几毫秒就来了（64KB 从页缓存读出来），
+             * 那时 64KB / 3ms 会算出 20 MB/s 的假速度，再经平滑要一秒多
+             * 才回落——刚点开始同步的头两秒，每行都顶着一个离谱的数字。
+             */
+            const instant =
+              elapsed > 0 ? (sent - lastEmitSent) / Math.max(0.1, elapsed / 1000) : 0
             smooth = smooth > 0 ? smooth * 0.6 + instant * 0.4 : instant
             this.opts.onProgress?.({
               fileId: req.fileId,
@@ -522,19 +530,41 @@ export class Transfer {
       const startedAt = Date.now()
       let sent = 0
 
-      for (let i = 0; i < total; i++) {
-        if (received.has(i)) {
-          sent += chunkSize
-          continue
-        }
+      /*
+       * 速率必须按**这一次真正上传的字节**算，不能让续传的进度顶上来。
+       *
+       * 以前这里是 `sent / (now - startedAt)`：`sent` 里包含了「服务端已有、
+       * 直接跳过」的分片。一个断点续传的 6.5GB 文件，若前 4GB 已经传过，
+       * 循环开头几毫秒就把 sent 加到 4GB——速率瞬间变成几百 MB/s，
+       * 之后一路按「4GB ÷ 已耗时」缓慢回落，几百秒后仍显示十几 MB/s。
+       * 结果就是列表里四行加起来 54 MB/s，顶栏总共只有 20 MB/s。
+       *
+       * 改成与单次 PUT 同一套：以上一次上报为基准算增量速率，
+       * 跳过续传分片时把基准一起上移（那批字节没有产生流量）。
+       */
+      let lastEmitAt = startedAt
+      let lastEmitSent = 0
+      let smooth = 0
 
+      for (let i = 0; i < total; i++) {
         const offset = i * chunkSize
         const length = Math.min(chunkSize, size - offset)
+
+        if (received.has(i)) {
+          sent += length
+          // 续传：不计流量，采样基准跟着走，否则「0 秒传了 4GB」
+          lastEmitSent = sent
+          lastEmitAt = Date.now()
+          continue
+        }
 
         await this.sendChunkWithRetry(uploadId, i, req.absPath, offset, length)
 
         sent += length
-        const elapsed = (Date.now() - startedAt) / 1000
+        const now = Date.now()
+        const elapsed = now - lastEmitAt
+        const instant = elapsed > 0 ? (sent - lastEmitSent) / (elapsed / 1000) : 0
+        smooth = smooth > 0 ? smooth * 0.6 + instant * 0.4 : instant
         this.opts.onProgress?.({
           fileId: req.fileId,
           relPath: req.relPath,
@@ -543,8 +573,10 @@ export class Transfer {
           delta: length,
           chunksDone: i + 1,
           chunksTotal: total,
-          speed: elapsed > 0 ? sent / elapsed : 0
+          speed: smooth
         })
+        lastEmitAt = now
+        lastEmitSent = sent
       }
 
       await client.multipartComplete(uploadId)
