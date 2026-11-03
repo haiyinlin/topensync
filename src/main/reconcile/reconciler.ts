@@ -8,7 +8,14 @@ import {
 } from '../watcher/paths'
 import { join } from 'path'
 import { tick } from '../io/tick'
-import type { AppConfig, DiffEntry, DiffKind, ScanKind, ScanTrigger } from '@shared/types'
+import type {
+  AppConfig,
+  DiffEntry,
+  DiffKind,
+  FileEntry,
+  ScanKind,
+  ScanTrigger
+} from '@shared/types'
 
 /**
  * 远端对账器。
@@ -389,7 +396,8 @@ export class Reconciler {
       // 与本地清单比对
       const localByRemote = new Map<string, (typeof localFiles)[number]>()
       for (const f of localFiles) {
-        if (f.remotePath) localByRemote.set(f.remotePath, f)
+        const expected = this.expectedRemotePath(f, root)
+        if (expected) localByRemote.set(expected, f)
       }
 
       // 比对阶段也报进度：这一步是纯 CPU 循环，文件多时也要好几秒
@@ -525,7 +533,7 @@ export class Reconciler {
            * （在、大小一致）。不提升的话，用户点完「立即对账」看到的
            * 还是满屏「未校验」，会以为对账没跑（真实反馈）。
            */
-          manifest.confirmRemotePresence(local.localPath)
+          manifest.confirmRemotePresence(local.localPath, remotePath)
         }
       }
 
@@ -535,13 +543,15 @@ export class Reconciler {
         // 让出的间隔取小一点，别让界面在复核阶段长时间停顿
         if (i > 0 && i % 50 === 0) await this.yieldIfBusy()
         const local = localFiles[i]
-        if (!local.remotePath) continue
+        // 缺 remote_path 的已同步行按「同步根 + 相对路径」推，别再默默跳过
+        const remotePath = this.expectedRemotePath(local, root)
+        if (!remotePath) continue
         if (local.state === 'deleted') continue
-        if (seen.has(local.remotePath)) continue
-        if (remoteFiles.has(local.remotePath)) continue
+        if (seen.has(remotePath)) continue
+        if (remoteFiles.has(remotePath)) continue
 
         // 所属目录本轮列举不可信 → 不能判它「缺失」
-        if (isUnderAnyDir(local.remotePath, unreliableDirs)) continue
+        if (isUnderAnyDir(remotePath, unreliableDirs)) continue
 
         // 正在传输 → 远端本来就可能还没有，不是差异
         if (this.opts.isTransferInFlight?.(local.localPath)) {
@@ -560,7 +570,7 @@ export class Reconciler {
         // （上传 → 校验 → 对账判缺失 → 重传 → …）。
         //
         // 所以这里刷新父目录后再确认一次：确实不在才算真的缺失。
-        if (!(await this.opts.client.confirmMissing(local.remotePath))) {
+        if (!(await this.opts.client.confirmMissing(remotePath))) {
           // 复核后其实还在 → 是缓存假阴性，不算差异
           continue
         }
@@ -568,7 +578,7 @@ export class Reconciler {
         const entry = manifest.recordDiff({
           kind: 'missing_remote',
           localPath: local.localPath,
-          remotePath: local.remotePath,
+          remotePath,
           localSize: local.localSize,
           remoteSize: null,
           localMtime: local.mtimeMs,
@@ -579,7 +589,7 @@ export class Reconciler {
         this.opts.onDiff?.({
           kind: 'missing_remote',
           localPath: local.localPath,
-          remotePath: local.remotePath
+          remotePath
         })
       }
 
@@ -623,6 +633,25 @@ export class Reconciler {
     } finally {
       this.running = false
     }
+  }
+
+  /**
+   * 一条本地记录「应该」在远端的哪个位置。
+   *
+   * 清单里绝大多数行都带 `remote_path`，但确实存在没有的行
+   * （早期版本只写了 synced 状态、或从别处恢复回来的记录）。
+   * 以前这些行在对账里被直接 `continue` 掉——**既不核对、也不判缺失**，
+   * 于是永远停在「未校验」，用户点完对账觉得「是不是被跳过了」（正是反馈）。
+   *
+   * 远端路径是确定的（远端根 + 相对路径），缺了就按这个推出来。
+   *
+   * 只对「声称自己已同步」的行推：pending / error / local_only 这些
+   * 本来就没承诺远端有这份文件，推出来只会制造假差异。
+   */
+  private expectedRemotePath(local: FileEntry, root: string): string | null {
+    if (local.remotePath) return local.remotePath
+    if (local.state !== 'synced') return null
+    return joinRemotePath(root, local.localPath)
   }
 
   private async listDir(path: string, refresh: boolean): Promise<RemoteObject[]> {

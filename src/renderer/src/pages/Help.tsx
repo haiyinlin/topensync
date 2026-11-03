@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { useEffect, useState } from 'react'
 import { Icon } from '../components/Icon'
 import type { PageKey } from '../App'
 
@@ -11,6 +12,13 @@ import type { PageKey } from '../App'
  * 没有对应页面的说明（「秒传与去重」「常见问题」）宁可不放。
  */
 export function Help(): React.JSX.Element {
+  const [version, setVersion] = useState<string | null>(null)
+
+  // 版本号从主进程取（打包后的 package.json 版本），失败就留一个省略号
+  useEffect(() => {
+    void window.topensync?.appVersion().then(setVersion).catch(() => undefined)
+  }, [])
+
   return (
     <section>
       <div className="page-head">
@@ -88,7 +96,14 @@ export function Help(): React.JSX.Element {
       <div className="card ver-card">
         <div className="ver-head">
           <span className="kv-k">版本</span>
-          <span className="mono ver-txt">TopenSync v0.1.0 · dev</span>
+          {/*
+            * 必须读真实版本，不能写死。
+            *
+            * 这里以前写死成 `v0.1.0 · dev`——后来发了十几个版本，界面还
+            * 一直显示 v0.1.0。排查时用户照着这里报版本，两边全在猜；
+            * 「我这是最新版吧」这种误判一次能耗掉半天。
+            */}
+          <span className="mono ver-txt">TopenSync {version ? `v${version}` : '…'}</span>
         </div>
         <div className="hr" />
         <p className="note">

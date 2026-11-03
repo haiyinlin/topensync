@@ -1059,18 +1059,21 @@ export class Manifest {
    * `size` 保持不变。认领（adoptByNameAndSize）写 'size' 的那条路
    * 只对「从未同步过」的记录生效，与这里不冲突。
    */
-  confirmRemotePresence(localPath: string): void {
+  confirmRemotePresence(localPath: string, remotePath?: string): void {
     this.db
       .prepare(
         `UPDATE files SET
            last_verify_at = ?,
+           /* 清单里缺 remote_path 的行，对账确认后顺手补上——
+              否则「下载 / 深度校验 / 单条处置」都找不到远端落点 */
+           remote_path = COALESCE(remote_path, ?),
            verify_level = CASE
              WHEN verify_level IS NULL THEN 'reconciled'
              ELSE verify_level
            END
          WHERE local_path = ?`
       )
-      .run(Date.now(), localPath)
+      .run(Date.now(), remotePath ?? null, localPath)
   }
 
   markVerified(localPath: string): void {

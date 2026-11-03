@@ -30,6 +30,19 @@ export function registerIpc(engine: Engine): void {
     await engine.whenReady()
     return engine.getSnapshot()
   })
+  /*
+   * 版本号。
+   *
+   * 「我装的是哪个版本」在排查时是第一句话：同一个界面在不同版本里
+   * 行为可能完全不一样（例：0.3.7 之前对账不升级可信度）。
+   * 以前界面上看不到，用户只能靠安装包文件名猜。
+   */
+  ipcMain.handle('app:version', () => {
+    const v = app.getVersion()
+    // 未打包运行时 getVersion() 返回的是 **Electron 自己的版本**（如 36.9.5），
+    // 不能把它当应用版本显示给对方看，标个 dev 提醒
+    return app.isPackaged ? v : `${v}-dev`
+  })
   ipcMain.handle('app:stats', () => engine.getStats())
   ipcMain.handle('config:get', () => engine.getConfig())
   ipcMain.handle('files:list', (_e, opts: { limit?: number; offset?: number }) =>

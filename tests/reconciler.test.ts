@@ -416,3 +416,83 @@ describe('对账后可信度的升级', () => {
     expect(manifest.getFile('a.txt')?.verifyLevel).toBe('hash')
   })
 })
+
+/**
+ * 清单里缺 `remote_path` 的「已同步」行也要参与对账。
+ *
+ * 以前的写法是 `if (!local.remotePath) continue`——这类行既不核对、
+ * 也不判缺失，永远停在「未校验」。用户点完对账只会问：
+ * 「对账是不是把它们跳过了」。
+ *
+ * 远端路径是确定的（远端根 + 相对路径），缺了就该按这个推。
+ */
+describe('缺 remote_path 的已同步行', () => {
+  let dir: string
+  let manifest: Manifest
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'topensync-no-rp-'))
+    manifest = new Manifest(join(dir, 'manifest.db'))
+  })
+
+  afterEach(() => {
+    manifest.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const seed = (): void => {
+    // 故意不传 remotePath：模拟「只写了 synced 状态、没记远端落点」的历史行
+    manifest.upsertFile({ localPath: 'sub/a.txt', localSize: 10, mtimeMs: 1, state: 'synced' })
+    manifest.setState('sub/a.txt', 'synced', {
+      remoteSize: 10,
+      syncedSize: 10,
+      syncedMtimeMs: 1
+    })
+  }
+
+  const remoteHasA = {
+    list: vi.fn().mockImplementation(async (p: string) => ({
+      content:
+        p === '/quark-backup'
+          ? [{ name: 'sub', size: 0, modified: '', isDir: true }]
+          : p === '/quark-backup/sub'
+            ? [{ name: 'a.txt', size: 10, modified: '2026-01-01T00:00:00Z', isDir: false }]
+            : [],
+      total: 1
+    })),
+    confirmMissing: vi.fn().mockResolvedValue(true),
+    move: vi.fn().mockResolvedValue(undefined),
+    remove: vi.fn().mockResolvedValue(undefined)
+  } as unknown as OpenListClient
+
+  it('按「远端根 + 相对路径」核对，并补上 remote_path', async () => {
+    seed()
+    expect(manifest.getFile('sub/a.txt')?.remotePath).toBeNull()
+
+    await new Reconciler({ client: remoteHasA, manifest, config: CONFIG }).runNow()
+
+    const f = manifest.getFile('sub/a.txt')
+    expect(f?.verifyLevel).toBe('reconciled')
+    expect(f?.remotePath, '对账确认后要把远端落点补回去').toBe('/quark-backup/sub/a.txt')
+    expect(manifest.listUnresolvedDiffs()).toHaveLength(0)
+  })
+
+  it('远端确实没有时，判成「远端缺失」而不是默默跳过', async () => {
+    seed()
+    const emptyRemote = {
+      list: vi.fn().mockResolvedValue({ content: [], total: 0 }),
+      confirmMissing: vi.fn().mockResolvedValue(true),
+      move: vi.fn().mockResolvedValue(undefined),
+      remove: vi.fn().mockResolvedValue(undefined)
+    } as unknown as OpenListClient
+
+    await new Reconciler({ client: emptyRemote, manifest, config: CONFIG }).runNow()
+
+    const diffs = manifest.listUnresolvedDiffs()
+    expect(diffs).toHaveLength(1)
+    expect(diffs[0].kind).toBe('missing_remote')
+    expect(diffs[0].remotePath).toBe('/quark-backup/sub/a.txt')
+    // 判缺失时不该顺手把路径当成「已确认」
+    expect(manifest.getFile('sub/a.txt')?.verifyLevel).toBeNull()
+  })
+})

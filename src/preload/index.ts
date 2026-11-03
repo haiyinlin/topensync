@@ -124,6 +124,9 @@ const api = {
   verifyRemoteFiles: (relPaths: string[]): Promise<DeepVerifyResult> =>
     ipcRenderer.invoke('files:verifyRemote', relPaths),
 
+  /** 应用版本号（界面上要能显示，排查时第一句就问这个） */
+  appVersion: (): Promise<string> => ipcRenderer.invoke('app:version'),
+
   quit: () => ipcRenderer.send('app:quit')
 }
 
