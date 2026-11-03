@@ -1091,21 +1091,31 @@ export class Planner {
     kind: DiffKind
     localPath: string | null
     remotePath: string
-  }): Promise<boolean> {
+  }): Promise<{ handled: boolean; reason?: string }> {
     const config = this.opts.getConfig()
     if (config.remoteScan.conflictPolicy !== 'local-wins') {
-      this.opts.onLog?.(
-        'warn',
-        `冲突策略为「全部交由我确认」，未自动处理差异：${diff.remotePath}`
-      )
-      return false
+      /*
+       * 返回**原因**而不是光一个 false。
+       *
+       * 这条差异是用户点了「覆盖远端」之后才走到这里的，什么都没发生
+       * 却只回一句「请检查冲突策略与文件状态」——等于让用户自己猜。
+       * 每个 false 分支都写清「为什么没动手」和「下一步该做什么」。
+       */
+      return {
+        handled: false,
+        reason: '冲突策略是「全部交由我确认」，自动修复不会动手；到「对账规则」把它改成「本地优先」'
+      }
     }
 
     if (diff.kind !== 'missing_remote' && diff.kind !== 'size_mismatch') {
       if (diff.kind === 'remote_only') {
         this.opts.onLog?.('info', `远端多出文件（按策略不动作）：${diff.remotePath}`)
+        return {
+          handled: false,
+          reason: '远端多出的文件按策略只记录、不回传；要合并到本地请点「下载」'
+        }
       }
-      return false
+      return { handled: false, reason: '这类差异不需要回传本地版本' }
     }
 
     if (this.autoFixed >= config.remoteScan.autoFixLimit) {
@@ -1113,13 +1123,23 @@ export class Planner {
         'warn',
         `对账自动修复已达上限 ${config.remoteScan.autoFixLimit}，其余差异仅记录待人工确认`
       )
-      return false
+      return {
+        handled: false,
+        reason: `本轮自动修复已达上限 ${config.remoteScan.autoFixLimit} 条；下一轮对账会继续处理，也可先调高上限`
+      }
     }
-    if (!diff.localPath) return false
+    if (!diff.localPath) {
+      return { handled: false, reason: '这条差异没有对应的本地文件，无从回传' }
+    }
 
     const absPath = absolutize(config.syncRoot, diff.localPath)
     const probe = await this.probe(absPath)
-    if (!probe.ok) return false
+    if (!probe.ok) {
+      return {
+        handled: false,
+        reason: `本地文件当前读不到${probe.reason ? `（${probe.reason}）` : ''}；若是网络盘掉线，接好后重新对账`
+      }
+    }
 
     // 同样受单文件上限约束：超限文件回流重传也只会失败
     if (this.isOversize(probe.size, config)) {
@@ -1129,7 +1149,7 @@ export class Planner {
       this.opts.manifest.setState(diff.localPath, 'error', { errorMsg: message })
       this.opts.onLog?.('error', `${message}：${diff.localPath}`)
       this.touch(diff.localPath, { state: 'failed', errorMsg: message, size: probe.size })
-      return false
+      return { handled: false, reason: message }
     }
 
     this.autoFixed++
@@ -1164,7 +1184,7 @@ export class Planner {
       reason: 'diff',
       attempts: 0
     })
-    return true
+    return { handled: true }
   }
 
   // ── 手动重试 / 取消 ───────────────────────────────────

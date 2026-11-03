@@ -1698,24 +1698,27 @@ export class Engine {
 
     try {
       let acted = true
+      /** 没动手时的原因：直接拼进日志，别让用户猜 */
+      let whyNot = ''
       switch (resolution) {
         case 'uploaded':
         case 'overwritten': {
           if (diff.localPath) {
             /*
-             * handleDiff 现在返回「是否真的处理了」。
+             * handleDiff 会返回「是否真的处理了 + 为什么没处理」。
              *
              * 它有多个「什么都没做」的分支：冲突策略不是 local-wins、
              * 自动修复额度已满、本地文件读不到、超单文件上限。
              * 以前不管三七二十一都把差异标成「已处置」——
              * 用户以为远端已经用本地那份覆盖了，其实远端那份错的文件一直留着。
              */
-            acted =
-              (await this.planner?.handleDiff({
-                kind: 'size_mismatch',
-                localPath: diff.localPath,
-                remotePath: diff.remotePath
-              })) ?? false
+            const r = (await this.planner?.handleDiff({
+              kind: 'size_mismatch',
+              localPath: diff.localPath,
+              remotePath: diff.remotePath
+            })) ?? { handled: false, reason: '同步引擎未启动' }
+            acted = r.handled
+            whyNot = r.reason ?? ''
           }
           break
         }
@@ -1736,7 +1739,8 @@ export class Engine {
       if (!acted) {
         this.pushLog(
           'warn',
-          `差异未实际处理，保持待处置状态：${diff.remotePath}（请检查冲突策略与文件状态）`
+          `差异未处理，仍待处置：${diff.remotePath} —— ${whyNot || '原因未知'}`,
+          { category: 'system' }
         )
         return
       }
