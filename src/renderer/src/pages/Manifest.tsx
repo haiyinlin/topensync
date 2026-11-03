@@ -109,6 +109,24 @@ function localDetail(f: FileEntry, remoteRoot: string): DetailRow[] {
       })
     }
   }
+  /*
+   * 「已同步 + 未校验」这个组合最容易让人困惑，展开区必须直说清楚：
+   * 状态是**本地**的判断（文件没动过），不是「已核对过远端」。
+   */
+  rows.push({
+    items: [
+      {
+        k: '可信度',
+        v:
+          f.verifyLevel === 'hash'
+            ? '哈希确认：远端文件已拉回本地重算哈希并比对通过'
+            : f.verifyLevel === 'size'
+              ? '仅大小：远端有同名同大小的文件，已认定一致，但内容没读过'
+              : '未校验：本地大小与修改时间未变，直接沿用上次成功同步的结论，从未核对远端'
+      }
+    ],
+    tall: true
+  })
   return rows
 }
 
@@ -529,7 +547,7 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
           ))}
         </div>
         <span className="tb-hint">
-          「仅大小」只比了文件名与大小，内容未校验——这些文件本地那份可能没备份
+          「仅大小」只比了名称与大小；「未校验」是本地没动过、沿用上次结论——两类都没读过远端内容
         </span>
       </div>
 
@@ -768,7 +786,20 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
                           {VERIFY_LABELS[f.verifyLevel]}
                         </span>
                       ) : (
-                        <span className="pill gray">—</span>
+                        /*
+                         * 没有可信度标记 ≠ 没同步。
+                         *
+                         * 绝大多数是「本地大小与修改时间和上次成功同步时一致」
+                         * （L1 快筛）——本地根本没动过，就直接沿用了上次的结论，
+                         * 全程没碰远端。所以它是「已同步」，但依据只是**本地没变**。
+                         * 以前这里画一个「—」，用户看到「已同步 + —」只会更困惑。
+                         */
+                        <span
+                          className="pill gray"
+                          title="没核对过远端：本地大小与修改时间和上次成功同步时一致，直接沿用了上次的结论。需要确认时用「深度校验」。"
+                        >
+                          未校验
+                        </span>
                       )}
                     </td>
                     <td>
@@ -985,14 +1016,14 @@ const VERIFY_FILTER_LABELS: Record<VerifyFilter, string> = {
   all: '不限',
   hash: '哈希确认',
   size: '仅大小',
-  unknown: '未标记'
+  unknown: '未校验'
 }
 
 const VERIFY_FILTER_HINTS: Record<VerifyFilter, string> = {
   all: '不按可信度筛选',
-  hash: '内容经过哈希比对确认，可靠',
-  size: '仅凭「文件名 + 大小」弱认定，内容未校验',
-  unknown: '尚未走完同步流程，没有可信度标记'
+  hash: '把远端文件拉回来重算哈希比对过，结论可靠',
+  size: '仅凭「文件名 + 大小」认领远端已有，内容没读过',
+  unknown: '本地大小/修改时间与上次成功同步时一致，直接沿用上次结论，从未核对远端'
 }
 
 /** 差异标签另起一套配色，不与同步状态标签共用 */
