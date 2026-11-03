@@ -520,8 +520,12 @@ export class Reconciler {
            * 「修改时间不同」**不再**单独列为差异：复制、解压、跨设备同步
            * 都会改 mtime，而内容可能一模一样。把它列进对账清单只会制造噪声，
            * 用户要回答的是「这个文件在不在」「两边是不是同一份」。
+           *
+           * 顺带把可信度从「未校验」提到「仅大小」：这一轮确实核对过远端
+           * （在、大小一致）。不提升的话，用户点完「立即对账」看到的
+           * 还是满屏「未校验」，会以为对账没跑（真实反馈）。
            */
-          manifest.markVerified(local.localPath)
+          manifest.confirmRemotePresence(local.localPath)
         }
       }
 

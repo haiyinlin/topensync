@@ -11,7 +11,8 @@ import type {
   ScanRecord,
   SyncHistoryEntry,
   SyncHistoryKind,
-  SkipReason
+  SkipReason,
+  VerifyLevel
 } from '@shared/types'
 
 /**
@@ -1042,6 +1043,36 @@ export class Manifest {
         )
   }
 
+  /**
+   * 对账确认「远端确实有这份文件，且大小与清单记录一致」。
+   *
+   * 与 `markVerified()` 的区别：那个只盖一个时间戳（深度校验用），
+   * 这个还要把结论从「未校验」提升到「仅大小」。
+   *
+   * 为什么要提升：`verify_level` 回答的是「这个文件的结论凭什么是它」，
+   * 而 `NULL`（未校验）的字面含义是「还没跟远端核对过」。跑完一轮对账后
+   * 这个描述就不成立了——远端在不在、大小对不对，这一轮都亲眼看过。
+   * 不提升的话，用户点完「立即对账」，四千多条仍然写着「未校验」，
+   * 看上去像是对账什么都没做（真实反馈）。
+   *
+   * 只升不降：`hash` 是内容级结论，不能被弱认定覆盖；
+   * `size` 保持不变。认领（adoptByNameAndSize）写 'size' 的那条路
+   * 只对「从未同步过」的记录生效，与这里不冲突。
+   */
+  confirmRemotePresence(localPath: string): void {
+    this.db
+      .prepare(
+        `UPDATE files SET
+           last_verify_at = ?,
+           verify_level = CASE
+             WHEN verify_level IS NULL THEN 'reconciled'
+             ELSE verify_level
+           END
+         WHERE local_path = ?`
+      )
+      .run(Date.now(), localPath)
+  }
+
   markVerified(localPath: string): void {
     this.db
       .prepare('UPDATE files SET last_verify_at = ? WHERE local_path = ?')
@@ -1549,7 +1580,7 @@ function mapFileRow(r: Record<string, unknown>): Record<string, unknown> {
     syncedMtimeMs: r['synced_mtime_ms'],
     syncedMd5: r['synced_md5'] ?? null,
     syncedSha1: r['synced_sha1'] ?? null,
-    verifyLevel: (r['verify_level'] as 'hash' | 'size' | null) ?? null,
+    verifyLevel: (r['verify_level'] as VerifyLevel) ?? null,
     localInode: r['local_inode'] === null || r['local_inode'] === undefined ? null : String(r['local_inode']),
     state: r['state'],
     lastSyncAt: r['last_sync_at'],

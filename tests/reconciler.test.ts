@@ -345,3 +345,74 @@ describe('Reconciler 对「远端列举不出来」的容错', () => {
     expect(missing, '空列表不能直接判定远端缺失').toHaveLength(0)
   })
 })
+
+/**
+ * 对账确认「远端在、大小对」之后，可信度要跟着升级。
+ *
+ * 用户反馈：「我重新对账，可信度也是未校验」。当时对账只盖了一个
+ * last_verify_at 时间戳，`verify_level` 一个都不动——四千多条仍然写着
+ * 「未校验」，看着像对账什么都没做。
+ *
+ * 升级目标是 `reconciled`（已核对）而不是 `size`（仅大小）：
+ * 后者是「认领」专用——我们从没真正上传过那份文件，风险不同，界面用黄色提醒。
+ */
+describe('对账后可信度的升级', () => {
+  let dir: string
+  let manifest: Manifest
+
+  const client = {
+    list: vi.fn().mockResolvedValue({
+      content: [{ name: 'a.txt', size: 10, modified: '2026-01-01T00:00:00Z', isDir: false }],
+      total: 1
+    }),
+    move: vi.fn().mockResolvedValue(undefined),
+    remove: vi.fn().mockResolvedValue(undefined)
+  } as unknown as OpenListClient
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'topensync-verify-level-'))
+    manifest = new Manifest(join(dir, 'manifest.db'))
+  })
+
+  afterEach(() => {
+    manifest.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const seed = (): void => {
+    manifest.upsertFile({
+      localPath: 'a.txt',
+      localSize: 10,
+      mtimeMs: 1,
+      remotePath: '/quark-backup/a.txt',
+      state: 'synced'
+    })
+    manifest.setState('a.txt', 'synced', {
+      remoteSize: 10,
+      syncedSize: 10,
+      syncedMtimeMs: 1
+    })
+  }
+
+  it('未校验 → 已核对（这一轮确实核对过远端）', async () => {
+    seed()
+    expect(manifest.getFile('a.txt')?.verifyLevel).toBeNull()
+
+    await new Reconciler({ client, manifest, config: CONFIG }).runNow()
+
+    expect(manifest.getFile('a.txt')?.verifyLevel).toBe('reconciled')
+    // 差异列表里不该多出条目——确认一致不是差异
+    expect(manifest.listUnresolvedDiffs()).toHaveLength(0)
+  })
+
+  it('哈希确认不会被对账降级', async () => {
+    seed()
+    // 深度校验写过远端哈希 → hash
+    manifest.setState('a.txt', 'synced', { syncedMd5: 'm', syncedSha1: 's' })
+    expect(manifest.getFile('a.txt')?.verifyLevel).toBe('hash')
+
+    await new Reconciler({ client, manifest, config: CONFIG }).runNow()
+
+    expect(manifest.getFile('a.txt')?.verifyLevel).toBe('hash')
+  })
+})

@@ -1,6 +1,6 @@
 {
   "name": "topensync",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Windows 桌面同步程序：本地目录 → OpenList → 夸克网盘",
   "author": "haiyinlin",
   "license": "MIT",

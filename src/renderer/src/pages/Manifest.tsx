@@ -34,7 +34,7 @@ import { useAppStore } from '../store'
  */
 type StatusFilter = 'all' | 'synced' | 'pending' | 'error'
 type DiffFilter = DiffKind | 'all' | 'none'
-type VerifyFilter = 'all' | 'hash' | 'size' | 'unknown'
+type VerifyFilter = 'all' | 'hash' | 'reconciled' | 'size' | 'unknown'
 
 /**
  * 把远端绝对路径拆成「根前缀 + 相对路径」。
@@ -112,20 +112,19 @@ function localDetail(f: FileEntry, remoteRoot: string): DetailRow[] {
   /*
    * 「已同步 + 未校验」这个组合最容易让人困惑，展开区必须直说清楚：
    * 状态是**本地**的判断（文件没动过），不是「已核对过远端」。
+   *
+   * 这里**不能标 tall**：tall 行按「最多三行」预留 66px，而这行文字
+   * 通常一行就完了，底下会空出四十多像素——用户看到的就是
+   * 「展开后底部一大块空白」。要写长就换行写清楚，别用预留高度去凑。
    */
   rows.push({
     items: [
       {
         k: '可信度',
-        v:
-          f.verifyLevel === 'hash'
-            ? '哈希确认：远端文件已拉回本地重算哈希并比对通过'
-            : f.verifyLevel === 'size'
-              ? '仅大小：远端有同名同大小的文件，已认定一致，但内容没读过'
-              : '未校验：本地大小与修改时间未变，直接沿用上次成功同步的结论，从未核对远端'
+        v: verifyText(f.verifyLevel),
+        title: verifyText(f.verifyLevel)
       }
-    ],
-    tall: true
+    ]
   })
   return rows
 }
@@ -236,13 +235,13 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
     const map = new Map<VerifyFilter, number>([
       ['all', files.length],
       ['hash', 0],
+      ['reconciled', 0],
       ['size', 0],
       ['unknown', 0]
     ])
     for (const f of files) {
-      if (f.verifyLevel === 'hash') map.set('hash', (map.get('hash') ?? 0) + 1)
-      else if (f.verifyLevel === 'size') map.set('size', (map.get('size') ?? 0) + 1)
-      else map.set('unknown', (map.get('unknown') ?? 0) + 1)
+      const k: VerifyFilter = f.verifyLevel ?? 'unknown'
+      map.set(k, (map.get(k) ?? 0) + 1)
     }
     return map
   }, [files])
@@ -258,9 +257,11 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
           return false
         }
         // 可信度筛选：只看弱认定的文件时，这是唯一能找出备份缺口的办法
-        if (verifyFilter === 'hash' && f.verifyLevel !== 'hash') return false
-        if (verifyFilter === 'size' && f.verifyLevel !== 'size') return false
-        if (verifyFilter === 'unknown' && f.verifyLevel !== null) return false
+        if (verifyFilter === 'unknown') {
+          if (f.verifyLevel !== null) return false
+        } else if (verifyFilter !== 'all' && f.verifyLevel !== verifyFilter) {
+          return false
+        }
         return true
       }),
     [files, statusFilter, diffFilter, verifyFilter, diffByPath]
@@ -535,7 +536,7 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
           可信度
         </div>
         <div className="chips">
-          {(['all', 'hash', 'size', 'unknown'] as VerifyFilter[]).map((k) => (
+          {(['all', 'hash', 'reconciled', 'size', 'unknown'] as VerifyFilter[]).map((k) => (
             <button
               key={k}
               className={`chip${verifyFilter === k ? ' active' : ''}`}
@@ -547,7 +548,7 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
           ))}
         </div>
         <span className="tb-hint">
-          「仅大小」只比了名称与大小；「未校验」是本地没动过、沿用上次结论——两类都没读过远端内容
+          「仅大小」能确认远端有这份文件、大小也对，但没读过内容；「未校验」连远端都没核对过（对账跑一趟即可升级）
         </span>
       </div>
 
@@ -777,11 +778,7 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
                       {f.verifyLevel ? (
                         <span
                           className={`pill ${verifyTone(f.verifyLevel)}`}
-                          title={
-                            f.verifyLevel === 'size'
-                              ? '仅凭「文件名 + 大小」认定远端已有，内容未校验。可用深度校验确认。'
-                              : '内容已通过哈希比对确认。'
-                          }
+                          title={VERIFY_HINTS[f.verifyLevel]}
                         >
                           {VERIFY_LABELS[f.verifyLevel]}
                         </span>
@@ -796,7 +793,7 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
                          */
                         <span
                           className="pill gray"
-                          title="没核对过远端：本地大小与修改时间和上次成功同步时一致，直接沿用了上次的结论。需要确认时用「深度校验」。"
+                          title={VERIFY_HINTS_UNKNOWN}
                         >
                           未校验
                         </span>
@@ -1018,6 +1015,7 @@ const DIFF_KIND_LABELS: Record<DiffKind, string> = {
 const VERIFY_FILTER_LABELS: Record<VerifyFilter, string> = {
   all: '不限',
   hash: '哈希确认',
+  reconciled: '已核对',
   size: '仅大小',
   unknown: '未校验'
 }
@@ -1025,8 +1023,9 @@ const VERIFY_FILTER_LABELS: Record<VerifyFilter, string> = {
 const VERIFY_FILTER_HINTS: Record<VerifyFilter, string> = {
   all: '不按可信度筛选',
   hash: '把远端文件拉回来重算哈希比对过，结论可靠',
-  size: '仅凭「文件名 + 大小」认领远端已有，内容没读过',
-  unknown: '本地大小/修改时间与上次成功同步时一致，直接沿用上次结论，从未核对远端'
+  reconciled: '对账时确认远端确有这份文件、大小一致，但没读内容',
+  size: '按「名称 + 大小」认领远端已有——这份从没真正上传过，远端那个可能是别的文件',
+  unknown: '还没跟远端核对过：本地没动过，直接沿用了上次同步的结论'
 }
 
 /** 差异标签另起一套配色，不与同步状态标签共用 */
@@ -1050,12 +1049,45 @@ function diffTone(kind: DiffKind): string {
  * 认领只比了名称与大小、没读内容，所以必须让用户一眼看出
  * 哪些「已同步」的结论其实是弱认定——那些文件本地那份可能根本没备份。
  */
-const VERIFY_LABELS: Record<'hash' | 'size', string> = {
+const VERIFY_LABELS: Record<'hash' | 'reconciled' | 'size', string> = {
   hash: '哈希确认',
+  reconciled: '已核对',
   size: '仅大小'
 }
-function verifyTone(level: 'hash' | 'size' | null): string {
+
+/**
+ * 可信度的展开版说明（徽章悬停 + 展开详情共用）。
+ *
+ * 三种取值回答的是「这个结论**凭什么**得出」，而不是「文件传完了没」：
+ * - 哈希确认：内容比对过，最硬
+ * - 仅大小：远端确有这份文件且大小一致——可能是对账核对出来的，
+ *   也可能是按「名称 + 大小」认领来的；内容没读过
+ * - 未校验：连远端都没核对过，只是本地没变、沿用上次的结论
+ */
+const VERIFY_HINTS: Record<'hash' | 'reconciled' | 'size', string> = {
+  hash: '哈希确认：远端文件已拉回本地重算哈希并比对通过',
+  reconciled: '已核对：对账时确认远端确有这份文件、大小一致，但内容没读过。要确认内容请用「深度校验」。',
+  size: '仅大小：按「名称 + 大小」认领远端已有，这份从没真正上传过——远端那个同名同大小的可能是另一个文件。建议深度校验。'
+}
+
+const VERIFY_HINTS_UNKNOWN =
+  '未校验：还没跟远端核对过——本地大小与修改时间没变，直接沿用了上次成功的结论。跑一次「立即对账」可升级为「仅大小」，要确认内容则用「深度校验」。'
+
+function verifyText(level: 'hash' | 'reconciled' | 'size' | null): string {
+  return level ? VERIFY_HINTS[level] : VERIFY_HINTS_UNKNOWN
+}
+/*
+ * 配色表达的是**风险**，不是等级高低：
+ * - 哈希确认：绿，内容对过
+ * - 已核对：蓝，对账确认远端在、大小对，内容没读
+ * - 仅大小：黄，认领来的，远端那份可能是别的文件
+ * - 未校验：灰，还没跟远端核对过
+ *
+ * 「已核对」不能沿用黄色：对账跑一趟全变黄，会被当成满屏告警。
+ */
+function verifyTone(level: 'hash' | 'reconciled' | 'size' | null): string {
   if (level === 'hash') return 'green'
+  if (level === 'reconciled') return 'blue'
   if (level === 'size') return 'amber'
   return 'gray'
 }

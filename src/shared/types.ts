@@ -62,12 +62,18 @@ export interface ScanRecord {
 // ── 文件条目（files 表）───────────────────────────────
 
 /**
- * 同步结论的可信级别。
+ * 同步结论的可信级别——回答「凭什么说这份文件在远端是好的」。
  *
- * `hash` = 内容经哈希确认；`size` = 仅凭同名同大小弱认定；
- * `null` = 未标记。
+ * - `hash`：把远端那份拉回来重算哈希，内容比对通过（最硬）
+ * - `reconciled`：对账时确认远端确有这份文件、大小与记录一致，但没读内容
+ * - `size`：按「名称 + 大小」认领远端已有——**我们从没真正上传过这份**，
+ *   远端那个同名同大小的可能是另一个文件（弱认定，界面用黄色提醒）
+ * - `null`：还没跟远端核对过，只是本地没变、沿用了上次的结论
+ *
+ * `reconciled` 与 `size` 都只保证「大小一致」，但风险不同：
+ * 前者是我们传过、这轮确认还在；后者是根本没传过。
  */
-export type VerifyLevel = 'hash' | 'size' | null
+export type VerifyLevel = 'hash' | 'reconciled' | 'size' | null
 
 export interface FileEntry {
   id: number
