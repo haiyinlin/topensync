@@ -7,6 +7,7 @@ import { Queue } from './pages/Queue'
 import { ManifestPage } from './pages/Manifest'
 import { Reconcile } from './pages/Reconcile'
 import { Logs } from './pages/Logs'
+import { History } from './pages/History'
 import { Connection } from './pages/Connection'
 import { TransferRules } from './pages/TransferRules'
 import { ReconcileRules } from './pages/ReconcileRules'
@@ -31,6 +32,7 @@ export type PageKey =
   | 'queue'
   | 'manifest'
   | 'reconcile'
+  | 'history'
   | 'logs'
   | 'connection'
   | 'transfer'
@@ -43,6 +45,7 @@ const PAGES: PageKey[] = [
   'queue',
   'manifest',
   'reconcile',
+  'history',
   'logs',
   'connection',
   'transfer',
@@ -105,6 +108,7 @@ export function App(): React.JSX.Element {
           {page === 'queue' && <Queue />}
           {page === 'manifest' && <ManifestPage onNavigate={navigate} />}
           {page === 'reconcile' && <Reconcile />}
+          {page === 'history' && <History />}
           {page === 'logs' && <Logs />}
           {page === 'connection' && <Connection />}
           {page === 'transfer' && <TransferRules />}

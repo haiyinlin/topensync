@@ -124,6 +124,37 @@ describe('Planner', () => {
     expect(planner.getTasks().filter((t) => t.state === 'skipped')).toHaveLength(0)
   })
 
+  it('收到删除事件但本地文件仍在时，不改状态、也不删远端', async () => {
+    /*
+     * 回归：网络盘抖动时 watcher 会误报整棵树消失。
+     * 实测事故：SMB 服务端重启，两秒内 24,415 个还在本地盘上的文件
+     * 被标成「已删除」，其中 927 个的远端文件被真的移进了回收站。
+     *
+     * 现在删除前会自己 stat 一次：文件还在就不动。
+     */
+    const p = join(syncRoot, 'ghost.txt')
+    writeFileSync(p, 'still here')
+    const st = statSync(p)
+    manifest.upsertFile({
+      localPath: 'ghost.txt',
+      localSize: st.size,
+      mtimeMs: st.mtimeMs,
+      remotePath: '/quark-backup/ghost.txt',
+      state: 'synced'
+    })
+    manifest.setState('ghost.txt', 'synced', {
+      remoteSize: st.size,
+      syncedSize: st.size,
+      syncedMtimeMs: Math.floor(st.mtimeMs)
+    })
+
+    // exists=false：假装 watcher 说「文件没了」，但磁盘上它好好的
+    await planner.handleEvent('ghost.txt', false)
+    await settle(600)
+
+    expect(manifest.getFile('ghost.txt')?.state).toBe('synced')
+  })
+
   it('文件从未同步过时会上传', async () => {
     const p = join(syncRoot, 'b.txt')
     writeFileSync(p, 'world')

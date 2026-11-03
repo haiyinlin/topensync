@@ -35,6 +35,8 @@ import type {
   ScanProgress,
   ScanRecord,
   ScanStatus,
+  SyncHistoryEntry,
+  SyncHistoryKind,
   TaskBatch,
   TransferSpeed,
   TransferTask
@@ -261,6 +263,8 @@ export class Engine {
    */
   private readonly pendingDiffs: DiffEntry[] = []
   private diffFlushTimer: NodeJS.Timeout | null = null
+  /** 内存自检定时器（每 60 秒打一条 heap 日志，定位内存膨胀用） */
+  private memoryWatchTimer: NodeJS.Timeout | null = null
   /**
    * 本地首轮扫描完成的通知口。
    *
@@ -344,6 +348,24 @@ export class Engine {
     this.restoreScanHistory()
 
     /*
+     * 内存自检：每 60 秒记一条 system 日志，输出 V8 堆与堆外内存。
+     *
+     * 定位内存膨胀靠它：heapUsed 大 = 对象/字符串泄漏；
+     * external / arrayBuffers 大 = HTTP(Buffer) 或流泄漏。
+     * 只在「进行中」时打，空闲时不需要（进程空闲内存本来就该低）。
+     */
+    this.memoryWatchTimer = setInterval(() => {
+      const m = process.memoryUsage()
+      this.pushLog(
+        'info',
+        `内存 heap=${mb(m.heapUsed)}/${mb(m.heapTotal)}MB ` +
+          `rss=${mb(m.rss)}MB ext=${mb(m.external)}MB ab=${mb(m.arrayBuffers)}MB ` +
+          `tasks=${this.planner?.getTasks().length ?? 0}`
+      )
+    }, 60_000)
+    this.memoryWatchTimer.unref?.()
+
+    /*
      * 裁剪历史日志。
      *
      * 每次扫描每个文件写一条，六万个文件就是六万行。不裁剪的话
@@ -385,6 +407,55 @@ export class Engine {
     }
 
     this.pushLog('info', '已就绪，点击「开始同步」后开始扫描与上传', { category: 'system' })
+
+    /*
+     * 假删除自检：纯 SQL 按秒桶纠正，毫秒级，可以同步跑完再返回。
+     */
+    try {
+      this.repairFalseDeletions()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.pushLog('warn', `「已删除」记录自检失败：${message}`, { category: 'system' })
+    }
+  }
+
+  /**
+   * 启动自检：识别并修复「假删除」。
+   *
+   * 事故背景：同步根是 SMB 网络盘，服务端重启时 watcher 会一次性
+   * 吐出整棵树的 unlink 事件。0.3.x 之前直接采信这些事件，
+   * 24,415 个还在本地盘上的文件被写成「已删除」（挤在 22:50:58 与
+   * 22:50:59 两秒里），其中 927 个的远端文件被真的移进了回收站。
+   *
+   * 根因已在 `Planner.confirmRemoval()` 修掉（删除前先 stat 确认）；
+   * 这里负责把**已经写坏的数据**捞回来。
+   *
+   * 判据是「同一秒内被标删除的条数」：真人删两万个文件要几分钟，
+   * 不可能压进一秒；一秒上千条基本都是盘抖动的产物。
+   *
+   * 不用逐条 stat —— 网络盘上每个路径解析要一秒多，两万条要跑十几个
+   * 小时（实测 120 秒只修了 72 条）。按秒桶整批改，是 O(1) 次 SQL。
+   */
+  private repairFalseDeletions(): void {
+    const bursts = this.manifest.findBulkDeletionBursts()
+    if (bursts.length === 0) return
+
+    let restored = 0
+    const detail: string[] = []
+    for (const b of bursts) {
+      const n = this.manifest.restoreDeletionSecond(b.second)
+      restored += n
+      const at = new Date(b.second * 1000).toLocaleString('zh-CN')
+      detail.push(`${at} 的 ${n} 条`)
+    }
+
+    this.pushLog(
+      'warn',
+      `自检：发现 ${bursts.length} 批「同一秒内被批量标记为已删除」的记录（${detail.join('、')}）——` +
+        '这是网络盘抖动导致 watcher 误报文件消失，本地文件其实还在，已整批恢复为「已同步」。' +
+        '此前被误删的远端文件会在下次对账时按「远端缺失」重新上传。',
+      { category: 'system' }
+    )
   }
 
   /**
@@ -593,6 +664,10 @@ export class Engine {
     // 差异也是：这一批往往是「对账刚发现的」，丢了界面上就少几条
     this.flushDiffs()
     for (const kind of [...this.progressTimers.keys()]) this.clearProgressTimer(kind)
+    if (this.memoryWatchTimer) {
+      clearInterval(this.memoryWatchTimer)
+      this.memoryWatchTimer = null
+    }
 
     this.watcher?.stop()
     this.watcher = null
@@ -1929,6 +2004,21 @@ export class Engine {
     return this.manifest.recentLogs(limit)
   }
 
+  /**
+   * 分页列出同步历史（上传 / 下载 / 有结论的跳过）。
+   *
+   * 这是「文件到底传没传、往哪边传」的权威追溯出口，
+   * 永久落库、不受日志清理影响。
+   */
+  listHistory(opts: { kind?: SyncHistoryKind; limit?: number; offset?: number } = {}): SyncHistoryEntry[] {
+    return this.manifest.listHistory(opts)
+  }
+
+  /** 同步历史总条数（分页与「共 N 条」提示用） */
+  countHistory(kind?: SyncHistoryKind): number {
+    return this.manifest.countHistory(kind)
+  }
+
   /** 清空运行日志（只清日志表，不动同步状态） */
   clearLogs(): number {
     const n = this.manifest.clearLogs()
@@ -2384,4 +2474,9 @@ function describeInaccessibleRoot(root: string): string {
     return `${driveRoot[1].toUpperCase()}: 盘当前不可用（未映射、未插入或无访问权限）`
   }
   return `目录不存在或不可访问：${root}`
+}
+
+/** 字节 → MB（保留 0 位小数），内存自检日志用 */
+function mb(bytes: number): string {
+  return (bytes / 1024 / 1024).toFixed(0)
 }

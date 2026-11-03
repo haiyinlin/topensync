@@ -198,11 +198,14 @@ export function TopBar(): React.JSX.Element {
          * 只会让人以为是坏掉的控件。
          */}
         {speed && speed.totalBytes > 0 && (
-          <span className="speed-pill" title={`本次运行已传输 ${formatSize(speed.totalBytes)}`}>
+          <span
+            className="speed-pill"
+            title={`本次运行：当前 ${formatSpeed(speed.current)}，平均 ${formatSpeed(speed.avg)}，累计 ${formatSize(speed.totalBytes)}`}
+          >
             <Icon name="gauge" className="ic" />
             <b className="mono">{formatSpeed(speed.current)}</b>
             <span className="dim mono">
-              峰值 {formatSpeed(speed.max)} · 平均 {formatSpeed(speed.avg)}
+              已传 {formatSize(speed.totalBytes)} · 峰值 {formatSpeed(speed.max)}
             </span>
           </span>
         )}

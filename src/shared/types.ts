@@ -207,6 +207,15 @@ export interface TransferTask {
   speed: number
   md5Prefix: string
   sha1Prefix: string
+  /**
+   * 完整哈希（哈希阶段之后才有，之前是 null）。
+   *
+   * 列表里只显示前 8 位——够用来肉眼区分不同文件；
+   * 但要核对「传上去的到底是不是这份」，就得看全 32/40 位，
+   * 所以完整值一并带上，展开详情时显示。
+   */
+  md5: string | null
+  sha1: string | null
   errorMsg: string | null
   attempts: number
   /**
@@ -592,10 +601,11 @@ export interface AppStats {
    *
    * 六万个文件全被跳过时，任务表里堆六万条「本地未变」毫无意义——
    * 既占内存，也让所有遍历操作变慢。所以任务表有上限，
-   * 超出后按「跳过 → 完成」的优先级淘汰最旧的。
+   * 超出后按「取消 → 跳过 → 完成」的优先级淘汰最旧的。
    *
    * 但**必须让用户知道**：表格里看不到某条记录，
-   * 可能是它被淘汰了，而不是它没发生过。
+   * 可能是它被淘汰了，而不是它没发生过。永久明细见「同步历史」页
+   * （sync_history 持久化表，被淘汰的 done/skipped 都已写入）。
    */
   tasksTruncated: boolean
   /**
@@ -762,6 +772,49 @@ export interface StorageInfo {
   cacheDirs: StorageDirInfo[]
   /** 诊断包目录大小，字节 */
   diagnosticsBytes: number
+}
+
+// ── 同步历史────────────────────────────────────────
+
+/**
+ * 同步历史条目的方向。
+ *
+ * 与 TransferCategory 对应，但**不含**「跳过里的本地未变」这一种——
+ * 那条是每轮扫描的常态（六万个文件每轮都命中），记进历史会无限膨胀。
+ * 历史只记「真正发生了动作或得出了结论」的：
+ * 上传成功、下载成功、以及有明确原因的跳过。
+ */
+export type SyncHistoryKind = 'upload' | 'download' | 'skip'
+
+/**
+ * 一条持久化的同步历史。
+ *
+ * 与内存任务表（TransferTask）不同：任务表随进程退出而消失、且现在
+ * 取消淘汰后也只是「本次会话」的快照；而这张表**永久落库**，
+ * 是「某个文件到底传没传、往哪边传、什么时候传的」的权威追溯出口。
+ *
+ * 日志页受条数上限约束（prune 到 10 万条、渲染层只留 500），
+ * 文件清单页只标状态不标方向——两者都无法回答「这个文件上次是
+ * 上传还是下载」。这张表补上这个缺口。
+ */
+export interface SyncHistoryEntry {
+  /** 记录 id（自增） */
+  id: number
+  /** 方向：上传 / 下载 / 跳过 */
+  kind: SyncHistoryKind
+  /** 本地相对路径（相对同步根） */
+  localPath: string
+  /** 远端路径（跳过类可为 null） */
+  remotePath: string | null
+  /** 文件大小（字节） */
+  size: number
+  /**
+   * 跳过原因；仅 kind === 'skip' 时有值。
+   * 不含 local_duplicate（本地未变不记历史）。
+   */
+  skipReason: SkipReason | null
+  /** 动作发生的时间戳 */
+  at: number
 }
 
 /** 清除缓存的结果 */

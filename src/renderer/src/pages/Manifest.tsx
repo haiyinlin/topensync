@@ -1,10 +1,19 @@
 import * as React from 'react'
-import { useMemo, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { Icon } from '../components/Icon'
 import { BatchBar } from '../components/BatchBar'
-import { VirtualTable } from '../components/VirtualTable'
+import { ROW_HEIGHT, VirtualTable } from '../components/VirtualTable'
+import {
+  Cell2,
+  DetailRow,
+  ExpandToggle,
+  FileCell,
+  RowDetail,
+  detailHeight,
+  splitPath
+} from '../components/RowParts'
 import type { PageKey } from '../App'
-import type { DeepVerifyResult, DiffKind, DiffResolution } from '@shared/types'
+import type { DeepVerifyResult, DiffEntry, DiffKind, DiffResolution, FileEntry } from '@shared/types'
 import { formatSize } from '../format'
 import { useAppStore } from '../store'
 
@@ -23,7 +32,7 @@ import { useAppStore } from '../store'
  * 删除语义：**删本地文件**，远端按删除策略跟进（回收站 / 直接删 / 不动）。
  * 这跟「在资源管理器里删文件」是同一条路径——所以下一轮扫描不会把它当新文件重传。
  */
-type StatusFilter = 'all' | 'synced' | 'pending' | 'deleted'
+type StatusFilter = 'all' | 'synced' | 'pending' | 'error'
 type DiffFilter = DiffKind | 'all' | 'none'
 type VerifyFilter = 'all' | 'hash' | 'size' | 'unknown'
 
@@ -52,21 +61,73 @@ function splitRemote(remoteRoot: string, remotePath: string): { root: string; re
   return { root: '', rel: norm }
 }
 
-/** 远端路径单元格：灰色根前缀 + 亮色相对路径，title 给完整绝对路径 */
-function RemotePath({
-  remoteRoot,
-  remotePath
-}: {
-  remoteRoot: string
-  remotePath: string
-}): React.JSX.Element {
-  const { root, rel } = splitRemote(remoteRoot, remotePath)
-  return (
-    <span className="path-split" title={remotePath}>
-      {root && <span className="path-root">{root}</span>}
-      <span className="path-rel">{rel}</span>
-    </span>
-  )
+/**
+ * 本地文件行的展开详情。
+ *
+ * 表格里只放「扫一眼就要判断」的列；这里放需要**核对**的东西：
+ * 完整路径（含远端实际落点）与完整双哈希。
+ * 以前哈希列只截到 8 位，想比对得自己去数据库里翻——那等于没有。
+ */
+function localDetail(f: FileEntry, remoteRoot: string): DetailRow[] {
+  const rows: DetailRow[] = [
+    {
+      items: [
+        { k: '本地路径', v: f.localPath || '—', mono: true, title: f.localPath },
+        {
+          k: '远端路径',
+          v: f.remotePath ?? '—',
+          mono: true,
+          title: f.remotePath ?? undefined
+        }
+      ]
+    },
+    {
+      items: [
+        { k: 'MD5', v: f.md5 ?? '—', mono: true, title: f.md5 ?? undefined },
+        { k: 'SHA1', v: f.sha1 ?? '—', mono: true, title: f.sha1 ?? undefined }
+      ]
+    },
+    {
+      items: [
+        { k: '修改时间', v: formatTime(f.mtimeMs), mono: true },
+        {
+          k: '远端大小',
+          v: f.remoteSize !== null ? formatSize(f.remoteSize) : '—',
+          mono: true
+        }
+      ]
+    }
+  ]
+  if (f.remotePath) {
+    const { root, rel } = splitRemote(remoteRoot, f.remotePath)
+    if (rel.replace(/^\//, '') !== f.localPath) {
+      rows.push({
+        items: [
+          { k: '远端根', v: root || '/', mono: true },
+          { k: '远端相对路径', v: rel, mono: true, title: rel }
+        ]
+      })
+    }
+  }
+  return rows
+}
+
+/** 远端独有文件行的展开详情 */
+function remoteDetail(d: DiffEntry): DetailRow[] {
+  return [
+    {
+      items: [
+        { k: '远端路径', v: d.remotePath, mono: true, title: d.remotePath },
+        { k: '本地路径', v: d.localPath ?? '—（本地没有这个文件）', mono: true }
+      ]
+    },
+    {
+      items: [
+        { k: '远端大小', v: d.remoteSize !== null ? formatSize(d.remoteSize) : '—', mono: true },
+        { k: '本地大小', v: d.localSize !== null ? formatSize(d.localSize) : '—', mono: true }
+      ]
+    }
+  ]
 }
 
 export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void }): React.JSX.Element {
@@ -254,6 +315,60 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
     return out
   }, [selected, visibleIds])
 
+  /* ── 展开详情 ──────────────────────────────────────────
+   *
+   * 表格里只留最关键的几列（文件名、大小、状态、差异），
+   * 完整路径、双哈希这些「要核对时才看」的信息放进展开区。
+   * 否则哈希列永远只有 8 位、远端路径永远只剩开头——想问什么都要悬停。
+   */
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const toggleExpand = (id: string): void => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  /* id → 行数据的索引：展开高度要按 id 反查（行号会随筛选变化） */
+  const localById = useMemo(() => {
+    const m = new Map<string, FileEntry>()
+    for (const f of shown) m.set(`${LOCAL_ID_PREFIX}${f.localPath}`, f)
+    return m
+  }, [shown])
+
+  const remoteById = useMemo(() => {
+    const m = new Map<string, DiffEntry>()
+    for (const d of remoteOnly) m.set(`${REMOTE_ID_PREFIX}${d.remotePath}`, d)
+    return m
+  }, [remoteOnly])
+
+  /* 只对展开中的那几行算高度，rowHeight 里 O(1) 查表 */
+  const expandedHeights = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const id of expanded) {
+      const lf = localById.get(id)
+      if (lf) {
+        m.set(id, ROW_HEIGHT + detailHeight(localDetail(lf, remoteRoot)))
+        continue
+      }
+      const rd = remoteById.get(id)
+      if (rd) m.set(id, ROW_HEIGHT + detailHeight(remoteDetail(rd)))
+    }
+    return m
+  }, [expanded, localById, remoteById, remoteRoot])
+
+  const localRowHeight = useCallback(
+    (i: number) => expandedHeights.get(`${LOCAL_ID_PREFIX}${shown[i].localPath}`) ?? ROW_HEIGHT,
+    [expandedHeights, shown]
+  )
+
+  const remoteRowHeight = useCallback(
+    (i: number) => expandedHeights.get(`${REMOTE_ID_PREFIX}${remoteOnly[i].remotePath}`) ?? ROW_HEIGHT,
+    [expandedHeights, remoteOnly]
+  )
+
   /*
    * 全选/半选状态。
    *
@@ -341,7 +456,7 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
           <input placeholder="按路径、文件名或哈希搜索" />
         </div>
         <div className="chips">
-          {(['all', 'synced', 'pending', 'deleted'] as StatusFilter[]).map((k) => (
+          {(['all', 'synced', 'pending', 'error'] as StatusFilter[]).map((k) => (
             <button
               key={k}
               className={`chip${statusFilter === k ? ' active' : ''}`}
@@ -441,7 +556,7 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
           <VirtualTable
             head={
               <tr>
-                <th style={{ width: '4%' }}>
+                <th style={{ width: 38 }}>
                   <label className="batch-check" title="全选 / 全不选远端独有文件">
                     <input
                       type="checkbox"
@@ -453,64 +568,81 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
                     />
                   </label>
                 </th>
-                <th style={{ width: '46%' }}>远端文件（相对远端根）</th>
-                <th style={{ width: '12%' }}>大小</th>
-                <th style={{ width: '14%' }}>发现时间</th>
-                <th style={{ width: '24%' }}>操作</th>
+                <th style={{ width: 30 }} />
+                <th>远端文件（相对远端根）</th>
+                <th style={{ width: 96 }}>大小</th>
+                <th style={{ width: 100 }}>发现时间</th>
+                <th style={{ width: 186 }}>操作</th>
               </tr>
             }
             rowCount={remoteOnly.length}
+            rowHeight={remoteRowHeight}
             renderRow={(index) => {
               const d = remoteOnly[index]
               if (!d) return null
+              const rid = `${REMOTE_ID_PREFIX}${d.remotePath}`
+              const open = expanded.has(rid)
+              const { name, dir } = splitPath(splitRemote(remoteRoot, d.remotePath).rel)
               return (
-                <tr key={d.id}>
-                  <td>
-                    <label className="batch-check">
-                      <input
-                        type="checkbox"
-                        checked={selected.has(`${REMOTE_ID_PREFIX}${d.remotePath}`)}
-                        onChange={() => {
-                          const next = new Set(selected)
-                          const id = `${REMOTE_ID_PREFIX}${d.remotePath}`
-                          if (next.has(id)) next.delete(id)
-                          else next.add(id)
-                          setSelected(next)
-                        }}
+                <React.Fragment key={d.id}>
+                  <tr className={`row-main${open ? ' expanded' : ''}`}>
+                    <td>
+                      <label className="batch-check">
+                        <input
+                          type="checkbox"
+                          checked={selected.has(rid)}
+                          onChange={() => {
+                            const next = new Set(selected)
+                            if (next.has(rid)) next.delete(rid)
+                            else next.add(rid)
+                            setSelected(next)
+                          }}
+                        />
+                      </label>
+                    </td>
+                    <td>
+                      <ExpandToggle open={open} onToggle={() => toggleExpand(rid)} />
+                    </td>
+                    <td>
+                      <FileCell
+                        icon="cloud-check"
+                        name={name}
+                        meta={dir || undefined}
+                        title={d.remotePath}
                       />
-                    </label>
-                  </td>
-                  <td>
-                    <div className="cell-file">
-                      <Icon name="cloud-check" className="ic file" />
-                      <RemotePath remoteRoot={remoteRoot} remotePath={d.remotePath} />
-                    </div>
-                  </td>
-                  <td className="mono dim">
-                    {d.remoteSize !== null ? formatSize(d.remoteSize) : '—'}
-                  </td>
-                  <td className="mono dim nw">{formatTime(d.detectedAt)}</td>
-                  <td>
-                    <div className="act-row">
-                      <button
-                        className="btn tiny primary"
-                        onClick={() => resolveRemoteDiff(d.id, 'pulled')}
-                      >
-                        <Icon name="down" />
-                        下载到本地
-                      </button>
-                      <button
-                        className="btn tiny ghost"
-                        onClick={() => resolveRemoteDiff(d.id, 'ignored')}
-                      >
-                        忽略
-                      </button>
-                    </div>
-                  </td>
-                </tr>
+                    </td>
+                    <td className="mono dim">
+                      {d.remoteSize !== null ? formatSize(d.remoteSize) : '—'}
+                    </td>
+                    <td>
+                      <Cell2
+                        line1={dateOnly(d.detectedAt)}
+                        line2={<span className="mono">{timeOnly(d.detectedAt)}</span>}
+                      />
+                    </td>
+                    <td>
+                      <div className="act-row">
+                        <button
+                          className="btn tiny primary"
+                          onClick={() => resolveRemoteDiff(d.id, 'pulled')}
+                        >
+                          <Icon name="down" />
+                          下载
+                        </button>
+                        <button
+                          className="btn tiny ghost"
+                          onClick={() => resolveRemoteDiff(d.id, 'ignored')}
+                        >
+                          忽略
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                  {open && <RowDetail rows={remoteDetail(d)} colSpan={6} />}
+                </React.Fragment>
               )
             }}
-            maxHeight={280}
+            maxHeight={300}
           />
         </div>
       )}
@@ -538,13 +670,13 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
             {truncated
               ? `当前显示 ${shown.length} 条（已加载 ${files.length} 条，还有更多）`
               : `同步目录内受管的文件，共 ${shown.length} 个`}
-            {' —— '}路径均相对本地同步目录
+            {' —— '}路径均相对本地同步目录，已删除的文件不再列出
           </span>
         </div>
         <VirtualTable
           head={
             <tr>
-              <th style={{ width: '4%' }}>
+              <th style={{ width: 38 }}>
                 <label className="batch-check" title="全选 / 全不选当前筛选出的本地文件">
                     <input
                       type="checkbox"
@@ -556,120 +688,130 @@ export function ManifestPage({ onNavigate }: { onNavigate: (k: PageKey) => void 
                     />
                   </label>
                 </th>
-                <th style={{ width: '22%' }}>本地文件</th>
-                <th style={{ width: '8%' }}>大小</th>
-                <th style={{ width: '11%' }}>修改时间</th>
-                <th style={{ width: '19%' }} title="相对远端根目录的路径；与本地路径不同时会高亮">
-                  远端位置
-                </th>
-                <th style={{ width: '10%' }}>哈希 (md5:sha1)</th>
-                <th style={{ width: '9%' }}>同步状态</th>
-                <th style={{ width: '8%' }}>可信度</th>
-                <th style={{ width: '9%' }}>对账差异</th>
-                <th style={{ width: '4%' }}>操作</th>
+                <th style={{ width: 30 }} />
+                <th>本地文件</th>
+                <th style={{ width: 96 }}>大小</th>
+                <th style={{ width: 88 }}>同步状态</th>
+                <th style={{ width: 88 }}>可信度</th>
+                <th style={{ width: 96 }}>对账差异</th>
+                <th style={{ width: 100 }}>修改时间</th>
+                <th style={{ width: 64 }} />
               </tr>
             }
             rowCount={shown.length}
+            rowHeight={localRowHeight}
             renderRow={(index) => {
               const f = shown[index]
               if (!f) return null
+              const lid = `${LOCAL_ID_PREFIX}${f.localPath}`
+              const open = expanded.has(lid)
+              const { name, dir } = splitPath(f.localPath)
+              /*
+               * 远端保存位置与本地路径不一致时才提醒。
+               *
+               * 以前远端路径独占一列，几百行全都和本地一样——那列的
+               * 唯一作用就是让人反复确认「哦，还是一样」。改成默认不占位，
+               * 只在真的不一样时给一个琥珀色标记，完整路径去展开区看。
+               */
+              const remoteRel = f.remotePath ? splitRemote(remoteRoot, f.remotePath).rel : null
+              const pathDiffers = remoteRel !== null && remoteRel.replace(/^\//, '') !== f.localPath
               return (
-                <tr key={f.id}>
-                  <td>
-                    <label className="batch-check">
-                      <input
-                        type="checkbox"
-                        checked={selected.has(`${LOCAL_ID_PREFIX}${f.localPath}`)}
-                        onChange={() => {
+                <React.Fragment key={f.id}>
+                  <tr className={`row-main${open ? ' expanded' : ''}`}>
+                    <td>
+                      <label className="batch-check">
+                        <input
+                          type="checkbox"
+                          checked={selected.has(lid)}
+                          onChange={() => {
+                            const next = new Set(selected)
+                            if (next.has(lid)) next.delete(lid)
+                            else next.add(lid)
+                            setSelected(next)
+                          }}
+                        />
+                      </label>
+                    </td>
+                    <td>
+                      <ExpandToggle open={open} onToggle={() => toggleExpand(lid)} />
+                    </td>
+                    <td>
+                      <FileCell
+                        name={name}
+                        meta={dir || undefined}
+                        title={f.localPath}
+                        badge={
+                          pathDiffers ? (
+                            <span className="mini-flag" title={`远端位置不同：${f.remotePath}`}>
+                              远端另存
+                            </span>
+                          ) : null
+                        }
+                      />
+                    </td>
+                    <td className="mono dim">
+                      {f.localSize > 0 ? formatSize(f.localSize) : '待探测'}
+                    </td>
+                    <td>
+                      <span className={`pill ${stateTone(f.state)}`}>{STATE_LABELS[f.state] ?? f.state}</span>
+                    </td>
+                    <td>
+                      {f.verifyLevel ? (
+                        <span
+                          className={`pill ${verifyTone(f.verifyLevel)}`}
+                          title={
+                            f.verifyLevel === 'size'
+                              ? '仅凭「文件名 + 大小」认定远端已有，内容未校验。可用深度校验确认。'
+                              : '内容已通过哈希比对确认。'
+                          }
+                        >
+                          {VERIFY_LABELS[f.verifyLevel]}
+                        </span>
+                      ) : (
+                        <span className="pill gray">—</span>
+                      )}
+                    </td>
+                    <td>
+                      {(() => {
+                        const kind = diffByPath.get(f.localPath)
+                        if (!kind) return <span className="pill gray">—</span>
+                        return (
+                          <span className={`pill ${diffTone(kind)}`}>
+                            {DIFF_KIND_LABELS[kind]}
+                          </span>
+                        )
+                      })()}
+                    </td>
+                    {/*
+                      * 时间拆两行：上行日期、下行时分。
+                      * 一行放 16 个字符需要 144px 宽，这一列只有 100px——
+                      * 之前就是在这里被截成「2019-10-02 …」，连具体时刻都看不到。
+                      */}
+                    <td>
+                      <Cell2
+                        line1={dateOnly(f.mtimeMs)}
+                        line2={<span className="mono">{timeOnly(f.mtimeMs)}</span>}
+                      />
+                    </td>
+                    <td>
+                      <button
+                        className="btn tiny ghost"
+                        title="删除本地文件"
+                        onClick={() => {
                           const next = new Set(selected)
-                          const id = `${LOCAL_ID_PREFIX}${f.localPath}`
-                          if (next.has(id)) next.delete(id)
-                          else next.add(id)
+                          next.add(lid)
                           setSelected(next)
                         }}
-                      />
-                    </label>
-                  </td>
-                  <td>
-                    <div className="cell-file">
-                      <Icon name="files" className="ic file" />
-                      <span title={f.localPath}>{f.localPath}</span>
-                    </div>
-                  </td>
-                  <td className="mono dim">{formatSize(f.localSize)}</td>
-                  <td className="mono dim nw">{formatTime(f.mtimeMs)}</td>
-                  <td className="mono">
-                    {f.remotePath ? (
-                      <div className="cell-file">
-                        <Icon name="cloud-check" className="ic file" />
-                        {(() => {
-                          const rel = splitRemote(remoteRoot, f.remotePath).rel
-                          // 远端位置与本地路径一致时压暗：
-                          // 这一列真正要回答的是「远端放的位置跟本地一样吗」，
-                          // 几百行都一样的路径刷成亮色只会变成冗余列。
-                          const same = rel.replace(/^\//, '') === f.localPath
-                          return (
-                            <span className="path-split" title={f.remotePath}>
-                              <span className="path-root">{splitRemote(remoteRoot, f.remotePath).root}</span>
-                              <span className={same ? 'path-rel same' : 'path-rel'}>{rel}</span>
-                            </span>
-                          )
-                        })()}
-                      </div>
-                    ) : (
-                      <span className="dim">—</span>
-                    )}
-                  </td>
-                  <td className="mono dim" title={f.md5 && f.sha1 ? `${f.md5}\n${f.sha1}` : undefined}>
-                    {f.md5 ? `${f.md5.slice(0, 8)}:${f.sha1?.slice(0, 4) ?? ''}…` : '—'}
-                  </td>
-                  <td>
-                    <span className={`pill ${stateTone(f.state)}`}>{STATE_LABELS[f.state] ?? f.state}</span>
-                  </td>
-                  <td>
-                    {f.verifyLevel ? (
-                      <span
-                        className={`pill ${verifyTone(f.verifyLevel)}`}
-                        title={
-                          f.verifyLevel === 'size'
-                            ? '仅凭「文件名 + 大小」认定远端已有，内容未校验。可用深度校验确认。'
-                            : '内容已通过哈希比对确认。'
-                        }
                       >
-                        {VERIFY_LABELS[f.verifyLevel]}
-                      </span>
-                    ) : (
-                      <span className="pill gray">—</span>
-                    )}
-                  </td>
-                  <td>
-                    {(() => {
-                      const kind = diffByPath.get(f.localPath)
-                      if (!kind) return <span className="pill gray">—</span>
-                      return (
-                        <span className={`pill ${diffTone(kind)}`}>
-                          {DIFF_KIND_LABELS[kind]}
-                        </span>
-                      )
-                    })()}
-                  </td>
-                  <td>
-                    <button
-                      className="btn tiny ghost"
-                      title="删除本地文件"
-                      onClick={() => {
-                        const next = new Set(selected)
-                        next.add(`${LOCAL_ID_PREFIX}${f.localPath}`)
-                        setSelected(next)
-                      }}
-                    >
-                      <Icon name="trash" />
-                    </button>
-                  </td>
-                </tr>
+                        <Icon name="trash" />
+                      </button>
+                    </td>
+                  </tr>
+                  {open && <RowDetail rows={localDetail(f, remoteRoot)} colSpan={9} />}
+                </React.Fragment>
               )
             }}
-            maxHeight={520}
+            maxHeight={560}
             empty={
               files.length === 0
                 ? '清单为空。开始同步后这里会列出所有受管文件。'
@@ -807,7 +949,7 @@ const STATUS_LABELS: Record<StatusFilter, string> = {
   all: '全部',
   synced: '已同步',
   pending: '待处理',
-  deleted: '已删除'
+  error: '出错'
 }
 
 /**
@@ -924,4 +1066,18 @@ function formatTime(ts: number): string {
   const d = new Date(ts)
   const p = (n: number): string => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+/** 列表第一行：只有日期 */
+function dateOnly(ts: number): string {
+  const d = new Date(ts)
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+/** 列表第二行：时分 */
+function timeOnly(ts: number): string {
+  const d = new Date(ts)
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${p(d.getHours())}:${p(d.getMinutes())}`
 }

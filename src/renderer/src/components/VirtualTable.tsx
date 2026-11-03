@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 /**
  * 虚拟滚动表格。
@@ -23,13 +23,17 @@ import { useEffect, useRef, useState } from 'react'
  */
 
 /**
- * 单行高度（像素）。
+ * 基础行高（像素）：两行内容（主信息 + 次信息）。
  *
- * 必须与 CSS 里 `.vtable-tbl tr` 的高度**严格一致**——
- * 虚拟滚动的全部位置计算都建立在这个值上，
+ * 旧版是 40px 单行，列一多就必然截断——文件名、哈希、远端路径
+ * 全挤在一行里，只能看到开头几个字。改成两行之后
+ * 「一行放不下就换第二行」，主信息（文件名）几乎总能读全。
+ *
+ * 必须与 CSS 里 `tr.row-main` 的高度**严格一致**——
+ * 虚拟滚动的全部位置计算都建立在这套高度上，
  * 对不上就会出现「滚动一格跳两行」或者底部露白。
  */
-const ROW_HEIGHT = 40
+const ROW_HEIGHT = 56
 /** 可视区上下各多渲染几行，滚动时不会看到空白 */
 const OVERSCAN = 6
 
@@ -38,8 +42,21 @@ export interface VirtualTableProps {
   head: React.ReactNode
   /** 总行数 */
   rowCount: number
-  /** 取第 i 行；返回 null 表示该行不渲染（占位） */
+  /**
+   * 取第 i 行；返回 null 表示该行不渲染（占位）。
+   *
+   * 展开的行可以在同一个 React 节点里返回**两个** `<tr>`：
+   * 主行 + 详情行（用 `<React.Fragment key=…>` 包起来）。
+   * 高度由 `rowHeight` 如实提供。
+   */
   renderRow: (index: number) => React.ReactNode
+  /**
+   * 第 i 行的高度。不传则全部按 ROW_HEIGHT。
+   *
+   * **必须是稳定引用**（useCallback）——它进 useMemo 的依赖，
+   * 每次渲染都新建一个函数会让 6 万行的高度表反复重算。
+   */
+  rowHeight?: (index: number) => number
   /** 无数据时的提示 */
   empty?: React.ReactNode
   /** 表体容器的最大高度；不传则撑满父容器 */
@@ -50,6 +67,7 @@ export function VirtualTable({
   head,
   rowCount,
   renderRow,
+  rowHeight,
   empty,
   maxHeight
 }: VirtualTableProps): React.JSX.Element {
@@ -102,12 +120,50 @@ export function VirtualTable({
     return () => ro.disconnect()
   }, [])
 
-  const visibleCount = Math.ceil(viewportHeight / ROW_HEIGHT)
-  const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
-  const end = Math.min(rowCount, start + visibleCount + OVERSCAN * 2)
+  /*
+   * 行高表 + 前缀和。
+   *
+   * 固定行高时定位是「scrollTop / ROW_HEIGHT」一句话的事；
+   * 有了展开行之后每行高度不同，必须先有前缀和才能反查
+   * 「scrollTop 落在第几行」。
+   *
+   * 只在行数或行高函数变化时重算（滚动不参与），
+   * 六万行大约 1~2ms，用户感受不到。
+   */
+  const offsets = useMemo(() => {
+    // Float64Array：六万行用普通数组会产生一堆装箱的 number
+    const arr = new Float64Array(rowCount + 1)
+    let acc = 0
+    for (let i = 0; i < rowCount; i++) {
+      arr[i] = acc
+      acc += rowHeight ? rowHeight(i) : ROW_HEIGHT
+    }
+    arr[rowCount] = acc
+    return arr
+  }, [rowCount, rowHeight])
 
-  const topPad = start * ROW_HEIGHT
-  const bottomPad = (rowCount - end) * ROW_HEIGHT
+  /**
+   * 二分查找：偏移量 → 行号。
+   *
+   * 展开行让行高不再均等，「除一下」的算法会把位置算歪；
+   * 二分是对数级，六万行只要 16 步。
+   */
+  const indexAt = (offset: number): number => {
+    let lo = 0
+    let hi = rowCount
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (offsets[mid + 1] <= offset) lo = mid + 1
+      else hi = mid
+    }
+    return lo
+  }
+
+  const start = Math.max(0, indexAt(scrollTop) - OVERSCAN)
+  const end = Math.min(rowCount, indexAt(scrollTop + viewportHeight) + 1 + OVERSCAN)
+
+  const topPad = offsets[start]
+  const bottomPad = offsets[rowCount] - offsets[end]
 
   const rows: React.ReactNode[] = []
   for (let i = start; i < end; i++) {

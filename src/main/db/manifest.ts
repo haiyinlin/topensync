@@ -8,7 +8,10 @@ import type {
   DiffEntry,
   LogEntry,
   LogMeta,
-  ScanRecord
+  ScanRecord,
+  SyncHistoryEntry,
+  SyncHistoryKind,
+  SkipReason
 } from '@shared/types'
 
 /**
@@ -181,6 +184,25 @@ CREATE TABLE IF NOT EXISTS sync_log (
   local_path  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_log_ts ON sync_log(ts);
+
+-- 同步历史（持久化的「方向 + 状态」追溯）。
+--
+-- 日志页受条数上限约束、文件清单页不标方向，两者都无法回答
+-- 「这个文件上次到底是上传还是下载」。这张表永久保存每一次
+-- 真正发生的动作（上传 / 下载 / 有结论的跳过），是唯一权威的追溯出口。
+-- 「本地未变」这种每轮扫描都命中的常态**不记**，避免表无限膨胀。
+CREATE TABLE IF NOT EXISTS sync_history (
+  id          INTEGER PRIMARY KEY,
+  kind        TEXT NOT NULL,
+  local_path  TEXT NOT NULL,
+  remote_path TEXT,
+  size        INTEGER NOT NULL DEFAULT 0,
+  skip_reason TEXT,
+  at          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_history_at ON sync_history(at);
+CREATE INDEX IF NOT EXISTS idx_history_kind ON sync_history(kind);
+
 -- 注意：category 上的索引**不能**在这里建。
 -- 老库的 sync_log 表没有 category 列，而建表语句在迁移之前执行——
 -- 此时建索引会直接报 "no such column: category"，连迁移的机会都没有。
@@ -580,28 +602,58 @@ export class Manifest {
    * 全塞进 IPC 的返回值里，那会让渲染进程卡住好几秒。
    */
   listFiles(
-    opts: { state?: FileState; limit?: number; offset?: number; desc?: boolean } = {}
+    opts: {
+      state?: FileState
+      limit?: number
+      offset?: number
+      desc?: boolean
+      /** 是否把「已删除」的墓碑记录也算进来（默认不算） */
+      includeDeleted?: boolean
+    } = {}
   ): FileEntry[] {
     const limit = opts.limit ?? 500
     const offset = opts.offset ?? 0
     const order = opts.desc === false ? 'local_path ASC' : 'local_path DESC'
-    const sql = opts.state
-      ? `SELECT * FROM files WHERE state = ? ORDER BY ${order} LIMIT ? OFFSET ?`
-      : `SELECT * FROM files ORDER BY ${order} LIMIT ? OFFSET ?`
-    const rows = (
-      opts.state
-        ? this.db.prepare(sql).all(opts.state, limit, offset)
-        : this.db.prepare(sql).all(limit, offset)
-    ) as Record<string, unknown>[]
+
+    /*
+     * 墓碑记录（state='deleted'）默认不进清单。
+     *
+     * 它们是「本地删了、远端按策略处理过」的历史记录，留着是为了
+     * 防止下次扫描把同一个路径当新文件重传；但它**不是本地文件**，
+     * 放进「文件清单」既名不副实，又会挤占分页额度——实测用户
+     * 一次清理掉了 2.4 万个文件，清单前 5000 条全是「已删除」，
+     * 真正还在的文件一条都翻不到。
+     *
+     * 显式按 state='deleted' 查询时仍然可查（那是「只看已删除」的场景）。
+     */
+    const where: string[] = []
+    const args: (string | number)[] = []
+    if (opts.state) {
+      where.push('state = ?')
+      args.push(opts.state)
+    } else if (!opts.includeDeleted) {
+      where.push("state <> 'deleted'")
+    }
+
+    const sql =
+      `SELECT * FROM files` +
+      (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
+      ` ORDER BY ${order} LIMIT ? OFFSET ?`
+    const rows = this.db.prepare(sql).all(...args, limit, offset) as Record<string, unknown>[]
     return rows.map((r) => mapFileRow(r) as unknown as FileEntry)
   }
 
-  /** 文件总数（分页与「共 N 个」提示用） */
+  /**
+   * 文件总数（分页与「共 N 个」提示用）。
+   *
+   * 不传 state 时同样**不含墓碑记录**，口径与 listFiles 保持一致——
+   * 两处口径不一致会出现「共 3 万，却只能翻到 5 千条」。
+   */
   countFiles(state?: FileState): number {
     const row = (
       state
         ? this.db.prepare('SELECT COUNT(*) AS n FROM files WHERE state = ?').get(state)
-        : this.db.prepare('SELECT COUNT(*) AS n FROM files').get()
+        : this.db.prepare("SELECT COUNT(*) AS n FROM files WHERE state <> 'deleted'").get()
     ) as { n: number } | undefined
     return row?.n ?? 0
   }
@@ -871,6 +923,53 @@ export class Manifest {
          WHERE local_path = ?`
       )
       .run(newPath, newRemotePath, stats.size, stats.mtimeMs, stats.inode, Date.now(), oldPath)
+  }
+
+  /**
+   * 找出「同一秒内被标删除」的大批次。
+   *
+   * 用于识别网络盘抖动造成的**假删除**：盘瞬断时 watcher 会一口气
+   * 吐出上万条 unlink，这些记录的 `deleted_at` 会挤在**同一两秒**里。
+   * 实测事故：22:50:58 有 13,629 条、22:50:59 有 10,786 条，
+   * 而正常的零星删除（用户真删了几个文件）一秒内最多几十条。
+   *
+   * 真人手动删两万个文件要几分钟，不可能压缩到一秒——所以
+   * 「一秒内超过 minPerSecond 条」基本可以直接判定为假删除。
+   */
+  findBulkDeletionBursts(minPerSecond = 100): { second: number; count: number }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT CAST(deleted_at / 1000 AS INTEGER) AS sec, COUNT(*) AS n
+           FROM files
+          WHERE state = 'deleted' AND deleted_at IS NOT NULL
+          GROUP BY sec
+         HAVING n >= ?
+          ORDER BY n DESC`
+      )
+      .all(minPerSecond) as { sec: number; n: number }[]
+    return rows.map((r) => ({ second: r.sec, count: r.n }))
+  }
+
+  /**
+   * 把某一秒里被标删除的记录整批恢复为「已同步」。
+   *
+   * 只动 state 与 deleted_at，**绝不碰 synced_size/synced_mtime_ms**：
+   * 那是 L1 去重基准，恢复后下一轮扫描直接命中「本地未变」，
+   * 不会把几万个文件重新上传一遍。
+   */
+  restoreDeletionSecond(second: number): number {
+    let changed = 0
+    this.write((db) => {
+      const info = db
+        .prepare(
+          `UPDATE files
+              SET state = 'synced', deleted_at = NULL, error_msg = NULL
+            WHERE state = 'deleted' AND CAST(deleted_at / 1000 AS INTEGER) = ?`
+        )
+        .run(second)
+      changed = Number(info.changes)
+    })
+    return changed
   }
 
   /** 更新记录的 inode（文件被替换后 inode 会变） */
@@ -1361,6 +1460,76 @@ export class Manifest {
     const n = this.db.prepare('SELECT COUNT(*) AS n FROM sync_log').get() as { n: number }
     this.write((db) => db.prepare('DELETE FROM sync_log').run())
     return n.n
+  }
+
+  // ── 同步历史 ────────────────────────────────────────
+
+  /**
+   * 记录一条同步历史（上传 / 下载 / 有结论的跳过）。
+   *
+   * 与日志表分开：日志会定期清理（prune 到 10 万条）且渲染层只留 500，
+   * 而这张表**永久保存**，是「某个文件到底传没传、往哪边传」的权威追溯。
+   *
+   * ⚠️ 「本地未变」不记：那是每轮扫描都命中的常态，六万个文件每轮
+   * 都写一条会让表无限膨胀，且它本来就不在任务表里留痕。
+   */
+  recordHistory(entry: {
+    kind: SyncHistoryKind
+    localPath: string
+    remotePath?: string | null
+    size: number
+    skipReason?: SkipReason | null
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO sync_history (kind, local_path, remote_path, size, skip_reason, at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        entry.kind,
+        entry.localPath,
+        entry.remotePath ?? null,
+        entry.size,
+        entry.skipReason ?? null,
+        Date.now()
+      )
+  }
+
+  /**
+   * 分页列出同步历史（倒序：最新的在前）。
+   *
+   * `kind` 传入时只取该方向（上传 / 下载 / 跳过），不传则全部。
+   */
+  listHistory(opts: { kind?: SyncHistoryKind; limit?: number; offset?: number } = {}): SyncHistoryEntry[] {
+    const limit = opts.limit ?? 500
+    const offset = opts.offset ?? 0
+    const sql = opts.kind
+      ? `SELECT * FROM sync_history WHERE kind = ? ORDER BY at DESC, id DESC LIMIT ? OFFSET ?`
+      : `SELECT * FROM sync_history ORDER BY at DESC, id DESC LIMIT ? OFFSET ?`
+    const rows = (
+      opts.kind
+        ? this.db.prepare(sql).all(opts.kind, limit, offset)
+        : this.db.prepare(sql).all(limit, offset)
+    ) as Record<string, unknown>[]
+    return rows.map((r) => ({
+      id: Number(r['id']),
+      kind: r['kind'] as SyncHistoryKind,
+      localPath: r['local_path'] as string,
+      remotePath: (r['remote_path'] as string | null) ?? null,
+      size: Number(r['size'] ?? 0),
+      skipReason: (r['skip_reason'] as SkipReason | null) ?? null,
+      at: Number(r['at'])
+    }))
+  }
+
+  /** 同步历史总条数（分页与「共 N 条」提示用） */
+  countHistory(kind?: SyncHistoryKind): number {
+    const row = (
+      kind
+        ? this.db.prepare('SELECT COUNT(*) AS n FROM sync_history WHERE kind = ?').get(kind)
+        : this.db.prepare('SELECT COUNT(*) AS n FROM sync_history').get()
+    ) as { n: number } | undefined
+    return row?.n ?? 0
   }
 }
 

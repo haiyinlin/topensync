@@ -1,15 +1,26 @@
 import { describe, expect, it, vi, afterEach } from 'vitest'
 import { OpenListClient } from '../src/main/openlist/client'
+import { request as undiciRequest } from 'undici'
+import { Readable } from 'stream'
 
 /**
  * OpenList 客户端的接口契约测试。
  *
  * 这两个断言锁住的是两个真实踩过的坑：
- *   1. per_page: 0 会返回空列表（server/handles/fsread.go:215）
+ *   1. per_page: 0 会返回空列表（server/handlers/fsread.go:215）
  *   2. refresh: true 需要写权限，否则 403（server/handles/fsread.go:93）
  *
  * 任何人改动列举逻辑时，这个测试会先失败。
  */
+
+// putFile 用 undici.request 流式上传（fetch 会缓冲 body）。mock 掉 undici 的
+// request/Agent，让契约测试能断言上传头，而不真发网络请求。
+vi.mock('undici', () => ({
+  Agent: class {
+    constructor(_o: unknown) {}
+  },
+  request: vi.fn()
+}))
 describe('OpenListClient.list', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
@@ -78,6 +89,7 @@ describe('OpenListClient.list', () => {
 describe('OpenListClient 的凭据过期处理', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
+    vi.mocked(undiciRequest).mockReset()
   })
 
   interface Stubbed {
@@ -167,21 +179,20 @@ describe('OpenListClient 的凭据过期处理', () => {
   })
 
   it('流式请求体不重放：401 后刷新 token 并抛出，由上层重新发起', async () => {
-    const calls: { url: string; init: RequestInit }[] = []
     let logins = 0
     let puts = 0
-    vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
-      calls.push({ url, init })
-      if (url.includes('/api/auth/login')) {
-        logins++
-        return {
-          ok: true,
-          status: 200,
-          text: async () => JSON.stringify({ code: 200, data: { token: `token-${logins}` } })
-        }
+    // login 走 fetch（this.request），putFile 走 undici.request
+    vi.stubGlobal('fetch', async (url: string, _init: RequestInit) => {
+      logins++
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ code: 200, data: { token: `token-${logins}` } })
       }
+    })
+    vi.mocked(undiciRequest).mockImplementation(async () => {
       puts++
-      return { ok: false, status: 401, text: async () => 'unauthorized' }
+      return { statusCode: 401, body: { dump: async () => {}, text: async () => 'unauthorized' } }
     })
 
     const client = new OpenListClient({
@@ -191,12 +202,7 @@ describe('OpenListClient 的凭据过期处理', () => {
     })
     await client.login()
 
-    const body = new ReadableStream<Uint8Array>({
-      start(c) {
-        c.enqueue(new Uint8Array([1, 2, 3]))
-        c.close()
-      }
-    })
+    const body = Readable.from([Buffer.from([1, 2, 3])])
 
     await expect(
       client.putFile('/quark-backup/a.txt', body, {
@@ -216,13 +222,14 @@ describe('OpenListClient 的凭据过期处理', () => {
 describe('OpenListClient.putFile', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
+    vi.mocked(undiciRequest).mockReset()
   })
 
   it('必须同时发送 MD5 与 SHA1 双哈希头，以及 Content-Length', async () => {
-    const calls: { url: string; init: RequestInit }[] = []
-    vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
-      calls.push({ url, init })
-      return { ok: true, status: 200, text: async () => JSON.stringify({ code: 200, data: {} }) }
+    const calls: { url: string; opts: { method: string; headers: Record<string, string> } }[] = []
+    vi.mocked(undiciRequest).mockImplementation(async (url, opts) => {
+      calls.push({ url: String(url), opts: opts as { method: string; headers: Record<string, string> } })
+      return { statusCode: 200, body: { dump: async () => {}, text: async () => JSON.stringify({ code: 200 }) } }
     })
 
     const client = new OpenListClient({
@@ -231,12 +238,7 @@ describe('OpenListClient.putFile', () => {
       password: 'pw'
     })
 
-    const body = new ReadableStream<Uint8Array>({
-      start(c) {
-        c.enqueue(new Uint8Array([1, 2, 3]))
-        c.close()
-      }
-    })
+    const body = Readable.from([Buffer.from([1, 2, 3])])
 
     await client.putFile('/quark-backup/a.txt', body, {
       size: 3,
@@ -245,9 +247,9 @@ describe('OpenListClient.putFile', () => {
       lastModifiedMs: 1730000000000
     })
 
-    const headers = calls[0].init.headers as Record<string, string>
+    const headers = calls[0].opts.headers
     expect(calls[0].url).toContain('/api/fs/put')
-    expect(calls[0].init.method).toBe('PUT')
+    expect(calls[0].opts.method).toBe('PUT')
     // 缺任一哈希 → 服务端缓存整个文件并失去秒传
     expect(headers['X-File-Md5']).toBe('md5hash')
     expect(headers['X-File-Sha1']).toBe('sha1hash')

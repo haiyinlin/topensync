@@ -1,9 +1,18 @@
 import * as React from 'react'
-import { useMemo, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { Icon } from '../components/Icon'
 import { BatchBar } from '../components/BatchBar'
-import { VirtualTable } from '../components/VirtualTable'
-import type { DiffKind, DiffResolution } from '@shared/types'
+import { ROW_HEIGHT, VirtualTable } from '../components/VirtualTable'
+import {
+  Cell2,
+  DetailRow,
+  ExpandToggle,
+  FileCell,
+  RowDetail,
+  detailHeight,
+  splitPath
+} from '../components/RowParts'
+import type { DiffEntry, DiffKind, DiffResolution } from '@shared/types'
 import { useAppStore } from '../store'
 
 /**
@@ -97,6 +106,32 @@ export function Reconcile(): React.JSX.Element {
     )
   }, [diffs, filter, query])
   const shownIds = useMemo(() => shown.map((d) => String(d.id)), [shown])
+
+  /* ── 展开详情 ────────────────────────────────────────── */
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const toggleExpand = (id: string): void => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  /** 只对展开中的行算高度，rowHeight 里 O(1) 查表 */
+  const expandedHeights = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const id of expanded) {
+      const d = shown.find((x) => String(x.id) === id)
+      if (d) m.set(id, ROW_HEIGHT + detailHeight(diffDetail(d)))
+    }
+    return m
+  }, [expanded, shown])
+
+  const rowHeight = useCallback(
+    (i: number) => expandedHeights.get(shownIds[i]) ?? ROW_HEIGHT,
+    [expandedHeights, shownIds]
+  )
 
   /*
    * 全选（表头常驻）。
@@ -244,7 +279,7 @@ export function Reconcile(): React.JSX.Element {
         <VirtualTable
           head={
             <tr>
-              <th style={{ width: '4%' }}>
+              <th style={{ width: 38 }}>
                 <label className="batch-check" title="全选 / 全不选当前筛选出的差异项">
                   <input
                     type="checkbox"
@@ -256,99 +291,141 @@ export function Reconcile(): React.JSX.Element {
                   />
                 </label>
               </th>
-              <th style={{ width: '11%' }}>类型</th>
-              <th style={{ width: '25%' }}>路径</th>
-              <th style={{ width: '13%' }}>本地</th>
-              <th style={{ width: '13%' }}>远端</th>
-              <th style={{ width: '11%' }}>发现时间</th>
-              <th style={{ width: '23%' }}>处理</th>
+              <th style={{ width: 30 }} />
+              <th style={{ width: 92 }}>类型</th>
+              <th>路径</th>
+              <th style={{ width: 132 }}>本地</th>
+              <th style={{ width: 132 }}>远端</th>
+              <th style={{ width: 100 }}>发现时间</th>
+              <th style={{ width: 196 }}>处理</th>
             </tr>
           }
           rowCount={shown.length}
+          rowHeight={rowHeight}
           renderRow={(index) => {
             const d = shown[index]
             if (!d) return null
+            const rid = String(d.id)
+            const open = expanded.has(rid)
+            const { name, dir } = splitPath(d.remotePath)
             return (
-              <tr key={d.id}>
-                <td>
-                  <label className="batch-check">
-                    <input
-                      type="checkbox"
-                      checked={selected.has(String(d.id))}
-                      onChange={() => {
-                        const key = String(d.id)
-                        const next = new Set(selected)
-                        if (next.has(key)) next.delete(key)
-                        else next.add(key)
-                        setSelected(next)
-                      }}
+              <React.Fragment key={d.id}>
+                <tr className={`row-main${open ? ' expanded' : ''}`}>
+                  <td>
+                    <label className="batch-check">
+                      <input
+                        type="checkbox"
+                        checked={selected.has(rid)}
+                        onChange={() => {
+                          const next = new Set(selected)
+                          if (next.has(rid)) next.delete(rid)
+                          else next.add(rid)
+                          setSelected(next)
+                        }}
+                      />
+                    </label>
+                  </td>
+                  <td>
+                    <ExpandToggle open={open} onToggle={() => toggleExpand(rid)} />
+                  </td>
+                  <td>
+                    <span className={`pill ${KIND_META[d.kind].tone}`}>
+                      {KIND_META[d.kind].label}
+                    </span>
+                  </td>
+                  <td>
+                    <FileCell
+                      name={name}
+                      meta={dir || undefined}
+                      title={d.remotePath}
                     />
-                  </label>
-                </td>
-                <td>
-                  <span className={`pill ${KIND_META[d.kind].tone}`}>{KIND_META[d.kind].label}</span>
-                </td>
-                <td>
-                  <div className="cell-file">
-                    <Icon name="files" className="ic file" />
-                    <span title={d.remotePath}>{d.remotePath}</span>
-                  </div>
-                </td>
-                <td className="mono dim" title={d.localMtime ? formatTime(d.localMtime) : undefined}>
-                  {d.localSize !== null ? `${formatSize(d.localSize)}` : '—'}
-                  {d.localMtime ? ` · ${formatTime(d.localMtime)}` : ''}
-                </td>
-                <td
-                  className="mono dim"
-                  title={
-                    d.kind === 'missing_remote'
-                      ? '已被外部删除'
-                      : d.remoteMtime
-                        ? formatTime(d.remoteMtime)
-                        : undefined
-                  }
-                >
-                  {d.remoteSize !== null ? formatSize(d.remoteSize) : '—'}
-                  {d.kind === 'missing_remote'
-                    ? ' · 已被外部删除'
-                    : d.remoteMtime
-                      ? ` · ${formatTime(d.remoteMtime)}`
-                      : ''}
-                </td>
-                <td className="mono dim nw">{formatTime(d.detectedAt)}</td>
-                <td>
-                  <div className="act-row">
-                    {d.kind === 'missing_remote' && (
-                      <button className="btn tiny primary" onClick={() => resolve(d.id, 'uploaded')}>
-                        重新上传
-                      </button>
-                    )}
-                    {d.kind === 'size_mismatch' && (
-                      <button className="btn tiny primary" onClick={() => resolve(d.id, 'overwritten')}>
-                        覆盖远端
-                      </button>
-                    )}
-                    {d.kind === 'remote_only' && (
-                      <>
-                        <button className="btn tiny ghost" onClick={() => resolve(d.id, 'pulled')}>
-                          <Icon name="down" />
-                          下载到本地
+                  </td>
+                  {/*
+                    * 本地/远端各占一列、两行显示：第一行大小、第二行时间。
+                    * 以前挤成一行「7.9 GB · 2022-11-03 19:31」，
+                    * 列一窄就从时间中间被切断，连年份都看不全。
+                    */}
+                  <td>
+                    <Cell2
+                      line1={d.localSize !== null ? formatSize(d.localSize) : '—'}
+                      line2={d.localMtime ? formatTime(d.localMtime) : undefined}
+                    />
+                  </td>
+                  <td>
+                    <Cell2
+                      line1={d.remoteSize !== null ? formatSize(d.remoteSize) : '—'}
+                      line2={
+                        d.kind === 'missing_remote'
+                          ? '已被外部删除'
+                          : d.remoteMtime
+                            ? formatTime(d.remoteMtime)
+                            : undefined
+                      }
+                    />
+                  </td>
+                  <td>
+                    <Cell2
+                      line1={dateOnly(d.detectedAt)}
+                      line2={<span className="mono">{timeOnly(d.detectedAt)}</span>}
+                    />
+                  </td>
+                  <td>
+                    {/*
+                      * 所有操作压成一行。
+                      *
+                      * 以前「下载到本地 / 移入回收站 / 忽略」三个文字按钮
+                      * 在窄列里换行成两排，把行高撑成别人的两倍，
+                      * 整张表的节奏全乱。次要操作改成图标 + 悬停提示。
+                      */}
+                    <div className="act-row">
+                      {d.kind === 'missing_remote' && (
+                        <button
+                          className="btn tiny primary"
+                          onClick={() => resolve(d.id, 'uploaded')}
+                        >
+                          重新上传
                         </button>
-                        <button className="btn tiny ghost" onClick={() => resolve(d.id, 'deleted_remote')}>
-                          <Icon name="trash" />
-                          移入回收站
+                      )}
+                      {d.kind === 'size_mismatch' && (
+                        <button
+                          className="btn tiny primary"
+                          onClick={() => resolve(d.id, 'overwritten')}
+                        >
+                          覆盖远端
                         </button>
-                      </>
-                    )}
-                    <button className="btn tiny ghost" onClick={() => resolve(d.id, 'ignored')}>
-                      忽略
-                    </button>
-                  </div>
-                </td>
-              </tr>
+                      )}
+                      {d.kind === 'remote_only' && (
+                        <>
+                          <button
+                            className="btn tiny primary"
+                            onClick={() => resolve(d.id, 'pulled')}
+                          >
+                            <Icon name="down" />
+                            下载
+                          </button>
+                          <button
+                            className="btn tiny ghost"
+                            title="移入远端回收站"
+                            onClick={() => resolve(d.id, 'deleted_remote')}
+                          >
+                            <Icon name="trash" />
+                          </button>
+                        </>
+                      )}
+                      <button
+                        className="btn tiny ghost"
+                        onClick={() => resolve(d.id, 'ignored')}
+                      >
+                        忽略
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+                {open && <RowDetail rows={diffDetail(d)} colSpan={8} />}
+              </React.Fragment>
             )
           }}
-          maxHeight={520}
+          maxHeight={560}
           empty={
             diffs.length === 0
               ? '暂无差异。运行一次对账以核对远端文件树。'
@@ -402,6 +479,35 @@ export function Reconcile(): React.JSX.Element {
   )
 }
 
+/**
+ * 差异行的展开详情。
+ *
+ * 列表里只看得到「文件名 + 大小」，真要动手处理前
+ * 往往得确认一下两侧的完整路径和时间——尤其是远端那份到底在哪。
+ */
+function diffDetail(d: DiffEntry): DetailRow[] {
+  return [
+    {
+      items: [
+        { k: '远端路径', v: d.remotePath, mono: true, title: d.remotePath },
+        { k: '本地路径', v: d.localPath ?? '—（本地没有这个文件）', mono: true, title: d.localPath ?? undefined }
+      ]
+    },
+    {
+      items: [
+        { k: '本地大小', v: d.localSize !== null ? formatSize(d.localSize) : '—', mono: true },
+        { k: '远端大小', v: d.remoteSize !== null ? formatSize(d.remoteSize) : '—', mono: true }
+      ]
+    },
+    {
+      items: [
+        { k: '本地时间', v: d.localMtime ? formatTime(d.localMtime) : '—', mono: true },
+        { k: '远端时间', v: d.remoteMtime ? formatTime(d.remoteMtime) : '—', mono: true }
+      ]
+    }
+  ]
+}
+
 function formatSize(bytes: number): string {
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let v = bytes
@@ -417,4 +523,18 @@ function formatTime(ts: number): string {
   const d = new Date(ts)
   const p = (n: number): string => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+/** 列表第一行：只有日期 */
+function dateOnly(ts: number): string {
+  const d = new Date(ts)
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+/** 列表第二行：时分 */
+function timeOnly(ts: number): string {
+  const d = new Date(ts)
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${p(d.getHours())}:${p(d.getMinutes())}`
 }

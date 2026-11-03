@@ -1,5 +1,7 @@
 import { open, rm, rename, copyFile } from 'fs/promises'
 import { createHash } from 'crypto'
+import { Transform, type Readable } from 'stream'
+import { Agent as UndiciAgent, request as undiciRequest } from 'undici'
 
 /**
  * OpenList REST 客户端。
@@ -178,6 +180,20 @@ const REFRESH_INTERVAL_MS = 1_200
  *
  * 内网地址应当**绕过代理直连**。
  */
+/**
+ * 判断一个值是不是 Node 可读流（而非 Web ReadableStream）。
+ *
+ * 用 duck-typing：Node Readable 有 `readable` 属性或 `Symbol.asyncIterator`，
+ * 且没有 Web 流的 `getReader`。区分两者才能决定 fetch body 走哪条路——
+ * Node 流直接传（零缓冲流式），Web 流走 undici 的 ReadableStream 路径。
+ */
+function isNodeReadable(value: unknown): boolean {
+  if (value === null || typeof value !== 'object') return false
+  const v = value as { readable?: boolean; getReader?: unknown; [Symbol.asyncIterator]?: unknown }
+  if (typeof v.getReader === 'function') return false // Web ReadableStream
+  return v.readable === true || typeof v[Symbol.asyncIterator] === 'function'
+}
+
 function isPrivateHost(hostname: string): boolean {
   const host = hostname.replace(/^\[|\]$/g, '').toLowerCase()
 
@@ -215,19 +231,26 @@ function isPrivateHost(hostname: string): boolean {
 let directAgent: unknown = null
 
 function directFetch(input: string, init: RequestInit): Promise<Response> {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const undici = require('undici') as { Agent: new (opts: unknown) => unknown }
-    if (!directAgent) {
-      directAgent = new undici.Agent({ connect: { timeout: 30_000 } })
-    }
-    // Node 的 RequestInit 已经声明了 dispatcher（类型来自内置 undici），
-    // 这里要塞的是外部 undici 包的 Agent，两者类型不兼容但运行时兼容。
-    return fetch(input, { ...init, dispatcher: directAgent } as unknown as RequestInit)
-  } catch {
-    /* 没有 undici 就用默认行为 */
-    return fetch(input, init)
+  if (!directAgent) {
+    /*
+     * 连接池必须限容量、限存活。
+     *
+     * 实测整盘同步时主进程 external 内存（undici 的 Buffer/连接缓冲）
+     * 7 分钟从 800MB 涨到 2.2GB——根因是连接池无上限地缓存 keep-alive
+     * 连接与响应体。给 Agent 设一个小的每-host 连接上限 + 明确的空闲
+     * 回收超时，连接不再无限累积，内存才稳得住。
+     */
+    directAgent = new UndiciAgent({
+      connect: { timeout: 30_000 },
+      connections: 16,
+      pipelining: 1,
+      keepAliveTimeout: 30_000,
+      keepAliveMaxTimeout: 60_000
+    })
   }
+  // Node 的 RequestInit 已经声明了 dispatcher（类型来自内置 undici），
+  // 这里要塞的是外部 undici 包的 Agent，两者类型不兼容但运行时兼容。
+  return fetch(input, { ...init, dispatcher: directAgent } as unknown as RequestInit)
 }
 
 /**
@@ -364,7 +387,7 @@ export class OpenListClient {
    */
   async putFile(
     remotePath: string,
-    body: ReadableStream<Uint8Array>,
+    body: Readable,
     opts: {
       size: number
       md5: string
@@ -383,34 +406,132 @@ export class OpenListClient {
       onProgress?: (sent: number) => void
     }
   ): Promise<void> {
-    // 包一层字节计数：每读出一块就上报累计发送字节，让单次 PUT 也有实时速率
-    let sent = 0
+    /*
+     * 字节计数用 Node 原生 Transform（不是 Web TransformStream，也不是
+     * `data` 事件）。
+     *
+     * 为什么：undici 处理 Web ReadableStream body 时内部缓冲 + 拷贝，
+     * external 内存涨到约 3.5 倍文件大小（1GB 文件吃掉 3GB+，实测）。
+     * 直接传 Node 流则零缓冲。计数用 Transform 串在流上：既保持流式
+     * 背压，又不把流切到 flowing mode（`data` 事件会和 undici 的
+     * async iterator 消费互斥，读不到数据）。
+     */
     const counted = opts.onProgress
-      ? body.pipeThrough(
-          new TransformStream<Uint8Array, Uint8Array>({
-            transform(chunk, controller) {
-              sent += chunk.byteLength
-              controller.enqueue(chunk)
+      ? (() => {
+          let sent = 0
+          const t = new Transform({
+            transform(chunk: Buffer, _enc, cb) {
+              sent += chunk.length
               opts.onProgress?.(sent)
+              cb(null, chunk)
             }
           })
-        )
+          body.pipe(t)
+          return t
+        })()
       : body
 
-    await this.request('PUT', '/api/fs/put', {
-      headers: {
-        'File-Path': encodeURI(remotePath),
-        'Content-Length': String(opts.size),
-        'X-File-Md5': opts.md5,
-        'X-File-Sha1': opts.sha1,
-        'Last-Modified': String(opts.lastModifiedMs),
-        'Content-Type': 'application/octet-stream',
-        Overwrite: opts.overwrite === false ? 'false' : 'true'
-      },
+    const headers: Record<string, string> = {
+      ...(this.token ? { Authorization: this.token } : {}),
+      'File-Path': encodeURI(remotePath),
+      'Content-Length': String(opts.size),
+      'X-File-Md5': opts.md5,
+      'X-File-Sha1': opts.sha1,
+      'Last-Modified': String(opts.lastModifiedMs),
+      'Content-Type': 'application/octet-stream',
+      Overwrite: opts.overwrite === false ? 'false' : 'true'
+    }
+
+    /*
+     * 用 undici.request 原生 API 上传，**不用 fetch**。
+     *
+     * 决定性实测：Node 22 内置 fetch 对流式 body（哪怕是 Node 流 + duplex:half）
+     * 会**把整个 body 缓冲进 external 内存**——500MB 文件上传 ext 涨到 505MB，
+     * 1GB 的 mkv 就是 1GB+ 缓冲，4 个并发直接吃爆（实测主进程 9GB 的根因）。
+     * 而 undici.request 对 Node 流有正确的流式背压，500MB 上传 ext 只涨 25MB。
+     */
+    await this.putViaUndici(`${this.baseUrl}/api/fs/put`, {
+      method: 'PUT',
+      headers,
       body: counted,
       signal: opts.signal,
       timeoutMs: Math.max(this.timeoutMs, opts.size / (1024 * 1024) * 1000 * 60)
     })
+  }
+
+  /**
+   * 用 undici.request 发起一次流式上传（绕代理直连）。
+   *
+   * 与 `request()`（走 fetch）分开：fetch 对流式 body 会整段缓冲，
+   * 只有 undici.request 才是真流式。这里处理超时、状态码、响应消费。
+   */
+  private async putViaUndici(
+    url: string,
+    opts: {
+      method: 'PUT'
+      headers: Record<string, string>
+      body: Readable
+      signal?: AbortSignal
+      timeoutMs: number
+    }
+  ): Promise<void> {
+    if (!directAgent) {
+      directAgent = new UndiciAgent({
+        connect: { timeout: 30_000 },
+        connections: 16,
+        pipelining: 1,
+        keepAliveTimeout: 30_000,
+        keepAliveMaxTimeout: 60_000
+      })
+    }
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), opts.timeoutMs)
+    const onAbort = (): void => controller.abort()
+    opts.signal?.addEventListener('abort', onAbort, { once: true })
+
+    try {
+      let res: { statusCode: number; body: { dump: () => Promise<void>; text: () => Promise<string> } }
+      try {
+        res = await undiciRequest(url, {
+          method: opts.method,
+          headers: opts.headers,
+          body: opts.body,
+          dispatcher: directAgent,
+          signal: controller.signal
+        } as never)
+      } catch (err) {
+        throw new OpenListError(
+          `OpenList ${opts.method} /api/fs/put 请求失败：${describeError(err)}`,
+          0,
+          err
+        )
+      }
+
+      // 必须消费响应体，否则连接不释放
+      const text = await res.body.text().catch(() => '')
+
+      if (res.statusCode === 401 && !this.authenticating) {
+        // 凭据过期：刷新 token 后抛错，由上层重新发起（body 流已消费，不能原地重放）
+        await this.reauth()
+        throw new OpenListError(
+          `OpenList ${opts.method} /api/fs/put → HTTP 401（凭据已过期，已自动重新登录，需重新发起本次请求）`,
+          401,
+          text
+        )
+      }
+
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        throw new OpenListError(
+          `OpenList ${opts.method} /api/fs/put → HTTP ${res.statusCode}`,
+          res.statusCode,
+          text
+        )
+      }
+    } finally {
+      clearTimeout(timer)
+      opts.signal?.removeEventListener('abort', onAbort)
+    }
   }
 
   // ── 分片上传 ───────────────────────────────────────────
@@ -438,10 +559,22 @@ export class OpenListClient {
       const contentType = res.headers.get('content-type') ?? ''
       // 落到 SPA 兜底页说明没有这个路由
       this.multipartSupported = contentType.includes('json')
-    } catch {
-      this.multipartSupported = false
+      return this.multipartSupported
+    } catch (err) {
+      /*
+       * **探测失败 ≠ 服务端不支持。**
+       *
+       * 以前这里一律写 false 并缓存，于是「服务端恰好抖了一下」
+       * 就被永久记成「不支持分片」：本进程后续每一个大文件都退化成
+       * 单次 PUT，还额外打一条误导性的 warn——日志里那些
+       * 「服务端不支持 multipart 分片上传」旁边往往跟着
+       * `ECONNREFUSED`，就是因为这个。
+       *
+       * 连接类错误原样抛：调用方会走正常失败/重试路径，
+       * 错误信息也保持真实（连不上），而不是伪装成「没有该路由」。
+       */
+      throw err
     }
-    return this.multipartSupported
   }
 
   async multipartInit(
@@ -1235,7 +1368,9 @@ export class OpenListClient {
 
     let body: RequestInit['body']
     if (opts.body !== undefined) {
-      if (opts.body instanceof ReadableStream) {
+      if (opts.body instanceof ReadableStream || isNodeReadable(opts.body)) {
+        // Web 流或 Node 流：直接作为流式 body（undici 原生支持 Node 流，
+        // 配合 duplex:'half' 零缓冲发送，不转 Web 流、不 JSON 化）
         body = opts.body as unknown as RequestInit['body']
       } else {
         headers['Content-Type'] = 'application/json'

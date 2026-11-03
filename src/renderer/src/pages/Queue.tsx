@@ -1,9 +1,18 @@
 import * as React from 'react'
-import { useMemo, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { Icon } from '../components/Icon'
 import { BatchBar } from '../components/BatchBar'
-import { VirtualTable } from '../components/VirtualTable'
+import { ROW_HEIGHT, VirtualTable } from '../components/VirtualTable'
+import {
+  DetailRow,
+  ExpandToggle,
+  FileCell,
+  RowDetail,
+  detailHeight,
+  splitPath
+} from '../components/RowParts'
 import type { SkipReason, TransferCategory, TransferTask } from '@shared/types'
+import { explainError } from '@shared/errors'
 import { useAppStore } from '../store'
 import { formatSize, formatSpeed } from '../format'
 
@@ -17,6 +26,12 @@ import { formatSize, formatSpeed } from '../format'
  * 删除语义：**只清队列里的记录，不动文件**。
  * 队列是历史快照，「删除」指的是「这条记录我不要看了」；
  * 真要删文件请去文件清单页——两者混在一起会误删数据。
+ *
+ * 表格布局：每行两行信息。
+ * 第一行是**文件名**（用户最先要找的东西），第二行是所在目录；
+ * 哈希、完整路径、错误信息放进「展开」里。
+ * 以前全部挤在一行，列一窄文件名就只剩开头几个字，
+ * 哈希也只剩前 8 位——等于最该看的两样都看不到。
  */
 type StateFilter = 'all' | 'uploading' | 'queued' | 'done' | 'failed' | 'canceled' | 'skipped'
 type CategoryFilter = 'all' | TransferCategory
@@ -41,6 +56,55 @@ function isSkipped(task: TransferTask): boolean {
   return task.category === 'skip' || task.state === 'skipped'
 }
 
+/**
+ * 大小列的文字。
+ *
+ * 还没探测到大小的时候（刚排队、正在算哈希）`size` 是 0，
+ * 直接格式化会显示「0 B」——用户看到一整列 0 B 会以为
+ * 这些文件都是空的、或者程序读不到大小。所以显式说明「待探测」。
+ */
+function sizeLabel(task: TransferTask): string {
+  if (task.size > 0) return formatSize(task.size)
+  if (task.state === 'queued' || task.state === 'hashing') return '待探测'
+  return formatSize(task.size)
+}
+
+/** 展开区要显示的内容 */
+function buildDetail(t: TransferTask): DetailRow[] {
+  const rows: DetailRow[] = [
+    {
+      items: [
+        { k: '本地路径', v: t.localPath || '—', mono: true, title: t.localPath },
+        { k: '远端路径', v: t.remotePath || '—', mono: true, title: t.remotePath }
+      ]
+    },
+    {
+      items: [
+        {
+          k: 'MD5',
+          v: t.md5 ?? (t.md5Prefix ? `${t.md5Prefix}…` : '—'),
+          mono: true,
+          title: t.md5 ?? undefined
+        },
+        {
+          k: 'SHA1',
+          v: t.sha1 ?? (t.sha1Prefix ? `${t.sha1Prefix}…` : '—'),
+          mono: true,
+          title: t.sha1 ?? undefined
+        }
+      ]
+    }
+  ]
+  // 失败原因是最该被完整看到的内容，允许换行
+  if (t.errorMsg) {
+    const hint = explainError(t.errorMsg)
+    rows.push({ items: [{ k: '失败原因', v: hint.brief }] })
+    rows.push({ items: [{ k: '怎么处理', v: hint.advice }], tall: true })
+    rows.push({ items: [{ k: '原始报错', v: t.errorMsg, mono: true, title: t.errorMsg }], tall: true })
+  }
+  return rows
+}
+
 export function Queue(): React.JSX.Element {
   const tasks = useAppStore((s) => s.tasks)
   const truncated = useAppStore((s) => s.stats?.tasksTruncated ?? false)
@@ -48,6 +112,7 @@ export function Queue(): React.JSX.Element {
   const [filter, setFilter] = useState<StateFilter>('all')
   const [category, setCategory] = useState<CategoryFilter>('all')
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
 
   /*
    * 计数一次遍历算完。
@@ -59,7 +124,7 @@ export function Queue(): React.JSX.Element {
    *
    * 遍历一次的代价与筛选条件无关，只跟任务数有关。
    */
-  const { stateCounts, categoryCounts } = useMemo(() => {
+  const { stateCounts, categoryCounts, failGroups } = useMemo(() => {
     const sc = {
       all: tasks.length,
       uploading: 0,
@@ -70,19 +135,36 @@ export function Queue(): React.JSX.Element {
       skipped: 0
     }
     const cc = { all: tasks.length, upload: 0, download: 0, skip: 0 }
+    /*
+     * 失败原因聚合。
+     *
+     * 「163 个失败」这个数字本身没有信息量——用户要知道的是
+     * **它们是不是同一个原因**。同一病因归到一组，一眼就能看出
+     * 「全是服务端拒绝连接」，也就知道该去修服务端而不是逐个重试。
+     * 顺便在这里算掉，省一次全表遍历。
+     */
+    const fg = new Map<string, { count: number; advice: string }>()
     for (const t of tasks) {
       if (isActiveState(t.state)) sc.uploading++
       else if (t.state === 'queued') sc.queued++
       else if (t.state === 'done') sc.done++
-      else if (t.state === 'failed') sc.failed++
-      else if (t.state === 'canceled') sc.canceled++
+      else if (t.state === 'failed') {
+        sc.failed++
+        const hint = explainError(t.errorMsg)
+        const cur = fg.get(hint.brief)
+        if (cur) cur.count++
+        else fg.set(hint.brief, { count: 1, advice: hint.advice })
+      } else if (t.state === 'canceled') sc.canceled++
       else if (t.state === 'skipped') sc.skipped++
 
       if (t.category === 'upload') cc.upload++
       else if (t.category === 'download') cc.download++
       else if (t.category === 'skip') cc.skip++
     }
-    return { stateCounts: sc, categoryCounts: cc }
+    const groups = [...fg.entries()]
+      .map(([brief, v]) => ({ brief, count: v.count, advice: v.advice }))
+      .sort((a, b) => b.count - a.count)
+    return { stateCounts: sc, categoryCounts: cc, failGroups: groups }
   }, [tasks])
 
   /*
@@ -125,6 +207,33 @@ export function Queue(): React.JSX.Element {
   const shownIds = useMemo(() => shown.map((t) => t.id), [shown])
 
   /*
+   * 展开行的额外高度。
+   *
+   * 只对**展开中的那几行**求值（通常 0~3 条），
+   * 然后在 rowHeight 里 O(1) 查表——如果每行都现场算一遍，
+   * 三千多条任务每次推送都要重建几千个详情对象，白白制造 GC 压力。
+   */
+  const byId = useMemo(() => {
+    const map = new Map<string, TransferTask>()
+    for (const t of shown) map.set(t.id, t)
+    return map
+  }, [shown])
+
+  const expandedHeights = useMemo(() => {
+    const map = new Map<string, number>()
+    for (const id of expanded) {
+      const t = byId.get(id)
+      if (t) map.set(id, ROW_HEIGHT + detailHeight(buildDetail(t)))
+    }
+    return map
+  }, [expanded, byId])
+
+  const rowHeight = useCallback(
+    (i: number) => expandedHeights.get(shown[i].id) ?? ROW_HEIGHT,
+    [expandedHeights, shown]
+  )
+
+  /*
    * 全选。
    *
    * 以前全选框藏在 BatchBar 里，而 BatchBar 在「没选中任何项」时
@@ -146,115 +255,135 @@ export function Queue(): React.JSX.Element {
     setSelected(new Set([...selected, ...shownIds]))
   }
 
+  const toggleExpand = (id: string): void => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
   const renderRow = (index: number): React.ReactNode => {
     const t = shown[index]
     if (!t) return null
     const skipped = isSkipped(t)
+    const open = expanded.has(t.id)
+    const { name, dir } = splitPath(t.localPath)
+    const detail = open ? buildDetail(t) : null
+
     return (
-      <tr key={t.id}>
-        <td>
-          <label className="batch-check">
-            <input
-              type="checkbox"
-              checked={selected.has(t.id)}
-              onChange={() => {
-                const next = new Set(selected)
-                if (next.has(t.id)) next.delete(t.id)
-                else next.add(t.id)
-                setSelected(next)
-              }}
+      <React.Fragment key={t.id}>
+        <tr className={`row-main${open ? ' expanded' : ''}`}>
+          <td>
+            <label className="batch-check">
+              <input
+                type="checkbox"
+                checked={selected.has(t.id)}
+                onChange={() => {
+                  const next = new Set(selected)
+                  if (next.has(t.id)) next.delete(t.id)
+                  else next.add(t.id)
+                  setSelected(next)
+                }}
+              />
+            </label>
+          </td>
+          <td>
+            <ExpandToggle open={open} onToggle={() => toggleExpand(t.id)} />
+          </td>
+          <td>
+            <FileCell
+              icon={t.category === 'download' ? 'down' : 'files'}
+              name={name}
+              meta={dir || undefined}
+              title={t.localPath}
             />
-          </label>
-        </td>
-        <td>
-          <div className="cell-file">
-            <Icon name={t.category === 'download' ? 'down' : 'files'} className="ic file" />
-            <span title={t.localPath}>{t.localPath}</span>
-          </div>
-        </td>
-        <td>
-          <span className={`pill ${categoryTone(t.category)}`}>
-            {CATEGORY_LABELS[t.category]}
-          </span>
-          {t.skipReason && (
-            <div className="tiny dim">{SKIP_LABELS[t.skipReason]}</div>
-          )}
-        </td>
-        <td className="mono dim">{formatSize(t.size)}</td>
-        <td>
-          {/*
-           * 跳过的文件不画进度条。
-           *
-           * 跳过没有「进度」这回事——它没传。画一条空的进度条加「0%」，
-           * 用户看到的是「卡在 0% 不动」，会反复点、或者以为程序坏了。
-           * 这一列改成显示跳过原因。
-           */}
-          {skipped ? (
-            <span className="tiny dim">{t.skipReason ? SKIP_LABELS[t.skipReason] : '已跳过'}</span>
-          ) : (
-            <>
-              <div className="bar" style={{ width: '100%' }}>
-                <i style={{ width: `${Math.round(t.progress * 100)}%` }} />
-              </div>
-              <span className="tiny mono">
-                {/*
-                 * 只给百分比，不显示「分片 3/10」。
-                 *
-                 * 分片数是实现细节：用户关心的是「还要多久」，
-                 * 而 3/10 和 30% 说的是同一件事，多一个数字只是噪声。
-                 * 真正有用的附加信息是速度，所以留在后面。
-                 */}
-                {Math.round(t.progress * 100)}%
-                {t.speed > 0 && <span className="dim"> · {formatSpeed(t.speed)}</span>}
+          </td>
+          <td>
+            <Cell2Pill
+              tone={categoryTone(t.category)}
+              label={CATEGORY_LABELS[t.category]}
+            />
+          </td>
+          <td className="mono dim">{sizeLabel(t)}</td>
+          <td>
+            {skipped ? (
+              <span className="tiny dim">
+                {t.skipReason ? SKIP_LABELS[t.skipReason] : '已跳过'}
               </span>
-            </>
-          )}
-        </td>
-        <td
-          className="mono dim"
-          title={t.md5Prefix && t.sha1Prefix ? `${t.md5Prefix}…\n${t.sha1Prefix}…` : undefined}
-        >
-          {t.md5Prefix ? `${t.md5Prefix}…` : '—'}
-        </td>
-        <td>
-          <span className={`pill ${stateTone(t.state)}`}>{stateLabel(t.state)}</span>
-        </td>
-        <td>
-          <div className="act-row">
-            {/*
-             * 失败和已取消都能重试。
-             * 只在 failed 时显示「重试」的话，用户取消完就再也拉不回来了。
-             */}
-            {(t.state === 'failed' || t.state === 'canceled') && (
-              <button
-                className="btn tiny primary"
-                onClick={() => window.topensync?.retryTransfer(t.id)}
-              >
-                重试
-              </button>
+            ) : t.state === 'failed' ? (
+              /*
+               * 失败行不画进度条，改显示原因。
+               *
+               * 失败的任务进度恒为 0%，画一条空条 + 「0%」只会让人以为
+               * 「卡住没动」；而用户此刻唯一想知道的正是**为什么失败**。
+               * 这一格正好把空出来的空间给它，整行扫一眼就能看出
+               * 「163 个全是服务端拒绝连接」，不必逐条展开。
+               */
+              <span className="fail-brief" title={t.errorMsg ?? ''}>
+                {explainError(t.errorMsg).brief}
+              </span>
+            ) : (
+              <>
+                <div className="bar" style={{ width: '100%' }}>
+                  <i style={{ width: `${Math.round(t.progress * 100)}%` }} />
+                </div>
+                <span className="tiny mono">
+                  {/*
+                    * 只给百分比，不显示「分片 3/10」。
+                    *
+                    * 分片数是实现细节：用户关心的是「还要多久」，
+                    * 而 3/10 和 30% 说的是同一件事，多一个数字只是噪声。
+                    * 真正有用的附加信息是速度，所以留在后面。
+                    */}
+                  {Math.round(t.progress * 100)}%
+                  {t.speed > 0 && <span className="dim"> · {formatSpeed(t.speed)}</span>}
+                </span>
+              </>
             )}
-            {t.state !== 'done' && t.state !== 'canceled' && t.state !== 'skipped' && (
+          </td>
+          <td>
+            <span className={`pill ${stateTone(t.state)}`}>{stateLabel(t.state)}</span>
+          </td>
+          <td>
+            <div className="act-row">
+              {/*
+                * 失败和已取消都能重试。
+                * 只在 failed 时显示「重试」的话，用户取消完就再也拉不回来了。
+                */}
+              {(t.state === 'failed' || t.state === 'canceled') && (
+                <button
+                  className="btn tiny primary"
+                  onClick={() => window.topensync?.retryTransfer(t.id)}
+                >
+                  重试
+                </button>
+              )}
+              {t.state !== 'done' && t.state !== 'canceled' && t.state !== 'skipped' && (
+                <button
+                  className="btn tiny ghost"
+                  onClick={() => window.topensync?.cancelTransfer(t.id)}
+                >
+                  取消
+                </button>
+              )}
               <button
                 className="btn tiny ghost"
-                onClick={() => window.topensync?.cancelTransfer(t.id)}
+                title="从队列移除这条记录"
+                onClick={() => {
+                  const next = new Set(selected)
+                  next.add(t.id)
+                  setSelected(next)
+                }}
               >
-                取消
+                <Icon name="trash" />
               </button>
-            )}
-            <button
-              className="btn tiny ghost"
-              title="从队列移除这条记录"
-              onClick={() => {
-                const next = new Set(selected)
-                next.add(t.id)
-                setSelected(next)
-              }}
-            >
-              <Icon name="trash" />
-            </button>
-          </div>
-        </td>
-      </tr>
+            </div>
+          </td>
+        </tr>
+        {detail && <RowDetail rows={detail} colSpan={8} />}
+      </React.Fragment>
     )
   }
 
@@ -264,13 +393,8 @@ export function Queue(): React.JSX.Element {
         <div>
           <h1>传输队列</h1>
           <p className="sub">
-            上传、下载与跳过记录，逐项重试。
-            {/*
-             * 任务表有容量上限（三千条）。丢掉记录必须说出来——
-             * 否则用户会以为「刚才明明跳过了一堆，怎么找不到了」，
-             * 转而怀疑程序漏记了文件。完整的明细在日志页。
-             */}
-            {truncated && ' 记录过多，较早的已完成/已跳过条目已自动清理，完整明细见运行日志。'}
+            上传、下载与跳过记录，逐项重试。本页只保留最近一批记录；更早的完整历史见「同步历史」页。
+            {truncated && ' 记录过多，较早的已完成/已跳过条目已自动清理，完整明细见「同步历史」页。'}
           </p>
         </div>
       </div>
@@ -332,11 +456,52 @@ export function Queue(): React.JSX.Element {
         )}
       </div>
 
+      {/*
+       * 失败汇总条。
+       *
+       * 只在这一批里**有失败**时出现，不占常驻空间。
+       * 顺序：病因 → 数量 → 处置。用户扫一眼就知道
+       * 「这 163 条是同一件事造成的，该修的是服务端」，
+       * 而不是把 163 条逐一点开看。
+       */}
+      {stateCounts.failed > 0 && (
+        <div className="card fail-summary">
+          <div className="fs-head">
+            <Icon name="alert" />
+            <b>{stateCounts.failed} 项失败</b>
+            {failGroups.length > 1 && <span className="dim">共 {failGroups.length} 类原因</span>}
+            <span className="fs-spacer" />
+            <button
+              className="btn tiny primary"
+              onClick={() => {
+                for (const t of tasks) {
+                  if (t.state === 'failed') window.topensync?.retryTransfer(t.id)
+                }
+              }}
+            >
+              重试全部失败
+            </button>
+          </div>
+          <ul className="fs-list">
+            {failGroups.slice(0, 4).map((g) => (
+              <li key={g.brief}>
+                <span className="fs-count">{g.count}</span>
+                <span className="fs-brief">{g.brief}</span>
+                <span className="fs-advice">{g.advice}</span>
+              </li>
+            ))}
+            {failGroups.length > 4 && (
+              <li className="dim">还有 {failGroups.length - 4} 类原因，展开任意一行可看完整报错</li>
+            )}
+          </ul>
+        </div>
+      )}
+
       <div className="card table-card">
         <VirtualTable
           head={
             <tr>
-              <th style={{ width: '4%' }}>
+              <th style={{ width: 38 }}>
                 {/*
                  * 全选框常驻表头。
                  *
@@ -355,21 +520,20 @@ export function Queue(): React.JSX.Element {
                   />
                 </label>
               </th>
-              <th style={{ width: '24%' }}>文件</th>
-              <th style={{ width: '11%' }}>类别</th>
-              <th style={{ width: '8%' }}>大小</th>
-              <th style={{ width: '15%' }}>进度</th>
-              <th style={{ width: '14%' }}>哈希</th>
-              <th style={{ width: '9%' }}>状态</th>
-              <th style={{ width: '15%' }}>操作</th>
+              <th style={{ width: 30 }} />
+              <th>文件</th>
+              <th style={{ width: 78 }}>类别</th>
+              <th style={{ width: 96 }}>大小</th>
+              <th style={{ width: 160 }}>进度</th>
+              <th style={{ width: 92 }}>状态</th>
+              <th style={{ width: 120 }}>操作</th>
             </tr>
           }
           rowCount={shown.length}
+          rowHeight={rowHeight}
           renderRow={renderRow}
-          maxHeight={520}
-          empty={
-            tasks.length === 0 ? '队列为空' : '没有符合当前筛选条件的任务'
-          }
+          maxHeight={560}
+          empty={tasks.length === 0 ? '队列为空' : '没有符合当前筛选条件的任务'}
         />
       </div>
 
@@ -391,6 +555,17 @@ export function Queue(): React.JSX.Element {
         ]}
       />
     </section>
+  )
+}
+
+/** 类别列：一行标签，超过宽度时自动省略 */
+function Cell2Pill({ tone, label }: { tone: string; label: string }): React.JSX.Element {
+  return (
+    <div className="cell2">
+      <div className="cell2-l1">
+        <span className={`pill ${tone}`}>{label}</span>
+      </div>
+    </div>
   )
 }
 
@@ -480,4 +655,3 @@ function stateLabel(state: TransferTask['state']): string {
       return state
   }
 }
-

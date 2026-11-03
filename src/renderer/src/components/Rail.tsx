@@ -30,7 +30,10 @@ const GROUPS: { label: string; items: NavEntry[] }[] = [
   },
   {
     label: '诊断',
-    items: [{ key: 'logs', label: '运行日志', icon: 'terminal' }]
+    items: [
+      { key: 'history', label: '同步历史', icon: 'clock' },
+      { key: 'logs', label: '运行日志', icon: 'terminal' }
+    ]
   },
   {
     label: '设置',

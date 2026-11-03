@@ -3,7 +3,7 @@ import { Icon } from '../components/Icon'
 import type { PageKey } from '../App'
 import type { TransferTask } from '@shared/types'
 import { useAppStore } from '../store'
-import { formatSpeed } from '../format'
+import { formatSize, formatSpeed } from '../format'
 
 /**
  * 概览页。
@@ -229,8 +229,8 @@ export function Overview({ onNavigate }: { onNavigate: (k: PageKey) => void }): 
             当前速率
           </div>
           <div className="stat-val mono">{formatSpeed(speed?.current ?? 0)}</div>
-          <div className="stat-foot">
-            峰值 {formatSpeed(speed?.max ?? 0)} · 平均 {formatSpeed(speed?.avg ?? 0)}
+          <div className="stat-foot" title={`平均 ${formatSpeed(speed?.avg ?? 0)}`}>
+            已传 {formatSize(speed?.totalBytes ?? 0)} · 峰值 {formatSpeed(speed?.max ?? 0)}
           </div>
         </div>
         <div className="card stat">

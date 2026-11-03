@@ -18,6 +18,7 @@ import {
   relativizeRemote
 } from '../watcher/paths'
 import { RenameDetector, type RenameCandidate } from './rename'
+import { explainError } from '@shared/errors'
 import type {
   AppConfig,
   DiffKind,
@@ -48,14 +49,12 @@ export type EnqueueReason = 'watch' | 'diff' | 'recovery' | 'retry'
  * 任务表容量上限。
  *
  * 为什么要有上限：一次本地扫描会把**每个**文件都变成一条任务——
- * 六万个文件就是六万条。这个表原本无界增长，而它上面的每一个
- * 操作（按 id 查、按路径查、渲染层替换）都是线性或更好，
- * 但**渲染层每次收到一条更新都要遍历全表**，
- * 六万条 × 六万次 = 三十多亿次操作，界面必然失去响应。
+ * 六万个文件就是六万条。这个表无界增长的话，主进程内存跟着涨，
+ * 渲染层每次收到一条更新还要遍历全表，界面必然失去响应。
  *
- * 三千条足够回答「刚才在传什么、哪个失败了」——
- * 再往前的记录用户根本不会翻，翻也翻不过来。
- * 完整的跳过明细由日志页承载（日志按类别可筛，且落库）。
+ * 三千条足够回答「刚才在传什么、哪个失败了」。
+ * 更早的完整明细由**同步历史**承载——它永久落库、分页可查，
+ * 所以任务表淘汰旧记录不再意味着「记录丢失」。
  */
 export const MAX_TASKS = 3000
 
@@ -286,8 +285,21 @@ export class Planner {
    * 一批文件往往集中在少数几个目录里，命中率很高。
    *
    * 只缓存**文件**（目录不进缓存）：认领只关心同名文件。
+   *
+   * ⚠️ 必须限容量：整盘首次同步时，几万个文件分布在几万个远端目录里，
+   * 每个目录的完整文件列表都缓存进来就是几百万个字符串对象——
+   * 实测主进程内存被它吃到 2GB+。这个缓存是「批处理临时加速」性质，
+   * 不是永久索引，超过上限直接清空、下次按需重新 list 即可，
+   * 只影响一点性能，不影响正确性。
    */
   private readonly remoteDirCache = new Map<string, Map<string, number>>()
+  /**
+   * remoteDirCache 的目录数上限。
+   *
+   * 超过就整体清空：清空比 LRU 逐条踢更简单，且这个缓存的生命周期
+   * 本来就应该是一轮认领批处理，而不是跨整个会话。
+   */
+  private static readonly REMOTE_DIR_CACHE_LIMIT = 500
   /** 正在进行的目录列举：同一目录的并发请求合并成一次 */
   private readonly remoteDirPending = new Map<string, Promise<Map<string, number>>>()
   /**
@@ -658,7 +670,7 @@ export class Planner {
     }
 
     if (!exists) {
-      this.handleRemoval(relPath, config)
+      await this.confirmRemoval(relPath, config)
       return
     }
 
@@ -793,6 +805,20 @@ export class Planner {
         progress: 0,
         speed: 0,
         errorMsg: null
+      })
+      /*
+       * 有结论的跳过写进同步历史（永久落库）。
+       *
+       * 「本地未变」不记：那是每轮扫描都命中的常态，六万个文件每轮
+       * 都写一条会让历史表无限膨胀，且它本就不在任务表里留痕。
+       * 其余三种（远端哈希判重 / 远端同名同大小认领 / 文件消失）
+       * 都是「有个文件要处理、被判定不用传」，值得追溯。
+       */
+      this.opts.manifest.recordHistory({
+        kind: 'skip',
+        localPath: relPath,
+        size,
+        skipReason: reason
       })
     }
 
@@ -935,6 +961,10 @@ export class Planner {
         }
       } catch {
         // 目录读不到（不存在 / 无权限）→ 视作该目录下没有任何文件
+      }
+      // 缓存容量兜底：超过上限整体清空，防止整盘同步时缓存无限膨胀吃光内存
+      if (this.remoteDirCache.size >= Planner.REMOTE_DIR_CACHE_LIMIT) {
+        this.remoteDirCache.clear()
       }
       this.remoteDirCache.set(dir, entries)
       return entries
@@ -1386,7 +1416,14 @@ export class Planner {
 
     this.queuedPaths.add(item.relPath)
     this.hashQueue.push(item)
-    this.touch(item.relPath, { state: 'queued' })
+    /*
+     * 入队时就把大小带上。
+     *
+     * 入队前已经 probe 过一遍，大小是已知的——不带的话任务表里
+     * 这条记录的大小是 0，传输队列会显示成一整列「0 B」，
+     * 用户会以为这些文件都是空的（而且分不清「已知是 0」和「还没读」）。
+     */
+    this.touch(item.relPath, { state: 'queued', size: item.size })
     void this.pump()
   }
 
@@ -1417,6 +1454,19 @@ export class Planner {
         }
 
         while (uploadActive < uploadLimit && this.uploadQueue.length > 0) {
+          /*
+           * 大文件**不再串行**。
+           *
+           * 0.2.18 之前这里有一条「同一时间只允许一个大文件上传」的限制：
+           * 当时上传走 fetch，undici 会把整个 body 缓冲进 external 内存，
+           * 4 个 1GB 并发就是 5GB。那条限制是为了压住内存，代价是
+           * **并发数设成 4 也只跑一条**——用户看到的正是「明明 4 线程，
+           * 传输队列里却永远只有一条在上传」。
+           *
+           * 0.2.19 起上传改成 undici.request + Node 原生流，实测 500MB
+           * 文件只占 25MB 外部内存（真流式），缓冲问题不复存在，
+           * 这条串行限制就成了纯粹的性能损失，删掉。
+           */
           const item = this.uploadQueue.shift()!
           uploadActive++
           void this.runUploadStage(item)
@@ -1466,8 +1516,11 @@ export class Planner {
       manifest.setState(item.relPath, 'hashed', { md5: hashes.md5, sha1: hashes.sha1 })
       this.touch(item.relPath, {
         state: 'hashing',
+        size: item.size,
         md5Prefix: hashes.md5.slice(0, 8),
-        sha1Prefix: hashes.sha1.slice(0, 8)
+        sha1Prefix: hashes.sha1.slice(0, 8),
+        md5: hashes.md5,
+        sha1: hashes.sha1
       })
 
       // ── 远端重复判定 ──
@@ -1542,7 +1595,9 @@ export class Planner {
        * 这正是用户反馈「类型上传、状态已完成，哈希却显示 —」的根因。
        */
       md5Prefix: item.hashes?.md5.slice(0, 8) ?? undefined,
-      sha1Prefix: item.hashes?.sha1.slice(0, 8) ?? undefined
+      sha1Prefix: item.hashes?.sha1.slice(0, 8) ?? undefined,
+      md5: item.hashes?.md5 ?? undefined,
+      sha1: item.hashes?.sha1 ?? undefined
     })
 
     // upsertFile 把状态写成了 uploading——如果这期间被取消了，
@@ -1589,6 +1644,13 @@ export class Planner {
 
     if (result.ok) {
       this.touch(item.relPath, { state: 'done', progress: 1, speed: 0, errorMsg: null })
+      // 持久化到同步历史：这是「这个文件确实上传成功了」的权威追溯
+      this.opts.manifest.recordHistory({
+        kind: 'upload',
+        localPath: item.relPath,
+        remotePath,
+        size: item.size
+      })
       // 用带类别的回调，不要再调 onLog——两者都会写日志，会重复出一条
       this.opts.onLogDetail?.('info', `已上传 ${item.relPath} → ${remotePath}`, {
         category: 'upload',
@@ -1641,11 +1703,23 @@ export class Planner {
       attempts: item.attempts,
       errorMsg: result.error ?? '上传失败'
     })
-    this.opts.onLogDetail?.('error', `上传失败 ${item.relPath}：${result.error ?? '未知原因'}`, {
-      category: 'upload',
-      filePath: item.relPath,
-      remotePath
-    })
+    /*
+     * 日志带上人话的病因。
+     *
+     * `connect ECONNREFUSED 192.168.50.2:5244` 对用户等于没说；
+     * 前面加一句「服务端拒绝连接」，同一批失败的 160 多条日志
+     * 才有可读的共同点。原始报错照样保留在末尾，方便排查。
+     */
+    const brief = explainError(result.error).brief
+    this.opts.onLogDetail?.(
+      'error',
+      `上传失败（${brief}）${item.relPath}：${result.error ?? '未知原因'}`,
+      {
+        category: 'upload',
+        filePath: item.relPath,
+        remotePath
+      }
+    )
   }
 
   private handleFatal(item: QueueItem, err: unknown): void {
@@ -1677,7 +1751,10 @@ export class Planner {
 
     this.opts.manifest.setState(item.relPath, 'error', { errorMsg: message })
     this.touch(item.relPath, { state: 'failed', errorMsg: message })
-    this.opts.onLogDetail?.('error', `处理 ${item.relPath} 失败：${message}`, {
+    // 同样加一句人话病因：`UNKNOWN: unknown error, open 'Z:\...'`
+    // 这类 Node 原文对用户没有任何信息量，但对排查有用，所以两者都留。
+    const brief = explainError(message).brief
+    this.opts.onLogDetail?.('error', `处理 ${item.relPath} 失败（${brief}）：${message}`, {
       category: 'upload',
       filePath: item.relPath
     })
@@ -1790,6 +1867,17 @@ export class Planner {
     const controller = new AbortController()
     // 上一次累计接收量；用来把回调里的累计值换算成增量
     let lastReceived = 0
+    /*
+     * 速率的算法与上传保持一致：**滑动窗口的瞬时速率**。
+     *
+     * 「累计 ÷ 总耗时」只会算出一个平均值，前面慢一点就一路被拖着，
+     * 显示的数字跟眼前实际在跑的带宽对不上。
+     */
+    let lastEmitAt = startedAt
+    let lastEmitReceived = 0
+    let smoothSpeed = 0
+    /** 第一次回调立刻上报：进度条要马上动起来 */
+    let firstEmit = true
     try {
       await this.opts.client.downloadTo(item.remotePath, item.absPath, {
         signal: controller.signal,
@@ -1798,7 +1886,6 @@ export class Planner {
             controller.abort()
             return
           }
-          const elapsed = (Date.now() - startedAt) / 1000
           /*
            * 报**增量**字节，不是累计值。
            *
@@ -1808,11 +1895,31 @@ export class Planner {
           const delta = Math.max(0, received - lastReceived)
           lastReceived = received
           this.opts.onDownloadBytes?.(delta)
+
+          const now = Date.now()
+          const elapsed = now - lastEmitAt
+          const done = total > 0 && received >= total
+          /*
+           * 节流：任务更新没必要每个数据块都推。
+           *
+           * 一个 5GB 的文件按 64KB 回调是八万次，每次都 touch 一遍
+           * 等于把整个任务表翻新八万遍——渲染层跟不上，纯浪费。
+           * 120ms 一次视觉上就是连续滚动；最后一块必须上报，
+           * 否则进度会停在 99%。
+           */
+          if (!firstEmit && elapsed < 120 && !done) return
+
+          const instant = elapsed > 0 ? (received - lastEmitReceived) / (elapsed / 1000) : 0
+          smoothSpeed = smoothSpeed > 0 ? smoothSpeed * 0.6 + instant * 0.4 : instant
+          lastEmitAt = now
+          lastEmitReceived = received
+          firstEmit = false
+
           this.touch(item.relPath, {
             state: 'downloading',
             category: 'download',
             progress: total > 0 ? Math.min(1, received / total) : 0,
-            speed: elapsed > 0 ? received / elapsed : 0,
+            speed: smoothSpeed,
             size: total > 0 ? total : item.size
           })
         }
@@ -1893,6 +2000,13 @@ export class Planner {
       size,
       errorMsg: null
     })
+    // 持久化到同步历史：下载成功同样要能长期追溯
+    this.opts.manifest.recordHistory({
+      kind: 'download',
+      localPath: item.relPath,
+      remotePath: item.remotePath,
+      size
+    })
     // 用带类别的回调，不要再调 onLog——两者都会写日志，会重复出一条
     this.opts.onLogDetail?.('info', `已下载 ${item.remotePath} → ${item.relPath}`, {
       category: 'download',
@@ -1916,6 +2030,93 @@ export class Planner {
   }
 
   // ── 删除处理 ──────────────────────────────────────────
+
+  /**
+   * 确认「本地已删除」是否属实，再决定要不要动远端。
+   *
+   * 为什么不能直接信 watcher 的 unlink 事件：
+   *
+   * 同步根是**网络盘**（SMB/WebDAV 挂载）时，盘瞬断、服务端重启、
+   * 句柄超时都会让 chokidar 认为整棵树都被删了，一次性吐出上万条
+   * unlink。实测事故：22:50:57 出现大批
+   * `UNKNOWN: unknown error, stat 'Z:\...'`（盘读不到），两秒后
+   * 24,647 个文件被标成「已删除」，其中 927 个的**远端文件被真的移进了
+   * 回收站**——而本地文件一个都没少。
+   *
+   * 删除远端是不可逆的（进了回收站也要用户自己捞），所以这里宁可
+   * 漏判一次删除，也绝不凭一个事件就把用户还在的文件从远端抹掉。
+   *
+   * 判定规则：
+   * - stat 到文件 → 假事件，忽略，状态不动；
+   * - ENOENT / ENOTDIR → 真的没了，正常走删除；
+   * - 其它错误（UNKNOWN / EIO / EBUSY / EPERM …）→ 此刻盘读不到，
+   *   **不判定**，也不改状态，等下一轮扫描再比对。
+   */
+  private async confirmRemoval(relPath: string, config: AppConfig): Promise<void> {
+    const absPath = absolutize(config.syncRoot, relPath)
+    try {
+      const st = await stat(absPath)
+      if (st.isDirectory()) {
+        await this.handleDirEvent(relPath, true, config)
+        return
+      }
+      // 文件还在——盘抖造成的假 unlink
+      this.noteRemovalAnomaly('still_there', relPath, null)
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        this.handleRemoval(relPath, config)
+        return
+      }
+      // 盘此刻读不到：既不能当删除，也不能当存在
+      this.noteRemovalAnomaly('unreadable', relPath, code ?? (err as Error)?.message ?? '未知')
+    }
+  }
+
+  /**
+   * 删除事件的异常聚合。
+   *
+   * 盘断开会一次吐出上万条事件，逐条写日志会把运行日志彻底刷掉——
+   * 用户真正需要看到的是「盘可能掉了」这一条。这里 5 秒一窗口，
+   * 每个窗口只落一条，带累计计数。
+   */
+  private removalAnomaly = { at: 0, still: 0, unreadable: 0, code: '', sample: '' }
+
+  private noteRemovalAnomaly(kind: 'still_there' | 'unreadable', relPath: string, code: string | null): void {
+    const now = Date.now()
+    const a = this.removalAnomaly
+    if (kind === 'still_there') a.still++
+    else {
+      a.unreadable++
+      if (code) a.code = code
+    }
+    if (!a.sample) a.sample = relPath
+
+    if (now - a.at < 5000) return
+    a.at = now
+
+    if (a.still > 0) {
+      this.opts.onLogDetail?.(
+        'warn',
+        `收到删除事件但本地文件仍在，已忽略 ${a.still} 条（例如 ${a.sample}）——` +
+          '同步根可能是网络盘，盘抖时会产生假删除事件',
+        { category: 'system' }
+      )
+      a.still = 0
+      a.sample = ''
+    }
+    if (a.unreadable > 0) {
+      this.opts.onLogDetail?.(
+        'warn',
+        `本地盘读取失败（${a.code || '未知错误'}），${a.unreadable} 个删除事件无法确认，本次未处理——` +
+          '请检查网络盘/挂载盘是否已掉线，恢复后重新扫描即可',
+        { category: 'system' }
+      )
+      a.unreadable = 0
+      a.code = ''
+      a.sample = ''
+    }
+  }
 
   /**
    * 本地文件被删除。
@@ -2406,6 +2607,8 @@ export class Planner {
       speed: patch.speed ?? existing?.speed ?? 0,
       md5Prefix: patch.md5Prefix ?? existing?.md5Prefix ?? '',
       sha1Prefix: patch.sha1Prefix ?? existing?.sha1Prefix ?? '',
+      md5: patch.md5 !== undefined ? patch.md5 : (existing?.md5 ?? null),
+      sha1: patch.sha1 !== undefined ? patch.sha1 : (existing?.sha1 ?? null),
       errorMsg: patch.errorMsg !== undefined ? patch.errorMsg : (existing?.errorMsg ?? null),
       attempts: patch.attempts ?? existing?.attempts ?? 0,
       /*
@@ -2439,11 +2642,14 @@ export class Planner {
    *
    * 2. **只淘汰终态，且从最老的开始**。Map 的迭代序就是创建序，
    *    从头扫、遇到可淘汰的就删即可。失败与进行中的任务通过
-   *    `evictRank` 排除在外，永远不会被踢——丢掉失败的记录
+   *    `isEvictable` 排除在外，永远不会被踢——丢掉失败的记录
    *    等于把用户要处理的问题藏起来。
    *
    * 3. **必须回报被删的 id**。渲染层那份数组不会自己缩，
    *    不同步的话两边表格会越差越远。
+   *
+   * 被淘汰的 done / skipped 已经写进了 sync_history（持久化），
+   * 所以「从传输队列里消失」不再等于「记录丢失」——永久回看走同步历史页。
    */
   private evictIfOverflow(): void {
     if (this.tasks.size <= TASK_TABLE_LIMIT) return

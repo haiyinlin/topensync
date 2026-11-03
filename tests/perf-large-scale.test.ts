@@ -73,6 +73,8 @@ function makeTask(i: number, state: TransferTask['state']): TransferTask {
     speed: 0,
     md5Prefix: '',
     sha1Prefix: '',
+    md5: null,
+    sha1: null,
     errorMsg: null,
     attempts: 0
   }

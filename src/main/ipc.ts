@@ -1,6 +1,6 @@
 import { app, ipcMain, BrowserWindow } from 'electron'
 import type { Engine } from './engine'
-import type { AppConfig, DiffResolution, ScanKind } from '@shared/types'
+import type { AppConfig, DiffResolution, ScanKind, SyncHistoryKind } from '@shared/types'
 /**
  * IPC 通道注册。
  *
@@ -36,6 +36,11 @@ export function registerIpc(engine: Engine): void {
     engine.listFiles(opts ?? {}))
   ipcMain.handle('diffs:list', () => engine.listDiffs())
   ipcMain.handle('logs:list', (_e, limit: number) => engine.recentLogs(limit ?? 200))
+  ipcMain.handle(
+    'history:list',
+    (_e, opts: { kind?: SyncHistoryKind; limit?: number; offset?: number }) =>
+      engine.listHistory(opts ?? {})
+  )
   ipcMain.handle('tasks:list', () => engine.listTasks())
   ipcMain.handle('connection:check', () => engine.recheckConnection())
   ipcMain.handle('diagnostics:export', () => engine.exportDiagnostics())

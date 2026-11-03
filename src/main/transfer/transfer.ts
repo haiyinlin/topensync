@@ -20,6 +20,15 @@ import type { AppConfig } from '@shared/types'
  * 8MB 重传无所谓，20GB 重传不可接受。
  */
 
+/**
+ * 进度上报的最小间隔（毫秒）。
+ *
+ * 单次 PUT 的流式进度是按块回调的（64KB 一块），1GB 文件就是一万六千次。
+ * 每次都推一次任务更新没有意义——渲染层根本来不及画，中间那些会被
+ * 下一批覆盖掉。120ms 一次，视觉上仍然是连续滚动的。
+ */
+const PROGRESS_EMIT_MS = 120
+
 export interface TransferOptions {
   client: OpenListClient
   manifest: Manifest
@@ -149,7 +158,10 @@ export class Transfer {
     if (limit > 0 && size > limit) {
       const message = `文件大小 ${size} 字节超过单文件上限 ${limit} 字节`
       manifest.setState(req.relPath, 'error', { errorMsg: message })
-      manifest.log('error', `跳过超限文件：${req.relPath}（${message}）`, req.fileId, req.remotePath)
+      manifest.log('error', `跳过超限文件：${req.relPath}（${message}）`, req.fileId, req.remotePath, {
+        category: 'upload',
+        filePath: req.relPath
+      })
       return { ok: false, error: message, retryable: false }
     }
 
@@ -199,7 +211,8 @@ export class Transfer {
         'warn',
         `服务端不支持 multipart 分片上传，${req.relPath} 改用单次 PUT 上传`,
         req.fileId,
-        req.remotePath
+        req.remotePath,
+        { category: 'upload', filePath: req.relPath }
       )
     }
 
@@ -225,7 +238,10 @@ export class Transfer {
     if (!verdict.ok) {
       const message = `远端校验未通过：${verdict.detail ?? '内容与本地不一致'}`
       manifest.setState(req.relPath, 'error', { errorMsg: message })
-      manifest.log('error', `校验失败：${req.relPath}（${message}）`, req.fileId, req.remotePath)
+      manifest.log('error', `校验失败：${req.relPath}（${message}）`, req.fileId, req.remotePath, {
+        category: 'upload',
+        filePath: req.relPath
+      })
       return { ok: false, error: message, retryable: true, verify: { ok: false, detail: verdict.detail } }
     }
 
@@ -250,7 +266,10 @@ export class Transfer {
     manifest.markVerified(req.relPath)
 
     if (verdict.detail) {
-      manifest.log('warn', `校验说明：${req.relPath}（${verdict.detail}）`, req.fileId, req.remotePath)
+      manifest.log('warn', `校验说明：${req.relPath}（${verdict.detail}）`, req.fileId, req.remotePath, {
+        category: 'upload',
+        filePath: req.relPath
+      })
     }
 
     return { ok: true, verify: { ok: true, detail: verdict.detail } }
@@ -303,7 +322,15 @@ export class Transfer {
     } catch (err) {
       const message = describeError(err)
       manifest.setState(req.relPath, 'error', { errorMsg: message })
-      manifest.log('error', `上传失败：${req.relPath}（${message}）`, req.fileId, req.remotePath)
+      /*
+       * 这里**不写日志**。
+       *
+       * Planner.handleUploadResult 拿到 !ok 之后会写一条带 category 的
+       * error 日志；从前这里再写一条（`manifest.log` 不带 category，
+       * 于是落成 system），同一次失败在日志页出现两遍、类别还各是
+       * 一个——用户翻了 200 条以为有 200 个问题，其实只有 100 个。
+       * 错误原因的持久化交给 errorMsg，展示交给 Planner 那一条。
+       */
       return { ok: false, error: message }
     }
   }
@@ -336,7 +363,8 @@ export class Transfer {
         'warn',
         `远端同名文件正在下载，删除后重传：${req.remotePath}`,
         req.fileId,
-        req.remotePath
+        req.remotePath,
+        { category: 'upload', filePath: req.relPath }
       )
 
       // 删掉远端那份同名文件（remove 接受完整路径，内部会拆成目录+文件名）
@@ -348,7 +376,8 @@ export class Transfer {
           'warn',
           `删除远端同名文件失败，仍尝试重传：${req.remotePath}（${describeError(err)}）`,
           req.fileId,
-          req.remotePath
+          req.remotePath,
+          { category: 'upload', filePath: req.relPath }
         )
       }
 
@@ -381,36 +410,85 @@ export class Transfer {
      */
     await ioGovernor.run(async () => {
       const stream = createReadStream(req.absPath)
+      /*
+       * 兜住 open 阶段的异步错误（文件在上传前被删、盘掉线等）。
+       *
+       * createReadStream 的 open 是惰性的：直接传流给 undici 时，open 被
+       * 推迟到真正消费才发生。如果文件那时已经没了，open 的 ENOENT 会以
+       * unhandled 'error' 事件冒出来（没有监听器会崩主进程）。这里挂一个
+       * no-op 监听器把错误收住，真正的失败由 putFile 的 fetch 抛错来报告。
+       */
+      stream.on('error', () => {})
       try {
-        const body = Readable.toWeb(stream) as ReadableStream<Uint8Array>
         /*
-         * 单次 PUT 的流式进度。
+         * 直接传 Node 流，**不转 Readable.toWeb**。
          *
-         * 大文件在服务端不支持分片时只能走这条路，整段传输可能持续
-         * 几十秒到几分钟。`putFile` 的 onProgress 给的是**累计**字节，
-         * 这里换算成增量后喂给上层，总体速率（Engine.recordSpeed）才能
-         * 在传输期间实时更新，而不是等传完才一次性补一个天文数字。
+         * 单次 PUT 的大文件（服务端不支持分片时）走这里。以前把 Node 流
+         * 转成 Web ReadableStream 再喂给 fetch，undici 内部会缓冲 body
+         * （chunk 缓冲 + Buffer/ArrayBuffer 拷贝），external 内存涨到约
+         * 3.5 倍文件大小——1GB 的 mkv 直接吃掉 3GB+（实测内存 5GB 的根因）。
+         * 直接传 Node 原生流，undici 走 async iterable 路径，背压正确、
+         * 零缓冲，内存只留一个 64KB chunk。
+         *
+         * 字节计数在 putFile 里用 `data` 事件做（不进流转换层），
+         * 这里的 onProgress 只是把累计字节换算成速率喂给上层。
          */
         const startedAt = Date.now()
-        let lastSent = 0
-        await this.opts.client.putFile(req.remotePath, body, {
+        /*
+         * 速率的算法：**滑动窗口的瞬时速率**，不是「累计字节 ÷ 总耗时」。
+         *
+         * 以前用后者，界面上显示的其实是「从开始到现在的平均速率」：
+         * 传一个大文件时它会被前面的慢速（握手、首包）拖住，越传越"爬"，
+         * 而用户此刻想知道的正是「现在有多快」。尤其在
+         * 开始几十秒内数字明显偏低，看起来就像速率算错了。
+         *
+         * 现在每次上报都用「距上次上报的字节增量 ÷ 这段时长」，
+         * 再做指数平滑（0.6/0.4）滤掉单块抖动。
+         */
+        let lastEmitAt = startedAt
+        let lastEmitSent = 0
+        let prevSent = 0
+        let smooth = 0
+        let pendingDelta = 0
+        /** 第一次回调立刻上报：进度条要马上动起来，不能等 120ms */
+        let firstEmit = true
+        await this.opts.client.putFile(req.remotePath, stream, {
           size,
           md5,
           sha1,
           lastModifiedMs: Math.floor(mtimeMs),
           onProgress: (sent) => {
-            const elapsed = (Date.now() - startedAt) / 1000
+            const now = Date.now()
+            pendingDelta += sent - prevSent
+            prevSent = sent
+
+            /*
+             * 节流到 120ms 一次（第一次例外）。
+             *
+             * 64KB 一块的话，1GB 文件会产生一万六千次回调；每次都推一次
+             * 任务更新纯属浪费（任务批处理窗口才 80ms，中间那些全被覆盖）。
+             * 但**第一次和最后一块必须上报**：前者让进度条立刻动起来，
+             * 后者避免进度停在 99%。
+             */
+            const elapsed = now - lastEmitAt
+            if (!firstEmit && elapsed < PROGRESS_EMIT_MS && sent < size) return
+
+            const instant = elapsed > 0 ? (sent - lastEmitSent) / (elapsed / 1000) : 0
+            smooth = smooth > 0 ? smooth * 0.6 + instant * 0.4 : instant
             this.opts.onProgress?.({
               fileId: req.fileId,
               relPath: req.relPath,
               sent,
               total: size,
-              delta: sent - lastSent,
+              delta: pendingDelta,
               chunksDone: 0,
               chunksTotal: 0,
-              speed: elapsed > 0 ? sent / elapsed : 0
+              speed: smooth
             })
-            lastSent = sent
+            pendingDelta = 0
+            lastEmitAt = now
+            lastEmitSent = sent
+            firstEmit = false
           }
         })
       } finally {
@@ -476,7 +554,7 @@ export class Transfer {
     } catch (err) {
       const message = describeError(err)
       manifest.setState(req.relPath, 'error', { errorMsg: message })
-      manifest.log('error', `分片上传失败：${req.relPath}（${message}）`, req.fileId, req.remotePath)
+      // 同上：日志由 Planner 统一写一条，这里不重复
       return { ok: false, error: message }
     }
   }
@@ -511,7 +589,8 @@ export class Transfer {
         'warn',
         `远端同名文件正在下载，删除后重传：${req.remotePath}`,
         req.fileId,
-        req.remotePath
+        req.remotePath,
+        { category: 'upload', filePath: req.relPath }
       )
       try {
         await client.remove([req.remotePath])
@@ -520,7 +599,8 @@ export class Transfer {
           'warn',
           `删除远端同名文件失败，仍尝试重传：${req.remotePath}（${describeError(removeErr)}）`,
           req.fileId,
-          req.remotePath
+          req.remotePath,
+          { category: 'upload', filePath: req.relPath }
         )
       }
       await client.waitForGone(req.remotePath, 10_000)

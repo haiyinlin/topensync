@@ -59,6 +59,13 @@ const api = {
   listDiffs: (): Promise<DiffEntry[]> => ipcRenderer.invoke('diffs:list'),
   listLogs: (limit?: number): Promise<LogEntry[]> =>
     ipcRenderer.invoke('logs:list', limit ?? 200),
+  /** 分页列出同步历史（上传 / 下载 / 有结论的跳过） */
+  listHistory: (opts?: {
+    kind?: import('@shared/types').SyncHistoryKind
+    limit?: number
+    offset?: number
+  }): Promise<import('@shared/types').SyncHistoryEntry[]> =>
+    ipcRenderer.invoke('history:list', opts ?? {}),
   listTasks: (): Promise<TransferTask[]> => ipcRenderer.invoke('tasks:list'),
   checkConnection: (): Promise<ConnectionStatus> => ipcRenderer.invoke('connection:check'),
   /** 导出诊断包，返回生成的文件路径 */

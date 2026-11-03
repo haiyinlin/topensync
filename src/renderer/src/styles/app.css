@@ -529,8 +529,24 @@ textarea {
 }
 
 .card-head h2 {
+  /*
+   * 标题与图标之间要有间距。
+   *
+   * `<h2><Icon/> 标题文字</h2>` 里 svg 是行内替换元素，不设 flex 时
+   * 它和文字之间只有空白符的自然宽度（≈4px），而且在行盒里基线对齐，
+   * 图标会比文字低半个字——「文件清单」「远端对账」几处的标题都这样。
+   */
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 13px;
   font-weight: 500;
+}
+
+.card-head h2 .ic {
+  width: 14px;
+  height: 14px;
+  flex: none;
 }
 
 .hr {
@@ -728,6 +744,24 @@ textarea {
   padding: 10px 12px;
   border-bottom: 1px solid var(--line-soft);
   font-size: 12.5px;
+  /* 短字段（大小、时间、数字、徽章）默认一行显示，不再被折成两行。
+     长文本（如日志说明）在具体单元格用 .tbl td.wrap 覆盖回换行。 */
+  white-space: nowrap;
+}
+
+/* 需要换行的单元格（长说明文本等）覆盖回正常换行 */
+.tbl td.wrap {
+  white-space: normal;
+  word-break: break-word;
+}
+
+/* 单行省略：超长文本截断成「…」，完整内容放 title 悬停看。
+   用于日志说明这类长文本，避免换行把行高撑大。 */
+.tbl td.ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 0; /* 配合 table-layout 让省略生效 */
 }
 
 .tbl tbody tr:last-child td {
@@ -795,6 +829,313 @@ textarea {
 /* 远端位置与本地路径一致 → 压暗，让「不一致」的那些自己跳出来 */
 .path-rel.same {
   color: var(--tx2);
+}
+
+/* ── 两行单元格 ─────────────────────────────────────────
+ *
+ * 一列放不下就把信息分两层：主信息在上、次要信息在下。
+ * 行高 56px = 20（主行）+ 4（间距）+ 16（次行）+ 上下留白 16。
+ * 这套数字必须与 VirtualTable 的 ROW_HEIGHT 一致。
+ */
+.cell2 {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.cell2-l1 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 21px;
+  line-height: 21px;
+  /*
+   * 主行文字比正文（12.5px）大一档。
+   *
+   * 两行布局把每个单元格的内容拆成了「主信息 + 次信息」，
+   * 如果两行都用 12.5px，文件名会和灰扑扑的目录行一样重，
+   * 整体观感比 0.2 的单行布局小一号。
+   */
+  font-size: 13px;
+  color: var(--tx1);
+  min-width: 0;
+}
+
+.cell2-l1 .ic {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--tx3);
+}
+
+.cell2-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* 次行缩进到文件名起始位置（图标 14 + 间距 6），两行左边缘对齐 */
+.cell2-l2 {
+  height: 16px;
+  line-height: 16px;
+  font-size: 11.5px;
+  color: var(--tx3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.cell2-indent {
+  padding-left: 20px;
+}
+
+/*
+ * 行内的迷你标记（如「远端另存」）。
+ *
+ * 这类信息不该占一整列——几百行里只有少数几行有值，
+ * 单独开一列等于让 99% 的单元格空着。做成贴在小字上的角标，
+ * 只在需要时出现，悬停看具体内容。
+ */
+.mini-flag {
+  flex: none;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+  color: var(--amber);
+  background: var(--amber-bg);
+  border: 1px solid rgba(245, 165, 36, 0.22);
+  white-space: nowrap;
+}
+
+/* 行首的展开箭头：默认朝右，展开后转 90° 朝下 */
+.exp-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--tx3);
+  cursor: pointer;
+}
+
+.exp-btn:hover {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--tx1);
+}
+
+.exp-btn .ic {
+  width: 12px;
+  height: 12px;
+  transition: transform 0.15s ease;
+}
+
+.exp-btn.open .ic {
+  transform: rotate(90deg);
+}
+
+/* ── 失败原因 ──────────────────────────────────────────────
+ *
+ * 失败行的「进度」列改显示原因摘要：失败任务进度恒为 0%，
+ * 一条空进度条只会让人以为卡住了，而「为什么失败」才是
+ * 用户此刻唯一想知道的。单行截断，完整内容在 title 与展开区。
+ */
+.fail-brief {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  line-height: 1.35;
+  color: #ff7d84;
+}
+
+/* 失败汇总条：一眼看清「这些失败是不是同一个原因」 */
+.fail-summary {
+  padding: 12px 14px;
+  border-color: rgba(255, 108, 116, 0.28);
+  background: linear-gradient(180deg, rgba(255, 108, 116, 0.07), rgba(255, 108, 116, 0.02));
+}
+
+.fs-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.fs-head .ic {
+  width: 14px;
+  height: 14px;
+  color: #ff7d84;
+}
+
+.fs-head b {
+  color: #ff9aa0;
+  font-weight: 600;
+}
+
+.fs-spacer {
+  flex: 1;
+}
+
+.fs-list {
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.fs-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12px;
+  min-width: 0;
+}
+
+.fs-count {
+  flex: none;
+  min-width: 42px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: #ff9aa0;
+}
+
+.fs-brief {
+  flex: none;
+  min-width: 132px;
+  color: var(--tx1);
+}
+
+.fs-advice {
+  min-width: 0;
+  color: var(--tx3);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* ── 展开后的详情区 ─────────────────────────────────────
+ *
+ * 一个跨全部列的 <tr>，里面按「行 × 字段」铺开。
+ * 高度由 RowParts.detailHeight() 算好写到 style 上——
+ * 这里的所有尺寸（22 / 66 / 4 / 16）都与那个函数一一对应。
+ */
+.row-detail td {
+  padding: 0 12px;
+  /*
+   * 这个单元格里只有块级 div，没有裸文本。但 td 仍会生成一个行盒，
+   * 把行高算进内容高度——于是声明 64px 的详情行实测 64.5px，
+   * 虚拟滚动按 64 累计，展开几行后位置就偏了。line-height: 0 把它抹平，
+   * 子元素各自设置字号/行高，不受影响。
+   */
+  line-height: 0;
+  /*
+   * 这里**刻意不用 border**。
+   *
+   * 折叠边框模型下，给跨列的详情行加 1px 下边框，浏览器会把行高
+   * 算成 134.67 而不是 134——每多一个展开行，虚拟滚动的定位就偏一点。
+   * 用 inset 阴影画同一条分隔线，不参与布局计算，高度分毫不差。
+   */
+  border-bottom: none;
+  box-shadow: inset 0 -1px 0 var(--line-soft);
+  background: rgba(255, 255, 255, 0.014);
+}
+
+.row-detail:hover td {
+  background: rgba(255, 255, 255, 0.014);
+}
+
+.row-detail-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 0;
+}
+
+.row-detail-row {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  height: 22px;
+  min-width: 0;
+}
+
+.row-detail-row.tall {
+  align-items: flex-start;
+  height: 66px;
+  padding-top: 2px;
+}
+
+/*
+ * 详情区的键值对。
+ *
+ * ⚠️ 类名是 dl-item / dl-k / dl-v，**不要改回 .kv**。
+ *
+ * 0.3.0 一开始用的是 .kv / .kv-k / .kv-v，结果和「键值表」组件的
+ * 同名类撞车：那个 .kv 定义（`.kv { display:flex; flex-direction: column }`）
+ * 写在更后面，同特异度直接覆盖 —— 详情区从「横向 字段名|值」变成
+ * 纵向堆叠，值的宽度不再受容器约束，长路径直接横穿整张表、
+ * 压在相邻字段上。用户看到的就是「展开后样式不对、宽度也不对」。
+ * 详情区永远用 dl-* 前缀，与页面级组件解耦。
+ */
+.dl-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: 1 1 0;
+  min-width: 0;
+  /*
+   * 必须显式给行高。
+   *
+   * 外层 `.row-detail td` 设了 `line-height: 0`（用来消掉 td 行盒带来的
+   * 0.5px 高度误差），子元素**必须**自己把行高写回来——否则这里继承到 0，
+   * 值所在的行盒高度为 0，再叠上 `.dl-v` 的 `overflow: hidden`，
+   * 值就被整条裁掉，界面上只剩下一排孤零零的字段名。
+   *
+   * 用固定 px 而不是裸数字：字段名 11.5px、值 12px，若写成 `1.5`
+   * （比率继承）两者算出的行高不同，baseline 对齐会歪。
+   */
+  line-height: 18px;
+}
+
+.dl-k {
+  flex: none;
+  width: 56px;
+  font-size: 11.5px;
+  color: var(--tx3);
+}
+
+.dl-v {
+  /* 必须显式 flex + min-width，否则长路径按内容宽度撑开、溢出表格 */
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--tx2);
+}
+
+/* 长文本（错误信息、日志全文）允许换行，最多三行 */
+.row-detail-row.tall .dl-v {
+  white-space: normal;
+  word-break: break-all;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
 }
 
 /*
@@ -1454,6 +1795,19 @@ textarea {
   flex-wrap: wrap;
 }
 
+/*
+ * 按钮**不允许收缩**。
+ *
+ * `.act-row` 是 flex 容器，按钮默认 `flex: 0 1 auto` 可以被压到
+ * min-content——列宽紧一点时，图标和文字直接叠在一起（截图里
+ * 「下载」按钮的 ↓ 压在下字上）。让它不收缩，挤不下就换行，
+ * 换行至少还是可点的按钮。
+ */
+.act-row .btn {
+  flex: none;
+  white-space: nowrap;
+}
+
 .sub-toolbar {
   background: var(--panel);
   border-color: var(--line-soft);
@@ -1495,6 +1849,50 @@ textarea {
   margin-left: auto;
   flex: none;
   max-width: 46%;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--tx3);
+  text-align: right;
+}
+
+/*
+ * 普通筛选行（同步历史这类只有一组 chips 的行）。
+ *
+ * `.toolbar` 是 flex 容器，三个子项默认可收缩：
+ * - 标签被压窄 → 「方向」两个字竖着排（截图里的样子）；
+ * - chips 被压 → 「全部 500」后面直接接「上传 498」，挤成一坨；
+ * - 右侧长说明又不设上限 → 把上面两者一起挤没。
+ *
+ * 所以标签与 chips 一律不收缩，说明文字吃掉剩余宽度并允许折行。
+ */
+.toolbar .tb-label {
+  /*
+   * 图标与文字要对齐。
+   *
+   * `.tb-label` 的 flex 布局原本只写在 `.sub-toolbar` 里，普通工具栏
+   * （同步历史这类）拿到的是裸 div：svg 作为行内替换元素与文字之间
+   * 只隔一个空白符，还按基线对齐——看起来就是「图标贴着字、还低半格」。
+   */
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  white-space: nowrap;
+}
+
+.toolbar .tb-label .ic {
+  width: 14px;
+  height: 14px;
+}
+
+.toolbar .chips {
+  flex: none;
+}
+
+.toolbar .tb-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin-left: auto;
   font-size: 11.5px;
   line-height: 1.5;
   color: var(--tx3);
@@ -2050,41 +2448,100 @@ textarea {
 }
 
 /*
- * 行高必须固定。
+ * 自适应列（没有显式 width 的那一列）必须吃掉全部剩余宽度。
  *
- * 虚拟滚动靠「每行等高」推算可视区里该渲染哪些行；
- * 行高由内容决定的话，两行文字的哈希单元格会把整张表的
- * 位置算歪——滚动时行会跳、内容会重叠。
+ * `table-layout: fixed` 下，Chromium **不会**把「表格宽度 − 各固定列宽」
+ * 自动分给未指定宽度的列——它会退化成 min-content。实测：Queue 的
+ * 「文件」列在 1084px 宽的表格里只拿到 5px，整个文件名列被压成一条缝，
+ * 而且整行右侧空出 468px。用户看到的「内容显示的宽度也不对」
+ * 就是这一条。
+ *
+ * 显式写 width:100% 是 fixed 布局里「吃掉剩余」的正确写法：
+ * 只有一个这样的列时它拿到全部剩余；有多个则平分。
+ * 每个表都应**恰好有一个**不带 inline width 的 th。
+ * （Queue 文件 / Manifest 路径 / Logs 说明 / History 本地文件 /
+ *   Reconcile 路径——都是各表唯一的口径列。）
  */
-.vtable-tbl tbody tr {
-  height: 40px;
+.vtable-tbl thead th:not([style]) {
+  width: 100%;
 }
 
-.vtable-tbl tbody td {
-  height: 40px;
+/*
+ * 行高必须可知。
+ *
+ * 虚拟滚动靠每行的高度推算可视区里该渲染哪些行。
+ * 主行固定 56px（两行内容），展开的详情行由行内 style 给出高度，
+ * 两者都写进 VirtualTable 的前缀和——对不上就会出现
+ * 「滚动一格跳两行」或者底部露白。
+ */
+.vtable-tbl tbody tr.row-main {
+  height: 56px;
+}
+
+.vtable-tbl tbody tr.row-main td {
+  height: 56px;
   padding-top: 0;
   padding-bottom: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  vertical-align: middle;
+}
+
+/* 展开中的主行：给一点底色，暗示「下面那块属于我」 */
+.vtable-tbl tbody tr.row-main.expanded {
+  background: rgba(47, 216, 164, 0.045);
+}
+
+.vtable-tbl tbody tr.row-main.expanded td {
+  border-bottom-color: transparent;
 }
 
 /*
- * 勾选框列（每行第一列）禁用省略号。
+ * 勾选框列（每行第一列）禁用省略号——**回归点，别再改回去**。
  *
  * 数据行第一列只有 `label.batch-check > input[type=checkbox]`。
  * `<input>` 是替换元素，`appearance:none` 后 Chromium 仍会把它的
  * `value="on"` 当文本塞进 `<td>` 的文本流里，让这一列的
  * `scrollWidth` 比 `clientWidth` 宽出 9px——配合 `overflow:hidden +
- * text-overflow:ellipsis`，就在勾选框右侧渲染出一个「…」。
+ * text-overflow:ellipsis`，就在勾选框右侧渲染出一个「…」
+ * （用户看到的「每行前面三个点」）。
  *
- * 表头行 `<th>` 的 text-overflow 是 `clip`（`.tbl th` 的默认），
- * 所以只有数据行出现「…」——跟用户反馈完全吻合。
+ * ⚠️ 选择器必须写成 `tr.row-main > td:first-child`。
  *
- * 勾选框列根本不需要省略号，直接 clip 掉即可；方框与勾由
- * `::before` / `::after` 绘制，不受影响。
+ * 0.3.0 把每行改成两行布局时，加了
+ *   `.vtable-tbl tbody tr.row-main td { text-overflow: ellipsis }`
+ * 它的特异度是 (0,2,3)，**高于**原来的 `td:first-child` (0,2,2)，
+ * 于是这条 clip 被静默压掉，三个点又回来了。
+ * 这里补一条 (0,3,3) 的写法把它压住；改表格样式时请先确认
+ * 第一列的 `text-overflow` 仍是 clip。
  */
+.vtable-tbl tbody tr.row-main > td:first-child,
 .vtable-tbl tbody td:first-child {
   text-overflow: clip;
+}
+
+/* label 自己兜住溢出，避免 input 的 value 文本把格子撑宽 */
+.vtable-tbl tbody td:first-child .batch-check {
+  max-width: 100%;
+  overflow: hidden;
+}
+
+/*
+ * 装徽章的单元格不画省略号。
+ *
+ * 与勾选框列同一个坑：td 一溢出就吐一串「…」，而徽章是**定宽短标签**，
+ * 差几个像素时那串点看起来像徽章的一部分（用户报的就是「error 后面
+ * 还有三个点」）。徽章本身已经 `nowrap`，这里把 td 的省略号关掉，
+ * 真有超宽就让它自然溢出到 padding 里，绝不再多出一行点。
+ */
+.vtable-tbl tbody td:has(.pill) {
+  text-overflow: clip;
+}
+
+/* 徽章自己兜住超宽，避免把单元格撑开 */
+.vtable-tbl tbody td .pill {
+  max-width: 100%;
+  overflow: hidden;
 }
 
 /* 表头吸顶：滚动时列名始终可见 */
