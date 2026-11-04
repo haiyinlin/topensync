@@ -45,6 +45,8 @@ const CONFIG: AppConfig = {
     conflictPolicy: 'local-wins',
     remoteOnlyPolicy: 'record-only',
     autoFixLimit: 20,
+    // 与默认配置一致：远端已有同名同大小时认领，不再重复上传
+    adoptByNameAndSize: true,
     exclude: []
   }
 }
@@ -649,5 +651,86 @@ describe('只读对账（autoFix: false）', () => {
     // 关键：这是**实例状态**而非一次性参数的话，下面这次会被上一次污染
     await r.runNow()
     expect(onDiff).toHaveBeenCalled()
+  })
+})
+
+/**
+ * 尚未上传的文件也要参与比对。
+ *
+ * 用户反馈：「对账扫出来 60 个，一开同步又有 100 多个要传」。
+ * 根因是对账的 `expectedRemotePath` 只对 `state='synced'` 的行推路径，
+ * 856 个 pending + 3502 个 hashed 压根不参与比对——「远端缺什么」
+ * 这个答案永远少一截，两个数字当然对不上。
+ *
+ * 现在：所有非 deleted 的记录都推路径，类型按状态区分。
+ */
+describe('尚未上传的文件纳入对账', () => {
+  let dir: string
+  let manifest: Manifest
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'topensync-unsent-'))
+    manifest = new Manifest(join(dir, 'manifest.db'))
+  })
+
+  afterEach(() => {
+    manifest.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const seedPending = (): void => {
+    // 从没上传过：state=pending，remote_path 与 remote_size 都是空的
+    manifest.upsertFile({ localPath: 'sub/a.txt', localSize: 10, mtimeMs: 1, state: 'pending' })
+  }
+
+  const remoteWith = (size: number) =>
+    ({
+      list: vi.fn().mockImplementation(async (p: string) => ({
+        content:
+          p === '/quark-backup'
+            ? [{ name: 'sub', size: 0, modified: '', isDir: true }]
+            : p === '/quark-backup/sub'
+              ? [{ name: 'a.txt', size, modified: '2026-01-01T00:00:00Z', isDir: false }]
+              : [],
+        total: 1
+      })),
+      confirmMissing: vi.fn().mockResolvedValue(true),
+      move: vi.fn(),
+      remove: vi.fn()
+    }) as unknown as OpenListClient
+
+  const emptyRemote =
+    {
+      list: vi.fn().mockResolvedValue({ content: [], total: 0 }),
+      confirmMissing: vi.fn().mockResolvedValue(true),
+      move: vi.fn(),
+      remove: vi.fn()
+    } as unknown as OpenListClient
+
+  it('远端没有 → 记成「仅本地」，不再静默跳过', async () => {
+    seedPending()
+    await new Reconciler({ client: emptyRemote, manifest, config: CONFIG }).runNow()
+
+    const diffs = manifest.listUnresolvedDiffs()
+    expect(diffs).toHaveLength(1)
+    expect(diffs[0].kind).toBe('local_only')
+    expect(diffs[0].remotePath).toBe('/quark-backup/sub/a.txt')
+  })
+
+  it('远端已有同名同大小 → 认领为已同步，不产生差异（避免重复上传）', async () => {
+    seedPending()
+    await new Reconciler({ client: remoteWith(10), manifest, config: CONFIG }).runNow()
+
+    expect(manifest.listUnresolvedDiffs()).toHaveLength(0)
+    expect(manifest.getFile('sub/a.txt')?.state).toBe('synced')
+  })
+
+  it('远端同名但大小不同 → 判「内容不符」，不能因为 remote_size 为空就误判一切', async () => {
+    seedPending()
+    await new Reconciler({ client: remoteWith(99), manifest, config: CONFIG }).runNow()
+
+    const diffs = manifest.listUnresolvedDiffs()
+    expect(diffs).toHaveLength(1)
+    expect(diffs[0].kind).toBe('size_mismatch')
   })
 })

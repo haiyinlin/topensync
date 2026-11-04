@@ -513,9 +513,17 @@ export class Reconciler {
           continue
         }
 
-        // 两边都有：比对大小与修改时间
+        // 两边都有：比对大小
         const remoteMtime = parseModified(obj.modified)
-        if (local.remoteSize !== obj.size) {
+        /*
+         * 比对基准取「清单记录的远端大小」，没有记录就用本地大小。
+         *
+         * 直接拿 `local.remoteSize` 比会让 pending / hashed 记录
+         * （remoteSize 恒为 null）永远不等于任何数字，全部误判成
+         * 「内容不符」——它们的共同点是**从没传过**，不是大小不一致。
+         */
+        const baselineSize = local.remoteSize ?? local.localSize
+        if (baselineSize !== obj.size) {
           // 正在上传（远端还是半截）→ 不是差异，是本轮不该看它
           if (this.opts.isTransferInFlight?.(local.localPath)) {
             skippedInFlight++
@@ -554,6 +562,33 @@ export class Reconciler {
            * 还是满屏「未校验」，会以为对账没跑（真实反馈）。
            */
           manifest.confirmRemotePresence(local.localPath, remotePath)
+
+          /*
+           * 从未同步过的记录，远端却已经有同名同大小的文件 → 认领。
+           *
+           * 典型场景：另一台设备刚传完，本机清单还停在 pending；
+           * 或者上次上传成功但清单没来得及落库。不认领的话，
+           * 同步队列会把它再传一遍，远端就多出一份完全相同的副本。
+           *
+           * 只信「相对路径 + 大小」两个条件，所以 verify_level 记 'size'，
+           * synced_md5/sha1 保持 NULL（没读内容，不能谎称哈希确认）。
+           */
+          if (local.state !== 'synced' && config.remoteScan.adoptByNameAndSize) {
+            const adopted = manifest.adoptRemote({
+              localPath: local.localPath,
+              localSize: local.localSize,
+              mtimeMs: local.mtimeMs,
+              remotePath,
+              remoteSize: obj.size
+            })
+            if (adopted) {
+              manifest.log(
+                'info',
+                `远端已有同名同大小文件 ${remotePath}，已认领为已同步（未校验内容）`
+              )
+            }
+          }
+
           /*
            * 这条路径以前可能被记过「远端缺失」或「大小不符」，现在两侧一致了。
            * 不清掉的话，它以后每轮对账都被算进「待补传」——用户按数字去传，
@@ -585,26 +620,40 @@ export class Reconciler {
           continue
         }
 
-        // ⚠️ 「远端没有」这个结论必须复核后才能成立。
-        //
-        // OpenList 的目录列表是快照缓存，`refresh:true` 会用夸克侧当时的
-        // 真实列表整体替换缓存。若某个文件还没在夸克落盘
-        //（PUT 返回 200 只表示 OpenList 收下了字节流，夸克侧要再过约 1 秒），
-        // 它会被这次刷新从缓存里抹掉——于是「刚上传成功的文件」被误判成丢失。
-        //
-        // 误判的后果是重传：白白再上行一遍。更糟的是这会形成死循环
-        // （上传 → 校验 → 对账判缺失 → 重传 → …）。
-        //
-        // 所以这里刷新父目录后再确认一次：确实不在才算真的缺失。
-        if (!(await this.opts.client.confirmMissing(remotePath))) {
-          // 复核后其实还在 → 是缓存假阴性，不算差异
-          continue
+        /*
+         * 差异类型看**状态**：
+         *
+         * - `synced` → `missing_remote`：本来远端有、现在没了，是「丢失」，
+         *   需要重新上传补回去（这类才该自动/一键修复）
+         * - 其余（pending / hashed / error / local_only）→ `local_only`：
+         *   本地有、还没传上去。它本来就排在同步队列里，
+         *   对账只负责把它**列出来**，让「远端缺什么」的数字对得上，
+         *   不在这里动手（否则会和同步流程抢同一个文件）
+         */
+        const kind: DiffKind = local.state === 'synced' ? 'missing_remote' : 'local_only'
+
+        /*
+         * 只有「曾经传过」的才值得复核。
+         *
+         * `missing_remote` 必须复核：OpenList 的目录列表是快照缓存，
+         * 刷新会把还没在夸克侧落盘的文件抹掉，于是「刚上传成功的文件」
+         * 被判成丢失 → 重传 → 再判丢失，形成死循环。
+         * `confirmMissing` 会刷新父目录再确认一次（一次远端请求）。
+         *
+         * 但从未上传过的文件（local_only）本来就要传，多列一条没有代价；
+         * 四千多个 pending/hashed 各发一次请求，只会让对账白白多跑几分钟。
+         */
+        if (kind === 'missing_remote') {
+          if (!(await this.opts.client.confirmMissing(remotePath))) {
+            // 复核后其实还在 → 是缓存假阴性，不算差异
+            continue
+          }
         }
 
-        // 同一路径上旧的「大小不符」不再成立：现在的事实是远端整个没有
-        manifest.closeDiffsForPath(local.localPath, 'missing_remote')
+        // 同一路径上别的类型不再成立：现在的事实是远端整个没有
+        manifest.closeDiffsForPath(local.localPath, kind)
         const entry = manifest.recordDiff({
-          kind: 'missing_remote',
+          kind,
           localPath: local.localPath,
           remotePath,
           localSize: local.localSize,
@@ -614,7 +663,7 @@ export class Reconciler {
         })
         diffCount++
         this.opts.onDiffRecorded?.(entry)
-        if (this.autoFixThisRun) {
+        if (this.autoFixThisRun && kind === 'missing_remote') {
           this.opts.onDiff?.({
             kind: 'missing_remote',
             localPath: local.localPath,
@@ -675,12 +724,20 @@ export class Reconciler {
    *
    * 远端路径是确定的（远端根 + 相对路径），缺了就按这个推出来。
    *
-   * 只对「声称自己已同步」的行推：pending / error / local_only 这些
-   * 本来就没承诺远端有这份文件，推出来只会制造假差异。
+   * **所有状态都推**（deleted 除外）。
+   *
+   * 早先只推 `synced`，理由是「没同步过就不该承诺远端有」。但这让
+   * 「远端到底缺什么」这个答案永远少一截：本地扫描刚扫出来的
+   * 854 个 pending、3502 个 hashed 压根不参与比对，用户看到对账
+   * 只有 60 条，一开同步冒出 100 多个要传——两个数字当然对不上。
+   *
+   * 状态决定的是「差异类型」，不是「要不要看」：
+   * - `synced` + 远端没有 → `missing_remote`（传过又没了，最危险）
+   * - 其余 + 远端没有 → `local_only`（本地有、还没传上去）
    */
   private expectedRemotePath(local: FileEntry, root: string): string | null {
     if (local.remotePath) return local.remotePath
-    if (local.state !== 'synced') return null
+    if (local.state === 'deleted') return null
     return joinRemotePath(root, local.localPath)
   }
 

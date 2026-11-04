@@ -1764,12 +1764,29 @@ textarea {
   flex: none;
 }
 
+/*
+ * 三段数字里的每一段都可点（点哪个就筛到哪一类）。
+ * 所以这里既要能当 div 排版，也要能当 button 用：把 button 的
+ * 默认边框/背景/字体全部抹掉，只保留栅格与分隔线。
+ */
 .rf-item {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 0 14px;
+  padding: 4px 14px;
+  border: none;
   border-right: 1px solid var(--line-soft);
+  border-radius: 6px 0 0 6px;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+button.rf-item:hover {
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .rf-item:last-child {

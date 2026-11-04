@@ -153,27 +153,31 @@ export function Reconcile(): React.JSX.Element {
   }, [diffs])
 
   /**
-   * 「远端缺了什么」—— 需要把本地那份补上去的全部差异。
+   * 「远端缺了什么」—— 分两类，因为处置方式不同。
    *
-   * 三类都算：
-   * - missing_remote：远端没有这个路径
-   * - size_mismatch：远端有同名但大小不同（按「名称 + 大小」判，就是不一致）
-   * - local_only：本地有、从没传过
-   *
-   * 按 kind 分组是因为处置语义词不同（重新上传 / 覆盖远端），
-   * 但底层都是把本地文件传上去；结果摘要要合并成一条给用户看。
+   * - `missing` + `mismatch`：曾经传过、远端现在没有或大小不对。
+   *   这是「丢失」，要在这里点上传补回去。
+   * - `unsent`（local_only）：本地有、还没传上去。它本来就排在同步队列里，
+   *   开始同步就会传；这里只把它**列出来**，让「远端缺什么」的数字对得上
+   *   （以前对账只统计 synced 的记录，用户看到 60 条、一开同步冒出 100 多，
+   *   两个数字当然对不上）。
    */
-  const pendingUpload = useMemo(() => {
-    const need = diffs.filter(
-      (d) => d.kind === 'missing_remote' || d.kind === 'size_mismatch' || d.kind === 'local_only'
-    )
+  const remoteGap = useMemo(() => {
+    const missing = diffs.filter((d) => d.kind === 'missing_remote')
+    const mismatch = diffs.filter((d) => d.kind === 'size_mismatch')
+    const unsent = diffs.filter((d) => d.kind === 'local_only')
+    const bytesOf = (arr: typeof diffs): number => arr.reduce((a, d) => a + (d.localSize ?? 0), 0)
     return {
-      count: need.length,
-      bytes: need.reduce((a, d) => a + (d.localSize ?? 0), 0),
+      missingCount: missing.length,
+      mismatchCount: mismatch.length,
+      unsentCount: unsent.length,
+      repairCount: missing.length + mismatch.length,
+      repairBytes: bytesOf(missing) + bytesOf(mismatch),
+      totalBytes: bytesOf(missing) + bytesOf(mismatch) + bytesOf(unsent),
       /** 远端根本没有 → 重新上传 */
-      newIds: need.filter((d) => d.kind !== 'size_mismatch').map((d) => d.id),
+      newIds: missing.map((d) => d.id),
       /** 远端有但大小不对 → 覆盖 */
-      mismatchIds: need.filter((d) => d.kind === 'size_mismatch').map((d) => d.id)
+      mismatchIds: mismatch.map((d) => d.id)
     }
   }, [diffs])
 
@@ -499,24 +503,37 @@ export function Reconcile(): React.JSX.Element {
             补传远端缺失
           </div>
           <p className="rescan-sub">
-            按「相对路径 + 大小」比对本地清单与远端。扫描只读、不改动任何文件；
-            确认后才会把缺的传上去。
+            按「相对路径 + 大小」比对本地清单与远端。扫描只读、不改动任何文件。
+            「尚未上传」那批本来就排在同步队列里，开始同步会自动传，这里列出来是为了让数字对得上。
           </p>
         </div>
 
         <div className="rescan-facts">
-          <div className="rf-item">
+          {/* 数字可直接点：点哪个就筛到哪一类，省得再去下面找 chip */}
+          <button
+            className="rf-item"
+            onClick={() => setFilter('missing_remote')}
+            title="只看远端缺失"
+          >
             <span className="rf-k">远端缺失</span>
-            <b className="mono rf-v">{counts.missing_remote ?? 0}</b>
-          </div>
-          <div className="rf-item">
+            <b className="mono rf-v">{remoteGap.missingCount}</b>
+          </button>
+          <button
+            className="rf-item"
+            onClick={() => setFilter('size_mismatch')}
+            title="只看大小不符"
+          >
             <span className="rf-k">大小不符</span>
-            <b className="mono rf-v">{counts.size_mismatch ?? 0}</b>
-          </div>
+            <b className="mono rf-v">{remoteGap.mismatchCount}</b>
+          </button>
+          <button className="rf-item" onClick={() => setFilter('local_only')} title="只看尚未上传">
+            <span className="rf-k">尚未上传</span>
+            <b className="mono rf-v">{remoteGap.unsentCount}</b>
+          </button>
           <div className="rf-item">
-            <span className="rf-k">待传合计</span>
+            <span className="rf-k">合计大小</span>
             <b className="mono rf-v">
-              {pendingUpload.bytes > 0 ? formatSize(pendingUpload.bytes) : '—'}
+              {remoteGap.totalBytes > 0 ? formatSize(remoteGap.totalBytes) : '—'}
             </b>
           </div>
         </div>
@@ -529,25 +546,25 @@ export function Reconcile(): React.JSX.Element {
             title="列举远端整棵树并与本地清单比对；只读，不会上传或删除任何文件"
           >
             <Icon name="diff" />
-            {reconciling ? '扫描中…' : pendingUpload.count > 0 ? '重新扫描远端' : '扫描远端并比对'}
+            {reconciling ? '扫描中…' : remoteGap.repairCount > 0 ? '重新扫描远端' : '扫描远端并比对'}
           </button>
-          {pendingUpload.count > 0 && (
+          {remoteGap.repairCount > 0 && (
             <button
               className="btn primary"
               disabled={bulkBusy || reconciling}
-              title="把上面这些文件按「本地为准」补传到远端"
+              title="把「远端缺失」和「大小不符」的文件按本地版本补传到远端；尚未上传的那批会在开始同步后自动传"
               onClick={() =>
                 void runGroups(
                   [
-                    { ids: pendingUpload.newIds, resolution: 'uploaded' },
-                    { ids: pendingUpload.mismatchIds, resolution: 'overwritten' }
+                    { ids: remoteGap.newIds, resolution: 'uploaded' },
+                    { ids: remoteGap.mismatchIds, resolution: 'overwritten' }
                   ],
                   '补传远端缺失'
                 )
               }
             >
               <Icon name="upload" />
-              {bulkBusy ? '上传中…' : `上传这 ${pendingUpload.count} 个文件`}
+              {bulkBusy ? '上传中…' : `补传这 ${remoteGap.repairCount} 个文件`}
             </button>
           )}
         </div>
@@ -589,7 +606,9 @@ export function Reconcile(): React.JSX.Element {
       </div>
 
       <div className="grid diff-grid">
-        {(['missing_remote', 'remote_only', 'size_mismatch'] as DiffKind[]).map((kind) => (
+        {(
+          ['missing_remote', 'local_only', 'size_mismatch', 'remote_only'] as DiffKind[]
+        ).map((kind) => (
           <div className={`card dstat ${KIND_CARD_CLASS[kind]}`} key={kind}>
             <div className="dstat-head">
               <Icon
@@ -598,7 +617,9 @@ export function Reconcile(): React.JSX.Element {
                     ? 'alert'
                     : kind === 'remote_only'
                       ? 'cloud-check'
-                      : 'overwrite'
+                      : kind === 'local_only'
+                        ? 'upload'
+                        : 'overwrite'
                 }
               />
               {KIND_META[kind].label}

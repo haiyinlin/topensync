@@ -176,8 +176,13 @@ describe('对账：正在传输的文件不计为差异', () => {
 
     const res = await rec.runNow()
 
+    /*
+     * 这条记录是 `pending`（从没传过），所以类型是「仅本地」而不是
+     * 「远端缺失」——后者专指「传过、后来没了」。
+     * 但它照样要被列出来，否则「远端缺什么」的统计会少一截。
+     */
     const diffs = manifest.listUnresolvedDiffs()
-    expect(diffs.filter((d) => d.kind === 'missing_remote')).toHaveLength(1)
+    expect(diffs.filter((d) => d.kind === 'local_only')).toHaveLength(1)
     expect(res.skippedInFlight).toBe(0)
   })
 })
