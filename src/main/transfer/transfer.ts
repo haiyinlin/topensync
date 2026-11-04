@@ -120,6 +120,15 @@ export interface UploadRequest {
 }
 
 export class Transfer {
+  /**
+   * 「服务端没有 /multipart 路由」这件事只值得说一次。
+   *
+   * 以前每个大文件都写一条 warn，08:07 那一分钟里连刷十几条——
+   * 用户看到满屏「不支持 multipart」会以为出错了，其实只是这个
+   * OpenList 构建没实现该路由，功能上已自动退化为单次 PUT。
+   */
+  private multipartDowngradeLogged = false
+
   constructor(private readonly opts: TransferOptions) {}
 
   /**
@@ -206,13 +215,16 @@ export class Transfer {
     // 这类服务端退化为单次 PUT（实测 12MB 单次 PUT 可正常落地）。
     const wantMultipart = size > config.singlePutMaxBytes
     const multipartOk = wantMultipart && (await this.opts.client.probeMultipart())
-    if (wantMultipart && !multipartOk) {
+    if (wantMultipart && !multipartOk && !this.multipartDowngradeLogged) {
+      this.multipartDowngradeLogged = true
       manifest.log(
         'warn',
-        `服务端不支持 multipart 分片上传，${req.relPath} 改用单次 PUT 上传`,
+        `服务端没有分片上传路由（/multipart），所有大于 ${Math.round(
+          config.singlePutMaxBytes / 1024 / 1024
+        )}MB 的文件都改用单次 PUT，中断后需要从头重传。本条只提示一次。`,
         req.fileId,
         req.remotePath,
-        { category: 'upload', filePath: req.relPath }
+        { category: 'system', filePath: req.relPath }
       )
     }
 

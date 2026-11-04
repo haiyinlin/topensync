@@ -828,3 +828,69 @@ describe('手动处置差异的准入', () => {
     }
   })
 })
+
+/**
+ * 服务端整体连不上时的熔断。
+ *
+ * 事故现场（2026-11-04 07:56 起）：OpenList 挂了，程序继续一个文件接
+ * 一个文件地试，两小时刷出 1123 条一模一样的 `connect ECONNREFUSED`，
+ * 把日志表冲得只剩这一句。而重试还是假的——失败项被推到队尾，
+ * 新文件又源源不断进来，1123 个文件里 1121 个只试过 1 次。
+ */
+describe('服务端连不上时的上传熔断', () => {
+  it('不消耗重试次数、不按文件失败记账、日志只写一条', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'topensync-gate-'))
+    const syncRoot = join(dir, 'sync')
+    require('fs').mkdirSync(syncRoot, { recursive: true })
+    const manifest = new Manifest(join(dir, 'manifest.db'))
+
+    const logs: Array<{ level: string; message: string }> = []
+    const upload = vi.fn().mockResolvedValue({
+      ok: false,
+      error: 'OpenList PUT /api/fs/put 请求失败：connect ECONNREFUSED 192.168.50.2:5244'
+    })
+
+    const planner = new Planner({
+      manifest,
+      transfer: { upload } as unknown as Transfer,
+      client: {
+        mkdir: vi.fn().mockResolvedValue(undefined),
+        move: vi.fn(),
+        remove: vi.fn()
+      } as unknown as OpenListClient,
+      getConfig: () => ({ ...CONFIG, syncRoot }),
+      onLogDetail: (level, message) => logs.push({ level, message })
+    })
+    planner.start()
+
+    try {
+      const names = ['g1.txt', 'g2.txt', 'g3.txt']
+      for (const n of names) writeFileSync(join(syncRoot, n), 'x'.repeat(64))
+      for (const n of names) await planner.handleEvent(n, true)
+      await settle(900)
+
+      // ① 文件不该被判死：服务端的问题不是这些文件的错
+      //    （pending = 已退回队列；hashed = 哈希算完了在等上传，都是活着的中间态）
+      for (const n of names) {
+        expect(['pending', 'hashed'], `${n} 应停在待上传状态`).toContain(
+          manifest.getFile(n)?.state
+        )
+      }
+
+      // ② 不能出现「第 1/3 次」这种按文件计的重试：那说明闸门没拦住
+      expect(logs.filter((l) => l.message.includes('将重试'))).toHaveLength(0)
+
+      // ③ 只留一条可读的暂停说明
+      const paused = logs.filter((l) => l.message.includes('上传已暂停'))
+      expect(paused).toHaveLength(1)
+      expect(paused[0].message).toContain('服务恢复后会继续')
+
+      // ④ 调用次数受熔断约束：三个文件各试一次就停，不该反复打
+      expect(upload.mock.calls.length).toBeLessThanOrEqual(3)
+    } finally {
+      planner.stop()
+      manifest.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})

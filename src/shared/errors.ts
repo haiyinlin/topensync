@@ -184,3 +184,25 @@ export function explainError(message: string | null | undefined): ErrorHint {
 export function errorBrief(message: string | null | undefined): string {
   return explainError(message).brief
 }
+
+/**
+ * 这个错误是不是「服务端整体连不上」。
+ *
+ * 与「某个文件传失败」要分开处理：单个文件失败该重试该文件，
+ * 服务端连不上则重试谁都没用——一千个文件挨个试三遍，只会把日志表
+ * 刷满同一个错误，把真正有用的那几条冲掉。
+ *
+ * 判定要**严**：只认「连接层面根本不通」的几种。像 `ECONNRESET`
+ * 这种单条连接被掐断（服务端偶尔会这样）不算整体不可用——
+ * 把它算进去，网络稍微抖一下就会误触发暂停。
+ *
+ * 注意 502/504 算：那说明前面的反代还活着、后面的 OpenList 没起来，
+ * 与 ECONNREFUSED 是同一件事的两个阶段。
+ */
+export function isConnectivityError(message: string | null | undefined): boolean {
+  const text = (message ?? '').trim()
+  if (!text) return false
+  return /ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|upstream connect failed|502 bad gateway|504 gateway time-?out/i.test(
+    text
+  )
+}

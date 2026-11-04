@@ -18,7 +18,7 @@ import {
   relativizeRemote
 } from '../watcher/paths'
 import { RenameDetector, type RenameCandidate } from './rename'
-import { explainError } from '@shared/errors'
+import { explainError, isConnectivityError } from '@shared/errors'
 import type {
   AppConfig,
   DiffKind,
@@ -245,6 +245,26 @@ export class Planner {
   private readonly downloadQueue: DownloadItem[] = []
   private readonly deleteQueue: DeleteItem[] = []
   /**
+   * 上传熔断：服务端整体连不上时暂停取任务，别把队列挨个耗光。
+   *
+   * 事故现场：OpenList 在 07:56 挂了，程序继续一个文件接一个文件地试，
+   * 两小时刷出 1123 条一模一样的 `connect ECONNREFUSED`，把日志表
+   * 冲得只剩这一句——连「监控出错 ECONNRESET」「远端目录列举失败」
+   * 这些真正说明盘也出问题的记录都被挤走了。
+   *
+   * 更糟的是重试是**假**的：失败项被推回队列尾部，而新文件还在源源不断
+   * 进来，1123 个文件里 1121 个只试过 1 次，第 2/3 次永远轮不到。
+   *
+   * 所以改成：连续 2 次连接类失败 → 暂停上传，秒级退避（5s→60s，
+   * 指数增长），到期自动重试；单个任务的 attempts 不增加（这不是文件的错）。
+   */
+  private connFailStreak = 0
+  private offlineUntil = 0
+  private offlineBackoffMs = 2_500
+  private offlineTimer: NodeJS.Timeout | null = null
+  /** 熔断日志限流：每 60 秒最多一条，否则它自己又会刷屏 */
+  private offlineLoggedAt = 0
+  /**
    * 本地事件队列（进 planner 的入口闸门）。
    *
    * 每条事件是一次「stat + 查清单 + 可能写库」，本身不重，
@@ -371,6 +391,12 @@ export class Planner {
       clearInterval(this.removalTimer)
       this.removalTimer = null
     }
+    if (this.offlineTimer) {
+      clearTimeout(this.offlineTimer)
+      this.offlineTimer = null
+    }
+    this.offlineUntil = 0
+    this.connFailStreak = 0
   }
 
   /**
@@ -1505,6 +1531,8 @@ export class Planner {
         }
 
         while (uploadActive < uploadLimit && this.uploadQueue.length > 0) {
+          // 熔断期内不取新任务：服务端都连不上，取出来也只是再刷一条同样的错
+          if (Date.now() < this.offlineUntil) break
           /*
            * 大文件**不再串行**。
            *
@@ -1694,6 +1722,8 @@ export class Planner {
     }
 
     if (result.ok) {
+      // 成功即视为服务已恢复：清熔断、把退避重置回起点
+      this.clearUploadGate()
       this.touch(item.relPath, { state: 'done', progress: 1, speed: 0, errorMsg: null })
       // 持久化到同步历史：这是「这个文件确实上传成功了」的权威追溯
       this.opts.manifest.recordHistory({
@@ -1720,6 +1750,19 @@ export class Planner {
      * 句柄枯竭期里，文件就被判死了，而盘其实几秒后就恢复了。
      */
     if (isResourceExhaustedMessage(result.error) && this.requeueAfterFdCooldown(item)) {
+      return
+    }
+
+    /*
+     * 服务端整体连不上 → 进熔断，不按「这个文件失败了」处理。
+     *
+     * 与句柄耗尽同理：这不是文件的错。若按普通重试走，会出现两个后果：
+     * 1) 每个文件都要吃满 3 次尝试，日志刷成一片同一个错误；
+     * 2) 失败项被推到 hashQueue 队尾，而新文件还在涌入，重试永远轮不到
+     *    （实测 1123 个失败文件里 1121 个只试过 1 次）。
+     * 换成「放回队首 + 全局暂停 + 到期自动重试」，服务一恢复就接着传。
+     */
+    if (isConnectivityError(result.error) && this.gateUploads(item, result.error ?? '服务端连不上')) {
       return
     }
 
@@ -1773,6 +1816,93 @@ export class Planner {
     )
   }
 
+  /**
+   * 服务端连不上：把任务放回队首、暂停上传、到期再试。
+   *
+   * 返回 `true` 表示已接管这次失败（调用方不要再走普通重试）。
+   * 返回 `false` 只在 `running === false`（正在停止）时出现。
+   */
+  private gateUploads(item: QueueItem, message: string): boolean {
+    if (!this.running) return false
+
+    /*
+     * 任务**放回队首**而不是队尾。
+     *
+     * 这是上一版真正的毛病：推到 hashQueue 队尾后，新文件还在源源不断
+     * 从扫描里进来，重试项永远排在最后——1123 个失败文件里 1121 个
+     * 只试过 1 次，用户看到的「重试」其实从没发生过。
+     */
+    item.requeued = true
+    this.queuedPaths.add(item.relPath)
+    this.uploadQueue.unshift(item)
+    this.touch(item.relPath, { state: 'queued', errorMsg: message })
+    this.opts.manifest.setState(item.relPath, 'pending', { errorMsg: message })
+
+    this.connFailStreak++
+
+    const now = Date.now()
+    /*
+     * 第一次失败不判定为「整体不可用」，但也不能让同一个文件立刻被重取。
+     *
+     * pump 是每 50ms 转一圈的：任务放回队首后，下一圈就会再取到它，
+     * 于是同一个文件在几毫秒内被连试好几次——重试次数没变，只是白打网络。
+     * 给一个很短的静默期错开，日志一条不写。
+     */
+    if (this.connFailStreak < 2) {
+      if (now >= this.offlineUntil) {
+        this.offlineUntil = now + 800
+        this.armOfflineTimer(800)
+      }
+      return true
+    }
+
+    // 已在熔断期内：这次只把任务放回去，不重复延时、不重复记日志
+    if (now < this.offlineUntil) return true
+
+    this.offlineBackoffMs = Math.min(60_000, this.offlineBackoffMs * 2)
+    this.offlineUntil = now + this.offlineBackoffMs
+    this.armOfflineTimer(this.offlineBackoffMs)
+
+    // 日志限流：否则这条提示自己又会每分钟刷几十遍
+    if (now - this.offlineLoggedAt >= 60_000) {
+      this.offlineLoggedAt = now
+      const brief = explainError(message).brief
+      this.opts.onLogDetail?.(
+        'warn',
+        `OpenList ${brief}，上传已暂停（${Math.round(this.offlineBackoffMs / 1000)} 秒后自动重试）：` +
+          `${message}。队列里还有 ${this.uploadQueue.length} 个文件，服务恢复后会继续，不需要重新扫描。`,
+        { category: 'system' }
+      )
+    }
+    return true
+  }
+
+  /** 到点自动重新泵一次，否则熔断结束后队列会一直静着 */
+  private armOfflineTimer(ms: number): void {
+    if (this.offlineTimer) clearTimeout(this.offlineTimer)
+    this.offlineTimer = setTimeout(() => {
+      this.offlineTimer = null
+      void this.pump()
+    }, ms)
+    this.offlineTimer.unref?.()
+  }
+
+  /** 上传成功一次即视为服务恢复：清掉熔断并把退避重置回起点 */
+  private clearUploadGate(): void {
+    if (this.connFailStreak >= 2) {
+      this.opts.onLogDetail?.('info', 'OpenList 连接已恢复，继续上传排队中的文件', {
+        category: 'system'
+      })
+    }
+    this.connFailStreak = 0
+    this.offlineUntil = 0
+    this.offlineBackoffMs = 2_500
+    if (this.offlineTimer) {
+      clearTimeout(this.offlineTimer)
+      this.offlineTimer = null
+    }
+  }
+
   private handleFatal(item: QueueItem, err: unknown): void {
     const message = err instanceof Error ? err.message : String(err)
     const code = (err as NodeJS.ErrnoException | undefined)?.code
@@ -1799,6 +1929,12 @@ export class Planner {
       this.recordSkip(item.relPath, 'file_gone', item.size)
       return
     }
+
+    /*
+     * ③ 服务端连不上：和 Transfer 返回失败是同一种情况，只是走了异常通道
+     * （例如建目录时抛 ECONNREFUSED）。同样交给熔断处理，别记成文件失败。
+     */
+    if (isConnectivityError(message) && this.gateUploads(item, message)) return
 
     this.opts.manifest.setState(item.relPath, 'error', { errorMsg: message })
     this.touch(item.relPath, { state: 'failed', errorMsg: message })
