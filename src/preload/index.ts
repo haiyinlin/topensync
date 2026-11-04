@@ -87,7 +87,14 @@ const api = {
   /** 改配置走请求-响应：调用方需要拿到合并后的新配置 */
   patchConfig: (patch: Partial<AppConfig>): Promise<AppConfig> =>
     ipcRenderer.invoke('config:patch', patch),
-  triggerScan: (kind: ScanKind) => ipcRenderer.send('scan:trigger', kind),
+  /**
+   * 触发一次扫描。
+   *
+   * `autoFix=false` 让远端对账变成「只读」：列举 + 比对 + 记差异，
+   * 但不自动重传。界面用它实现「先给清单、我确认后再传」。
+   */
+  triggerScan: (kind: ScanKind, opts?: { autoFix?: boolean }) =>
+    ipcRenderer.send('scan:trigger', kind, opts),
   retryTransfer: (taskId: string) => ipcRenderer.send('transfer:retry', taskId),
   cancelTransfer: (taskId: string) => ipcRenderer.send('transfer:cancel', taskId),
   resolveDiff: (diffId: number, resolution: DiffResolution) =>

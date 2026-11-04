@@ -82,8 +82,8 @@ export function registerIpc(engine: Engine): void {
   // ── 动作 ──────────────────────────────────────────────
   ipcMain.handle('config:patch', (_e, patch: Partial<AppConfig>) => engine.updateConfig(patch))
 
-  ipcMain.on('scan:trigger', (_e, kind: ScanKind) => {
-    void engine.triggerScan(kind)
+  ipcMain.on('scan:trigger', (_e, kind: ScanKind, opts?: { autoFix?: boolean }) => {
+    void engine.triggerScan(kind, opts ?? {})
   })
   ipcMain.on('transfer:retry', (_e, taskId: string) => {
     engine.retryTransfer(taskId)

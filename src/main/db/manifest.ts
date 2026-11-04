@@ -1298,6 +1298,35 @@ export class Manifest {
     return row ? (mapDiffRow(row) as unknown as DiffEntry) : null
   }
 
+  /**
+   * 关闭某条本地路径上残留的未解决差异。
+   *
+   * 「两侧已经一致」是最终事实：这条路径之前被记成缺失 / 大小不符，
+   * 现在不该继续挂在待办列表里。不关的话，修好的文件会**永远**留在
+   * 「远端缺失」——实测 232 条未解决差异里有 188 条属于这种情况
+   * （差异产生于 02:23，文件 04:58 就已经传成功了）。
+   * 用户照着清单点「上传这 228 个文件」，其中八成以上是白传。
+   *
+   * `keepKind` 用来在状态迁移时只留最新那一条：一个文件从「缺失」
+   * 变成「大小不符」时，旧那条描述的事实已经不成立了。
+   */
+  closeDiffsForPath(localPath: string, keepKind?: DiffEntry['kind']): number {
+    const res = keepKind
+      ? this.db
+          .prepare(
+            `UPDATE diffs SET resolved_at = ?, resolution = 'auto'
+              WHERE local_path = ? AND resolved_at IS NULL AND kind <> ?`
+          )
+          .run(Date.now(), localPath, keepKind)
+      : this.db
+          .prepare(
+            `UPDATE diffs SET resolved_at = ?, resolution = 'auto'
+              WHERE local_path = ? AND resolved_at IS NULL`
+          )
+          .run(Date.now(), localPath)
+    return Number(res.changes ?? 0)
+  }
+
   // ── scans ───────────────────────────────────────────
   startScan(kind: ScanRecord['kind'], trigger: ScanRecord['trigger']): number {
     const res = this.db

@@ -171,6 +171,8 @@ export class Reconciler {
   }
   /** 本次对账已自动处置的差异数；受 autoFixLimit 约束 */
   private autoFixed = 0
+  /** 本轮是否允许把差异交给 Planner 自动处置（见 runNow 的说明） */
+  private autoFixThisRun = true
 
   constructor(private readonly opts: ReconcilerOptions) {}
 
@@ -227,17 +229,31 @@ export class Reconciler {
     }
   }
 
-  /** 手动触发一次对账 */
-  async runNow(): Promise<ReconcileResult> {
-    return this.run('manual')
+  /**
+   * 手动触发一次对账。
+   *
+   * `autoFix: false` = 只读：照常列举、比对、记差异，但不把差异交给
+   * Planner 去自动重传。界面上的「补传远端缺失」用它实现
+   * 「先给我看清单、我确认了再传」。
+   *
+   * 这个开关是**每次运行独立**的，不是实例状态：定时对账与启动对账
+   * 走默认值（允许自动处置）。若做成 Engine 上的字段，用户点过一次
+   * 只读扫描之后，后面所有定时对账都会静默失去自动修复能力。
+   */
+  async runNow(opts: { autoFix?: boolean } = {}): Promise<ReconcileResult> {
+    return this.run('manual', opts)
   }
 
-  private async run(trigger: ScanTrigger): Promise<ReconcileResult> {
+  private async run(
+    trigger: ScanTrigger,
+    opts: { autoFix?: boolean } = {}
+  ): Promise<ReconcileResult> {
     if (this.running) {
       throw new Error('对账已在进行中')
     }
     this.running = true
     this.autoFixed = 0
+    this.autoFixThisRun = opts.autoFix !== false
 
     const { manifest } = this.opts
     // 实时取配置：用户在 UI 里改了回收站目录等参数后要立刻生效
@@ -505,6 +521,8 @@ export class Reconciler {
             skippedInFlight++
             continue
           }
+          // 状态从「缺失」迁移成「大小不符」时，旧那条不再成立
+          manifest.closeDiffsForPath(local.localPath, 'size_mismatch')
           const entry = manifest.recordDiff({
             kind: 'size_mismatch',
             localPath: local.localPath,
@@ -516,11 +534,13 @@ export class Reconciler {
           })
           diffCount++
           this.opts.onDiffRecorded?.(entry)
-          this.opts.onDiff?.({
-            kind: 'size_mismatch',
-            localPath: local.localPath,
-            remotePath
-          })
+          if (this.autoFixThisRun) {
+            this.opts.onDiff?.({
+              kind: 'size_mismatch',
+              localPath: local.localPath,
+              remotePath
+            })
+          }
         } else {
           /*
            * 两侧都在、大小一致 → 内容判定通过。
@@ -534,6 +554,12 @@ export class Reconciler {
            * 还是满屏「未校验」，会以为对账没跑（真实反馈）。
            */
           manifest.confirmRemotePresence(local.localPath, remotePath)
+          /*
+           * 这条路径以前可能被记过「远端缺失」或「大小不符」，现在两侧一致了。
+           * 不清掉的话，它以后每轮对账都被算进「待补传」——用户按数字去传，
+           * 传的却是远端早就有、本地也没变过的文件。
+           */
+          manifest.closeDiffsForPath(local.localPath)
         }
       }
 
@@ -575,6 +601,8 @@ export class Reconciler {
           continue
         }
 
+        // 同一路径上旧的「大小不符」不再成立：现在的事实是远端整个没有
+        manifest.closeDiffsForPath(local.localPath, 'missing_remote')
         const entry = manifest.recordDiff({
           kind: 'missing_remote',
           localPath: local.localPath,
@@ -586,11 +614,13 @@ export class Reconciler {
         })
         diffCount++
         this.opts.onDiffRecorded?.(entry)
-        this.opts.onDiff?.({
-          kind: 'missing_remote',
-          localPath: local.localPath,
-          remotePath
-        })
+        if (this.autoFixThisRun) {
+          this.opts.onDiff?.({
+            kind: 'missing_remote',
+            localPath: local.localPath,
+            remotePath
+          })
+        }
       }
 
       manifest.finishScan(scanId, timedOut ? 'cancelled' : 'done', {

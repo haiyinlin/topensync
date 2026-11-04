@@ -1725,6 +1725,12 @@ export class Planner {
       // 成功即视为服务已恢复：清熔断、把退避重置回起点
       this.clearUploadGate()
       this.touch(item.relPath, { state: 'done', progress: 1, speed: 0, errorMsg: null })
+      /*
+       * 这个文件刚传上去了，对账记的「远端缺失 / 大小不符」不再成立。
+       * 不关的话它会一直挂在待补传清单里，用户对着那个数字点「上传」，
+       * 传的其实是远端已经有了的文件。
+       */
+      this.opts.manifest.closeDiffsForPath(item.relPath)
       // 持久化到同步历史：这是「这个文件确实上传成功了」的权威追溯
       this.opts.manifest.recordHistory({
         kind: 'upload',

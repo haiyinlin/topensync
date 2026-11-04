@@ -1063,6 +1063,8 @@ export class Engine {
       // 实时取配置，不吃构造时的快照
       getConfig: () => this.config,
       onDiff: (diff) => {
+        // 只读模式由 Reconciler 自己拦（autoFix:false），这里不再判断：
+        // 做成 Engine 上的开关会污染后续的定时对账。
         // 同样要挂 catch：未处理的 Promise 拒绝会终止主进程
         void this.planner?.handleDiff(diff).catch((err: unknown) => {
           const message = err instanceof Error ? err.message : String(err)
@@ -1414,7 +1416,7 @@ export class Engine {
    *
    * 要真正开始传，用户得点「开始同步」。这是两件事，两个按钮。
    */
-  async triggerScan(kind: ScanKind): Promise<void> {
+  async triggerScan(kind: ScanKind, opts: { autoFix?: boolean } = {}): Promise<void> {
     /*
      * 同一条通道已经在跑了就别再起一轮。
      *
@@ -1483,7 +1485,7 @@ export class Engine {
         errorMsg: null
       })
       try {
-        const res = await this.reconciler.runNow()
+        const res = await this.reconciler.runNow({ autoFix: opts.autoFix })
         /*
          * 统计回写交给 Reconciler 的 onComplete 统一处理——
          * 手动、定时、启动三条路径共用同一套逻辑，

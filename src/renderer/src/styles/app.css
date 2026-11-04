@@ -1716,6 +1716,84 @@ textarea {
 }
 
 /* ── 远端对账 ─────────────────────────────────────────── */
+/*
+ * 「补传远端缺失」卡片。
+ *
+ * 一行三段：说明 / 三个数字 / 两个动作。窄窗口时整体换行，
+ * 说明占满第一行、数字与按钮落到第二行，不至于把按钮压成两行字。
+ */
+.rescan {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  padding: 13px 16px;
+  margin-bottom: 14px;
+}
+
+.rescan-main {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.rescan-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--tx1);
+}
+
+.rescan-title .ic {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--tx2);
+}
+
+.rescan-sub {
+  margin: 4px 0 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--tx3);
+}
+
+.rescan-facts {
+  display: flex;
+  flex: none;
+}
+
+.rf-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 14px;
+  border-right: 1px solid var(--line-soft);
+}
+
+.rf-item:last-child {
+  border-right: none;
+}
+
+.rf-k {
+  font-size: 10.5px;
+  color: var(--tx3);
+}
+
+.rf-v {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--tx1);
+}
+
+.rescan-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
 .recon-bar {
   display: flex;
   align-items: center;

@@ -496,3 +496,158 @@ describe('缺 remote_path 的已同步行', () => {
     expect(manifest.getFile('sub/a.txt')?.verifyLevel).toBeNull()
   })
 })
+
+/**
+ * 已经修好的文件不能永远挂在待办里。
+ *
+ * 事故现场：232 条未解决差异里 188 条的 `detected_at` 是 02:23，
+ * 而那些文件 04:58 就已经上传成功了——差异表从来没人关它们。
+ * 用户按「补传远端缺失」的数字去点上传，八成以上是白传一遍。
+ */
+describe('恢复一致的差异自动关闭', () => {
+  let dir: string
+  let manifest: Manifest
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'topensync-stale-diff-'))
+    manifest = new Manifest(join(dir, 'manifest.db'))
+  })
+
+  afterEach(() => {
+    manifest.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const seed = (): void => {
+    manifest.upsertFile({
+      localPath: 'a.txt',
+      localSize: 10,
+      mtimeMs: 1,
+      remotePath: '/quark-backup/a.txt',
+      state: 'synced'
+    })
+    manifest.setState('a.txt', 'synced', { remoteSize: 10, syncedSize: 10, syncedMtimeMs: 1 })
+  }
+
+  it('远端重新有了这份文件 → 旧的「远端缺失」被关掉', async () => {
+    seed()
+    const stale = manifest.recordDiff({
+      kind: 'missing_remote',
+      localPath: 'a.txt',
+      remotePath: '/quark-backup/a.txt',
+      localSize: 10,
+      remoteSize: null,
+      localMtime: 1,
+      remoteMtime: null
+    })
+    expect(manifest.listUnresolvedDiffs()).toHaveLength(1)
+
+    const client = {
+      list: vi.fn().mockResolvedValue({
+        content: [{ name: 'a.txt', size: 10, modified: '2026-01-01T00:00:00Z', isDir: false }],
+        total: 1
+      }),
+      confirmMissing: vi.fn().mockResolvedValue(true),
+      move: vi.fn(),
+      remove: vi.fn()
+    } as unknown as OpenListClient
+
+    await new Reconciler({ client, manifest, config: CONFIG }).runNow()
+
+    expect(manifest.listUnresolvedDiffs()).toHaveLength(0)
+    expect(manifest.getDiff(stale.id)?.resolution).toBe('auto')
+  })
+
+  it('同一路径从「缺失」变成「大小不符」时，只留最新那一条', async () => {
+    seed()
+    const stale = manifest.recordDiff({
+      kind: 'missing_remote',
+      localPath: 'a.txt',
+      remotePath: '/quark-backup/a.txt',
+      localSize: 10,
+      remoteSize: null,
+      localMtime: 1,
+      remoteMtime: null
+    })
+
+    const client = {
+      list: vi.fn().mockResolvedValue({
+        content: [{ name: 'a.txt', size: 99, modified: '2026-01-01T00:00:00Z', isDir: false }],
+        total: 1
+      }),
+      confirmMissing: vi.fn().mockResolvedValue(true),
+      move: vi.fn(),
+      remove: vi.fn()
+    } as unknown as OpenListClient
+
+    await new Reconciler({ client, manifest, config: CONFIG }).runNow()
+
+    const open = manifest.listUnresolvedDiffs()
+    expect(open).toHaveLength(1)
+    expect(open[0].kind).toBe('size_mismatch')
+    expect(manifest.getDiff(stale.id)?.resolution).toBe('auto')
+  })
+})
+
+/**
+ * 只读对账：列出清单，但一条都不自动处理。
+ *
+ * 「补传远端缺失」的流程是「扫描 → 看清单 → 我确认 → 才上传」。
+ * 若扫描顺手就把差异交给 Planner，用户还没看到清单，上行流量已经产生了
+ * （配置里 local-wins 时最多自动重传 autoFixLimit 个）。
+ */
+describe('只读对账（autoFix: false）', () => {
+  let dir: string
+  let manifest: Manifest
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'topensync-readonly-'))
+    manifest = new Manifest(join(dir, 'manifest.db'))
+  })
+
+  afterEach(() => {
+    manifest.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const seed = (): void => {
+    // 放在子目录里：根目录列举为空会被当成「本轮结果不可信」，不判缺失
+    manifest.upsertFile({
+      localPath: 'sub/a.txt',
+      localSize: 10,
+      mtimeMs: 1,
+      remotePath: '/quark-backup/sub/a.txt',
+      state: 'synced'
+    })
+    manifest.setState('sub/a.txt', 'synced', { remoteSize: 10, syncedSize: 10, syncedMtimeMs: 1 })
+  }
+
+  const client = {
+    list: vi.fn().mockResolvedValue({ content: [], total: 0 }),
+    confirmMissing: vi.fn().mockResolvedValue(true),
+    move: vi.fn(),
+    remove: vi.fn()
+  } as unknown as OpenListClient
+
+  it('差异照常记录，但不调用自动处置', async () => {
+    seed()
+    const onDiff = vi.fn()
+    await new Reconciler({ client, manifest, config: CONFIG, onDiff }).runNow({ autoFix: false })
+
+    expect(manifest.listUnresolvedDiffs()).toHaveLength(1)
+    expect(onDiff).not.toHaveBeenCalled()
+  })
+
+  it('默认（不传参）仍然自动处置，定时对账不会因刚跑过只读而失效', async () => {
+    seed()
+    const onDiff = vi.fn()
+    const r = new Reconciler({ client, manifest, config: CONFIG, onDiff })
+
+    await r.runNow({ autoFix: false })
+    expect(onDiff).not.toHaveBeenCalled()
+
+    // 关键：这是**实例状态**而非一次性参数的话，下面这次会被上一次污染
+    await r.runNow()
+    expect(onDiff).toHaveBeenCalled()
+  })
+})

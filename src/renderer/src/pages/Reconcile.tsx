@@ -152,6 +152,31 @@ export function Reconcile(): React.JSX.Element {
     return c
   }, [diffs])
 
+  /**
+   * 「远端缺了什么」—— 需要把本地那份补上去的全部差异。
+   *
+   * 三类都算：
+   * - missing_remote：远端没有这个路径
+   * - size_mismatch：远端有同名但大小不同（按「名称 + 大小」判，就是不一致）
+   * - local_only：本地有、从没传过
+   *
+   * 按 kind 分组是因为处置语义词不同（重新上传 / 覆盖远端），
+   * 但底层都是把本地文件传上去；结果摘要要合并成一条给用户看。
+   */
+  const pendingUpload = useMemo(() => {
+    const need = diffs.filter(
+      (d) => d.kind === 'missing_remote' || d.kind === 'size_mismatch' || d.kind === 'local_only'
+    )
+    return {
+      count: need.length,
+      bytes: need.reduce((a, d) => a + (d.localSize ?? 0), 0),
+      /** 远端根本没有 → 重新上传 */
+      newIds: need.filter((d) => d.kind !== 'size_mismatch').map((d) => d.id),
+      /** 远端有但大小不对 → 覆盖 */
+      mismatchIds: need.filter((d) => d.kind === 'size_mismatch').map((d) => d.id)
+    }
+  }, [diffs])
+
   /*
    * 筛选结果必须先记忆化再派生 ID 列表：
    * 之前 shown 是每次渲染现场 filter 出来的新数组，
@@ -191,6 +216,51 @@ export function Reconcile(): React.JSX.Element {
   }, [filter, shown])
 
   const byId = useMemo(() => new Map(diffs.map((d) => [String(d.id), d])), [diffs])
+
+  /**
+   * 一次处置多类差异。
+   *
+   * 「补传远端缺失」这个动作天然跨两类：远端没有的走 uploaded，
+   * 远端有但大小不对的走 overwritten。分两次调 resolveDiffs 没问题，
+   * 但结果摘要必须**合并成一条**——否则用户点一次会看到两行结果，
+   * 还得自己把两个数字加起来。
+   */
+  const runGroups = useCallback(
+    async (
+      groups: Array<{ ids: number[]; resolution: DiffResolution }>,
+      label: string
+    ): Promise<void> => {
+      const active = groups.filter((g) => g.ids.length > 0)
+      if (active.length === 0 || bulkBusy) return
+      setBulkBusy(true)
+      setBulkPending(null)
+      setBulkDone(null)
+
+      let handled = 0
+      let skipped = 0
+      let failed = 0
+      const reasons = new Map<string, number>()
+      for (const g of active) {
+        const res = await resolveDiffs(g.ids, g.resolution)
+        if (!res) continue
+        handled += res.handled
+        skipped += res.skipped
+        failed += res.failed
+        for (const r of res.reasons) reasons.set(r.reason, (reasons.get(r.reason) ?? 0) + r.count)
+      }
+
+      setBulkBusy(false)
+      setBulkDone({
+        label,
+        handled,
+        skipped,
+        failed,
+        reasons: [...reasons.entries()].map(([reason, count]) => ({ reason, count }))
+      })
+      setSelected(new Set())
+    },
+    [bulkBusy, resolveDiffs]
+  )
 
   const runBulk = useCallback(
     async (ids: number[], resolution: DiffResolution, label: string): Promise<void> => {
@@ -290,6 +360,20 @@ export function Reconcile(): React.JSX.Element {
     window.topensync?.triggerScan('remote')
     // 对账结束后主进程会推 scan:update，store 届时刷新差异列表。
     // 这里再兜一次：慢速服务端上对账可能超过 3 秒。
+    setTimeout(() => void refreshDiffs(), 2600)
+  }
+
+  /**
+   * 只读扫描：列举远端 + 比对 + 记差异，但**不自动上传**。
+   *
+   * 与上面的「立即对账」区别就在这一点：
+   * 那条路沿用配置里的冲突策略，local-wins 时会自己重传最多 autoFixLimit 个。
+   * 补传流程要的是「先给我看清单，我确认了再传」，所以这里显式关掉自动处置。
+   */
+  const scanOnly = (): void => {
+    if (reconciling) return
+    setBusy(true)
+    window.topensync?.triggerScan('remote', { autoFix: false })
     setTimeout(() => void refreshDiffs(), 2600)
   }
 
@@ -395,6 +479,77 @@ export function Reconcile(): React.JSX.Element {
             <Icon name="diff" />
             {reconciling ? '对账中…' : '立即对账'}
           </button>
+        </div>
+      </div>
+
+      {/*
+        * 「补传远端缺失」的显式入口。
+        *
+        * 功能上它就是远端对账的一个子集（missing_remote + size_mismatch），
+        * 但用户不该为了补几个文件先去理解「对账」这个词。
+        * 这张卡把三步摆在一起：扫描远端 → 看清单 → 我确认后上传。
+        *
+        * 与右上角「立即对账」的区别只有一条：这里走只读模式
+        * （autoFix:false），扫描不会顺手自动重传。
+        */}
+      <div className="card rescan">
+        <div className="rescan-main">
+          <div className="rescan-title">
+            <Icon name="cloud-check" />
+            补传远端缺失
+          </div>
+          <p className="rescan-sub">
+            按「相对路径 + 大小」比对本地清单与远端。扫描只读、不改动任何文件；
+            确认后才会把缺的传上去。
+          </p>
+        </div>
+
+        <div className="rescan-facts">
+          <div className="rf-item">
+            <span className="rf-k">远端缺失</span>
+            <b className="mono rf-v">{counts.missing_remote ?? 0}</b>
+          </div>
+          <div className="rf-item">
+            <span className="rf-k">大小不符</span>
+            <b className="mono rf-v">{counts.size_mismatch ?? 0}</b>
+          </div>
+          <div className="rf-item">
+            <span className="rf-k">待传合计</span>
+            <b className="mono rf-v">
+              {pendingUpload.bytes > 0 ? formatSize(pendingUpload.bytes) : '—'}
+            </b>
+          </div>
+        </div>
+
+        <div className="rescan-actions">
+          <button
+            className={`btn ghost${reconciling ? ' busy' : ''}`}
+            onClick={scanOnly}
+            disabled={reconciling}
+            title="列举远端整棵树并与本地清单比对；只读，不会上传或删除任何文件"
+          >
+            <Icon name="diff" />
+            {reconciling ? '扫描中…' : pendingUpload.count > 0 ? '重新扫描远端' : '扫描远端并比对'}
+          </button>
+          {pendingUpload.count > 0 && (
+            <button
+              className="btn primary"
+              disabled={bulkBusy || reconciling}
+              title="把上面这些文件按「本地为准」补传到远端"
+              onClick={() =>
+                void runGroups(
+                  [
+                    { ids: pendingUpload.newIds, resolution: 'uploaded' },
+                    { ids: pendingUpload.mismatchIds, resolution: 'overwritten' }
+                  ],
+                  '补传远端缺失'
+                )
+              }
+            >
+              <Icon name="upload" />
+              {bulkBusy ? '上传中…' : `上传这 ${pendingUpload.count} 个文件`}
+            </button>
+          )}
         </div>
       </div>
 
